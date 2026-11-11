@@ -184,6 +184,11 @@ bool image_compact_pass_end(uint64_t* freed_bytes, uint32_t* freed_blocks) {
     return compact_over(freed_bytes, freed_blocks);
 }
 
+// (Ocarina Engine) images made in system memory so far because no VRAM took them: vk_texture.cpp's steady budget (RX_VK_TEX_STABLE)
+// goes back to the presents' rules for the look that sees one
+static std::atomic<uint64_t> st_out_of_vram{0};
+uint64_t images_out_of_vram() { return st_out_of_vram.load(std::memory_order_relaxed); }
+
 bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& allocation, bool dedicated, bool target, bool textures) {
     VmaAllocationCreateInfo ai{};
     ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
@@ -219,6 +224,7 @@ bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& al
     VmaAllocationCreateInfo sai{};
     sai.usage = VMA_MEMORY_USAGE_AUTO;
     if (vmaCreateImage(vma, &ci, &sai, &image, &allocation, nullptr) != VK_SUCCESS) return false;
+    st_out_of_vram.fetch_add(1, std::memory_order_relaxed);   // (Ocarina Engine: images_out_of_vram)
     static std::atomic<int> told{0};
     if (told++ < 4) logf("vk: VRAM full: a %ux%u image (format %d) in system memory", ci.extent.width, ci.extent.height, (int)ci.format);
     return true;

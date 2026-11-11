@@ -38,13 +38,13 @@ struct VkSamplerCreateInfo {
 struct Offset { int x = 0, y = 0, z = 0; };
 struct Layers { int aspect = 0, level = 0, first = 0, count = 0; };
 struct VkImageBlit { Layers srcSubresource, dstSubresource; Offset srcOffsets[2], dstOffsets[2]; };
-struct { int upscale = 0, sharpness = 0, framegen = 0; } opts;
+struct { int upscale = 0, sharpness = 0, framegen = 0, vivid = 0, hdr = 0; } opts;
 struct SpyMutex {
     bool held = false;
     void lock() { CHECK(!held); held = true; }
     void unlock() { CHECK(held); held = false; }
 };
-struct { bool push_descriptor = true, offscreen = false; int device = 1; SpyMutex present_mu; } dev;
+struct { bool push_descriptor = true, offscreen = false, hdr = false; int device = 1; SpyMutex present_mu; } dev;
 // Only used by framegen_on and by the original scaler's negative control. No interpolation is initialized.
 struct {
     bool init = false, failed = false, thread_started = false;
@@ -60,10 +60,11 @@ uint32_t made_w = 0, made_h = 0, dispatched_w = 0, dispatched_h = 0;
 int made_usage = 0, dispatched_mode = -1;
 float dispatched_sharp = -1, dispatched_x0 = -1, dispatched_x1 = -1;
 int dispatched_side = -1;
+float dispatched_vivid = -1;
 VkImageView sampled_view = 0;
 VkImageBlit last_blit;
 bool make_pipe(Pipe& p, const uint32_t* code, size_t bytes, std::initializer_list<int> types, uint32_t push) {
-    CHECK(code == FG_SCALE_COMP_SPV && bytes == sizeof FG_SCALE_COMP_SPV && types.size() == 3 && push == 20);
+    CHECK(code == FG_SCALE_COMP_SPV && bytes == sizeof FG_SCALE_COMP_SPV && types.size() == 3 && push == 24);
     CHECK(*types.begin() == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && *(types.begin() + 1) == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
     ++pipe_calls; p.set = 1; p.layout = 2; p.pipe = pipe_fail ? 0 : 3; return !pipe_fail;
 }
@@ -97,13 +98,13 @@ void vkCmdBlitImage(int, VkImage src, int, VkImage dst, int, int count, const Vk
 }
 void pass(int, const Pipe& p, std::initializer_list<std::pair<VkImageView, VkSampler>> b,
           uint32_t w, uint32_t h, const void* data, uint32_t bytes) {
-    CHECK(p.pipe == 3 && b.size() == 3 && b.begin()->first && b.begin()->second == 4 && bytes == 20);
+    CHECK(p.pipe == 3 && b.size() == 3 && b.begin()->first && b.begin()->second == 4 && bytes == 24);
     CHECK((b.begin() + 2)->first && (b.begin() + 2)->second == 4);
     CHECK((b.begin() + 1)->first && !(b.begin() + 1)->second);
-    struct PC { int mode; float sharp; float x0, x1; int side; } pc;
+    struct PC { int mode; float sharp; float x0, x1; int side; float vivid; } pc;
     std::memcpy(&pc, data, sizeof pc);
     ++dispatches; dispatched_mode = pc.mode; dispatched_sharp = pc.sharp;
-    dispatched_side = pc.side; dispatched_x0 = pc.x0; dispatched_x1 = pc.x1;
+    dispatched_vivid = pc.vivid; dispatched_side = pc.side; dispatched_x0 = pc.x0; dispatched_x1 = pc.x1;
     dispatched_w = w; dispatched_h = h; sampled_view = b.begin()->first;
 }
 void logf(const char*, ...) { CHECK(dispatches > 0); ++logs; }
@@ -119,6 +120,11 @@ VkImage draw(const int* crop = nullptr, uint32_t dw = 2560, uint32_t dh = 1440) 
 }
 int main() {
     reset(); CHECK(!draw()); CHECK(pipe_calls == 0 && image_calls == 0 && dispatches == 0);
+    // Vivid colors alone runs the pass (vivid 1 in the push constants); not with HDR (the menu's or the swapchain's)
+    opts.vivid = 1; CHECK(draw()); CHECK(dispatches == 1 && dispatched_vivid == 1.0f && dispatched_mode == 0);
+    opts.hdr = 1; CHECK(!draw()); opts.hdr = 0; dev.hdr = true; CHECK(!draw()); dev.hdr = false;
+    opts.upscale = 1; opts.hdr = 2; CHECK(draw()); CHECK(dispatched_vivid == 0.0f);
+    reset();
     opts.upscale = 1;
     CHECK(!framegen_scale(1, 0, 11, 2560, 1440, nullptr, 100, 100));
     CHECK(!framegen_scale(1, 12, 11, 0, 1440, nullptr, 100, 100));

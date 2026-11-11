@@ -56,6 +56,7 @@
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
 namespace mkwvk {
+uint64_t device_vram_bytes();   // (vk_memory.cpp; Ocarina Engine: compact_on)
 namespace {
 
 uint64_t mix(uint64_t h, uint64_t v) {
@@ -240,6 +241,128 @@ bool remade_skip_old() {
     return on;
 }
 
+// ---- (Ocarina Engine, RX_VK_TEX_STABLE; on, =0: all as before) The textures' residency, held steady ----
+// A 6 GB RTX 4050 laptop, twelve minutes in Hyrule Castle Town's market with the camera turning (bench b37longo-K2): the
+// textures took 1.8 to 3.2 GB while their budget went from 1957 MB down to 1.1-1.6 GB and back with each look at the driver's
+// numbers (the process at 4.9 to 6.0 GB of the 5.05 it is allowed, whatever was evicted); what was used in the last 8 presents
+// alone was 1.83 GB, more than that budget, so every texture went two seconds after its last use (60 presents) and was made,
+// uploaded and decoded again when the camera came back: ~6 textures evicted a present and as many made, 135-160 frames over
+// 50 ms a minute. And each batch evicted freed space in the textures' blocks that the compaction gave back to the driver (36
+// runs, 15.7 GB of blocks) for the next textures to ask the driver for again. Now:
+// - the budget is not the driver's number of the moment: it never goes below RX_VK_TEX_FLOOR_PCT (70) % of the card's own
+//   (unless the driver's count is at its limit with no room in the blocks), nor
+//   below what was used in the last RX_VK_EVICT_MIN_UNUSED (60) presents plus an eighth (those cannot go anyway: a budget under
+//   them only meant "all the rest goes"), never above the card's own; it comes down a sixteenth a look once the driver's numbers
+//   have asked for less three looks in a row (a second), and goes back up once two looks agree. Over it, only the excess goes, not down to 7/8 of it;
+// - over the budget, what goes has gone unused for a real time as well as those presents: RX_VK_TEX_EVICT_MS (6000) while the
+//   driver's count is under 90% of what it allows, less the fuller it gets, down to the presents alone at RX_VK_TEX_OVER_PCT
+//   % of it (112 on NVIDIA, 100 elsewhere): the cold ones go early, before the count is over, not all at once after;
+// - one made again within 10 s of its eviction is the scene's working set, not a leftover: for 30 s it stays three times as long;
+// - while the textures made in the last 300 presents would fill the free space in their blocks, the compaction does not start
+//   for less than RX_VK_COMPACT_MB of it (compact_step).
+// Bounded: with the driver's count at RX_VK_TEX_OVER_PCT % or more of what it allows, an image gone to system memory since the
+// last look, or (where the budget is the limit itself: an integrated GPU, no VK_EXT_memory_budget, RX_VK_VRAM_MB, a preset's) the
+// textures a quarter over the budget, the presents alone decide, as before, and the budget's floor is what is in use.
+// Nothing here changes how a texture ends (destroy_later, when the GPU is past its last use): only which ones are chosen.
+bool tex_stable() {
+    static const bool on = !(getenv("RX_VK_TEX_STABLE") && !atoi(getenv("RX_VK_TEX_STABLE")));
+    return on;
+}
+uint64_t tex_evict_ms() {
+    static const uint64_t ms = getenv("RX_VK_TEX_EVICT_MS") ? (uint64_t)std::clamp(atoi(getenv("RX_VK_TEX_EVICT_MS")), 0, 600000) : 6000;
+    return ms;
+}
+uint64_t tex_floor_pct() {
+    static const uint64_t pct = getenv("RX_VK_TEX_FLOOR_PCT") ? (uint64_t)std::clamp(atoi(getenv("RX_VK_TEX_FLOOR_PCT")), 0, 100) : 70;
+    return pct;
+}
+uint64_t tex_over_pct() {
+    // (112 on NVIDIA, whose count goes past what the driver allows and whose frames were no slower at 119% of it than at 98%
+    // (b37longo-K2); 100 elsewhere: AMD's driver reports the use at most at what it allows (keep_rendered.h), so "over" never shows)
+    static const uint64_t pct = getenv("RX_VK_TEX_OVER_PCT") ? (uint64_t)std::clamp(atoi(getenv("RX_VK_TEX_OVER_PCT")), 95, 150)
+                                : dev.props.vendorID == 0x10DE ? 112 : 100;
+    return pct;
+}
+uint64_t tex_min_unused() {   // (texture_frame's min_unused: the presents within which nothing goes for the budget)
+    static const uint64_t n = getenv("RX_VK_EVICT_MIN_UNUSED") ? (uint64_t)std::max(1, atoi(getenv("RX_VK_EVICT_MIN_UNUSED"))) : 60;
+    return n;
+}
+uint64_t tex_clock_ms() {
+    return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+constexpr uint64_t kPresentRing = 8192;
+uint64_t present_ms[kPresentRing];   // (when each of the last 8192 presents began: frame_no % kPresentRing; texture_frame's thread)
+constexpr uint64_t kAgeOld = ~0ull >> 2;
+/// how long ago (ms) the present `f` ended; kAgeOld when older than the ring knows
+uint64_t present_age_ms(uint64_t f, uint64_t now_ms) {
+    if (f >= frame_no) return 0;
+    if (frame_no - f >= kPresentRing - 1) return kAgeOld;
+    const uint64_t t = present_ms[(f + 1) % kPresentRing];   // (the next one's beginning)
+    if (!t) return kAgeOld;
+    return now_ms > t ? now_ms - t : 0;
+}
+constexpr uint64_t kRemadeWindowMs = 10000, kHotForMs = 30000;
+std::mutex stable_mu;
+std::unordered_map<uint64_t, uint64_t> evicted_when;   // (stable_mu; evicted_key -> the ms it went)
+std::unordered_map<uint64_t, uint64_t> hot_until;      // (stable_mu; evicted_key -> made again soon after: kept longer until this ms)
+std::atomic<uint64_t> st_sb_evicted{0}, st_sb_evicted_bytes{0}, st_sb_remade{0}, st_sb_kept_age{0}, st_sb_kept_hot{0};
+std::atomic<uint64_t> st_sb_img_tex{0}, st_sb_img_target{0}, st_sb_img_other{0}, st_sb_img_reused{0}, st_sb_made_bytes{0};
+uint64_t tex_churn_bytes = 0;   // (texture_frame's thread: what the textures made in the last 300 presents took; compact_step)
+bool remade_hot(uint64_t k, uint64_t now_ms) {
+    std::lock_guard lk(stable_mu);
+    auto it = hot_until.find(k);
+    if (it == hot_until.end()) return false;
+    if (now_ms >= it->second) {
+        hot_until.erase(it);
+        return false;
+    }
+    return true;
+}
+/// (texture_frame) a texture with content of its own evicted for the budget: when, for note_made
+void note_evicted(uint64_t k, uint64_t now_ms) {
+    std::lock_guard lk(stable_mu);
+    if (evicted_when.size() > 50000) evicted_when.clear();   // (a bound: only the recent ones matter)
+    evicted_when[k] = now_ms;
+}
+/// (create) a texture made: one evicted less than 10 s ago is counted and kept longer from now on
+void note_made(uint64_t k) {
+    std::lock_guard lk(stable_mu);
+    auto ev = evicted_when.find(k);
+    if (ev == evicted_when.end()) return;
+    const uint64_t now = tex_clock_ms();
+    if (now - std::min(now, ev->second) < kRemadeWindowMs) {
+        st_sb_remade.fetch_add(1, std::memory_order_relaxed);
+        if (hot_until.size() > 50000) hot_until.clear();   // (a bound)
+        hot_until[k] = now + kHotForMs;
+    }
+    evicted_when.erase(ev);
+}
+/// (texture_frame, every look) The budget held steady: `raw` is what the driver's numbers ask for now, `ceiling` the card's own (or
+/// the preset's), `in_use` what the last presents used. Above. texture_frame's thread alone
+uint64_t stable_budget_step(uint64_t raw, uint64_t ceiling, uint64_t in_use, bool urgent, uint64_t floor_pct, uint64_t* floor_out) {
+    static uint64_t value = 0;
+    static uint32_t below = 0, above = 0;
+    ceiling = std::max(ceiling, raw);
+    const uint64_t low = urgent ? std::min(ceiling, in_use)
+                                : std::max(ceiling / 100 * floor_pct, std::min(ceiling, in_use + in_use / 8));
+    const uint64_t target = std::clamp(raw, low, ceiling);
+    if (!value) {
+        value = target;
+    } else if (target < value) {
+        above = 0;
+        if (urgent) value = target, below = 0;
+        else if (++below >= 3) value -= std::min(value - target, std::max<uint64_t>(value / 16, 16ull << 20));
+    } else if (target > value) {
+        below = 0;
+        if (++above >= 2) value = target;   // (up at once, once two looks agree: what thrashes is the way down)
+    } else {
+        below = above = 0;
+    }
+    value = std::clamp(value, low, ceiling);   // (what is in use grew, or the card's own changed with a preset)
+    *floor_out = low;
+    return value;
+}
+
 struct Dead {
     uint64_t value;
     VkImage image;
@@ -298,12 +421,54 @@ uint64_t pool_keep_presents() {
     return n;
 }
 bool compact_on() {   // (hookshot, RX_VK_COMPACT=1: the textures in a pool of their own, compacted: compact_step)
-    static const bool v = getenv("RX_VK_COMPACT") && atoi(getenv("RX_VK_COMPACT")) != 0;
+    // (Ocarina Engine: on by default on cards of 8.5 GB or less, where the textures overflowed what the driver allows (5.4 of
+    // 5.0 GB on a 6 GB laptop in Hyrule Market) and spilled to system RAM; with it, 4.7-5.0 GB and the same fps. RX_VK_COMPACT=0: off)
+    static const bool v = getenv("RX_VK_COMPACT") ? atoi(getenv("RX_VK_COMPACT")) != 0
+                                                   : (mkwvk::device_vram_bytes() && mkwvk::device_vram_bytes() <= (8704ull << 20));
     return v;
 }
 uint64_t pool_cap() {
     static const uint64_t mb = getenv("RX_VK_TARGET_POOL_MB") ? (uint64_t)std::max(0, atoi(getenv("RX_VK_TARGET_POOL_MB"))) : 256;
     return mb << 20;
+}
+// (Ocarina Engine, RX_VK_TARGET_POOL_STABLE; on, =0: as before) With VRAM short the pool kept 128 MB of what went into it in the
+// last 30 presents, the oldest of all going first. The dead targets reach it in batches (their sweep is every 10 presents: ~110
+// images, ~180 MB at once in Hyrule Market on a 6 GB card) and the frames after take them back ~12 a present: each batch put the
+// pool over its bound, 16 a present were destroyed, and the same shapes were asked of the allocator two presents later (bench
+// b37longo-K2, 600 presents: 4210 taken from the pool, 3036 made new in 724 ms, the slowest 27-50 ms with VRAM full, 3084
+// destroyed "over its bound"). Now the pool knows what each shape is asked for (the requests of the last 32 presents, taken
+// from it or not) and keeps that many of it whatever their age (600 presents at most); beyond that an image goes after 60
+// presents unused (120 with VRAM to spare); and its bound with VRAM short is RX_VK_TARGET_POOL_STABLE_MB (256), where the
+// shapes holding more than they are asked for give theirs up first. In a steady scene every target's image comes from the pool.
+// The images are the same ones either way (destroyed and made again in the same blocks, or waiting): only the allocator's work
+// goes. What the textures' budget leaves out for the pool is still RX_VK_TARGET_POOL_KEEP_MB at most (texture_frame).
+bool pool_stable() {
+    static const bool on = !(getenv("RX_VK_TARGET_POOL_STABLE") && !atoi(getenv("RX_VK_TARGET_POOL_STABLE")));
+    return on;
+}
+uint64_t pool_stable_cap() {
+    static const uint64_t mb =
+        getenv("RX_VK_TARGET_POOL_STABLE_MB") ? (uint64_t)std::max(0, atoi(getenv("RX_VK_TARGET_POOL_STABLE_MB"))) : 256;
+    return mb << 20;
+}
+constexpr uint64_t kPoolWindow = 32;   // (presents)
+struct PoolNeed {
+    uint64_t window = 0;           // (frame_no / kPoolWindow of `now`)
+    uint32_t now = 0, before = 0;   // (the requests for the shape in this window and in the one before it)
+};
+std::unordered_map<uint64_t, PoolNeed> pool_need;   // (pool_mu; by pool_key_of)
+void pool_need_roll(PoolNeed& n) {
+    const uint64_t w = frame_no / kPoolWindow;
+    if (w == n.window) return;
+    n.before = w == n.window + 1 ? n.now : 0;
+    n.now = 0, n.window = w;
+}
+/// (pool_mu held) how many images of the shape the pool keeps whatever their age
+size_t pool_wanted(uint64_t key) {
+    auto it = pool_need.find(key);
+    if (it == pool_need.end()) return 0;
+    pool_need_roll(it->second);
+    return std::max(it->second.now, it->second.before);
 }
 uint64_t pool_key_of(const VkImageCreateInfo& ci) {
     uint64_t k = mix((uint64_t)ci.flags, (uint64_t)ci.imageType << 32 | (uint64_t)ci.format);
@@ -315,6 +480,11 @@ uint64_t pool_key_of(const VkImageCreateInfo& ci) {
 }
 bool pool_take(uint64_t key, VkImage& image, VmaAllocation& allocation, std::unordered_map<uint64_t, VkImageView>& views) {
     std::lock_guard lk(pool_mu);
+    if (pool_stable()) {   // (asked for, taken or not: what the pool keeps of this shape. Above)
+        PoolNeed& n = pool_need[key];
+        pool_need_roll(n);
+        n.now++;
+    }
     auto it = target_pool.find(key);
     if (it == target_pool.end() || it->second.empty()) return false;
     Pooled& p = it->second.back();
@@ -341,6 +511,43 @@ void pool_put(Dead& d) {
 /// presents: destroyed, at most 16 a present (64 while VRAM is short). Returns how many
 size_t pool_trim() {
     std::lock_guard lk(pool_mu);
+    if (pool_stable()) {   // (Ocarina Engine: by what each shape is asked for. Above, pool_stable)
+        const uint64_t cap = pool_pressed ? pool_stable_cap() : std::max(pool_cap(), pool_stable_cap());
+        const uint64_t age = pool_pressed ? 60 : 120;
+        const size_t most = 16;
+        size_t n = 0;
+        if (frame_no % 256 == 0)   // (the shapes not asked for in a long while: forgotten)
+            for (auto it = pool_need.begin(); it != pool_need.end();)
+                it = frame_no / kPoolWindow > it->second.window + 8 ? pool_need.erase(it) : std::next(it);
+        for (auto it = target_pool.begin(); it != target_pool.end() && n < most;) {   // (too long unused: the oldest is the front)
+            auto& v = it->second;
+            const size_t keep = pool_wanted(it->first);
+            while (!v.empty() && n < most && frame_no - std::min(frame_no, v.front().since) > (v.size() > keep ? age : 600)) {
+                pool_destroy(v.front());
+                pool_bytes -= std::min(pool_bytes, v.front().bytes), pool_n--, n++, st_pool_aged++;
+                v.erase(v.begin());
+            }
+            it = v.empty() ? target_pool.erase(it) : std::next(it);
+        }
+        while (pool_bytes > cap && n < most) {   // (over its bound: a shape holding more than it is asked for first, the oldest of them)
+            auto pick = target_pool.end();
+            bool pick_spare = false;
+            for (auto it = target_pool.begin(); it != target_pool.end(); ++it) {
+                if (it->second.empty()) continue;
+                const bool spare = it->second.size() > pool_wanted(it->first);
+                if (pick == target_pool.end() || (spare && !pick_spare) ||
+                    (spare == pick_spare && it->second.front().since < pick->second.front().since))
+                    pick = it, pick_spare = spare;
+            }
+            if (pick == target_pool.end()) break;
+            auto& v = pick->second;
+            pool_destroy(v.front());
+            pool_bytes -= std::min(pool_bytes, v.front().bytes), pool_n--, n++, st_pool_capped++;
+            v.erase(v.begin());
+            if (v.empty()) target_pool.erase(pick);
+        }
+        return n;
+    }
     if (pool_pressed && pool_keep()) {   // (port-samuel: VRAM short, the recent ones kept. Above)
         const uint64_t cap = std::min(pool_cap(), pool_keep_cap()), age = pool_keep_presents();
         const size_t most = 16;
@@ -1897,6 +2104,7 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
     PROF_EXACT();   // (texture_get's slow path: PROF_TEXGET samples the rest)
     std::chrono::steady_clock::time_point new_t0;   // (port-samuel: the allocator's own image, timed: new_image_timed)
     bool new_timing = false;
+    bool from_allocator = false;   // (Ocarina Engine: the "vk: stable textures" line's count of images allocated)
     struct CreateTime {   // (port-samuel: what making images costs the replay thread, in the "vk: stutter:" line)
         const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
         ~CreateTime() {
@@ -1998,7 +2206,10 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
             if (small) logf("vk: %llu MB of VRAM allowed: all large ASTC textures kept as BC3", (unsigned long long)(allowed >> 20));
             return small;
         }();
-        const uint64_t min_bytes = (bw * bh >= 36 || all) ? low : 64ull << 20;
+        // (Ocarina Engine: on those cards every size too, not only from 2 MB: a 6 GB laptop in Hyrule Market 30.1 fps against 26.1,
+        // frames over 50 ms 41 against 79 a 30 s; RX_VK_ASTC_BC_MB=<MB> sets the old floor)
+        static const uint64_t low_used = getenv("RX_VK_ASTC_BC_MB") || !all ? low : 0;
+        const uint64_t min_bytes = (bw * bh >= 36 || all) ? low_used : 64ull << 20;
         uint64_t px = 0;
         for (uint32_t l = 0; l < x.levels; l++)
             px += (uint64_t)std::max(1u, x.width >> l) * std::max(1u, x.height >> l);
@@ -2164,7 +2375,8 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
              x.sparse_req.formatProperties.flags & VK_SPARSE_IMAGE_FORMAT_SINGLE_MIPTAIL_BIT ? ", one for all layers" : " a layer");
     } else if (in_textures && create_image(ci, x.image, x.allocation, false, false, true)) {
         // (made in the textures' pool; one refused there is made as any other, below)
-    } else if (!(pool_key && pool_take(pool_key, x.image, x.allocation, x.views)) && (st_pool_made += pool_key != 0, true) &&
+        st_sb_img_tex.fetch_add(1, std::memory_order_relaxed);
+    } else if (!(pool_key && pool_take(pool_key, x.image, x.allocation, x.views)) && (st_pool_made += pool_key != 0, from_allocator = true, true) &&
                (new_t0 = std::chrono::steady_clock::now(), new_timing = true, true) &&   // (port-samuel: new_image_timed)
                !create_image(ci, x.image, x.allocation, false, as_target && !is_bc(x.format) && !is_astc(x.format)) &&
                (new_image_timed(new_t0, false, ci, as_target && !is_bc(x.format) && !is_astc(x.format), pool_key != 0), new_timing = false, true) &&
@@ -2182,6 +2394,8 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
     }
     if (new_timing)   // (port-samuel: the allocator made it at the first try)
         new_image_timed(new_t0, true, ci, as_target && !is_bc(x.format) && !is_astc(x.format), pool_key != 0);
+    if (from_allocator) (pool_key ? st_sb_img_target : st_sb_img_other).fetch_add(1, std::memory_order_relaxed);
+    else if (pool_key) st_sb_img_reused.fetch_add(1, std::memory_order_relaxed);   // (the target pool's)
     // what it costs: the level chain's texels
     uint64_t px = 0;
     for (uint32_t l = 0; l < x.levels; l++)
@@ -2193,6 +2407,7 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
     static const bool by_estimate = getenv("RX_VK_COUNT_BY_ESTIMATE") != nullptr;
     if (!x.sparse && !by_estimate) x.pad = std::max(x.bytes, allocation_size(x.allocation)) - x.bytes;
     total_bytes += x.bytes + x.pad;
+    if (in_textures) st_sb_made_bytes.fetch_add(x.bytes + x.pad, std::memory_order_relaxed);   // (compact_step: what refills the blocks)
     InitRedirect redirect;   // (a parallel replay's worker: into the earliest open segment's init command buffer)
     // into GENERAL, and cleared (a target the game renders into before writing it all reads zeros, not garbage)
     VkCommandBuffer cmd = upload_cmd();
@@ -2267,6 +2482,7 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
             evicted_at.erase(ev);
         }
     }
+    if (tex_stable()) note_made(evicted_key(p->gpu, p->width, p->height, p->nvn_format));   // (evicted less than 10 s ago: kept longer)
     static int logged;
     if (logged++ < 40 || textures.size() % 500 == 0 || p->bytes > (64ull << 20))
         logf("vk: texture %#llx %ux%ux%u x%u levels %u NVN %#x -> vk %d%s (%zu textures, %llu MB)",
@@ -3588,9 +3804,12 @@ void compact_step(uint64_t completed) {
         compact.next_check = frame_no + 120;
         static const uint64_t min_free = (uint64_t)(getenv("RX_VK_COMPACT_MB") ? std::max(1, atoi(getenv("RX_VK_COMPACT_MB"))) : 512) << 20;
         uint64_t block_bytes = 0, free_bytes = 0;
-        if (!textures_pool_usage(&block_bytes, &free_bytes) ||
-            free_bytes < vram_compact::run_from(min_free, compact.pressed))
-            return;
+        if (!textures_pool_usage(&block_bytes, &free_bytes)) return;
+        // (Ocarina Engine, RX_VK_TEX_STABLE) not for less than RX_VK_COMPACT_MB while the textures made in the last 300 presents
+        // would fill that free space: given back, the blocks were asked of the driver again seconds later (36 runs and 15.7 GB of
+        // blocks in twelve minutes of Hyrule Market, a 128 MB block's allocation with VRAM full among the 27-50 ms images)
+        const bool refilling = tex_stable() && tex_churn_bytes >= free_bytes;
+        if (free_bytes < vram_compact::run_from(min_free, compact.pressed && !refilling)) return;
         if (!image_compact_begin(64ull << 20, 12)) return;
         compact.runs++, compact.moved = compact.moved_bytes = compact.ignored = compact.passes = 0;
         logf("vk: VRAM compaction %llu begins: the textures' blocks hold %llu MB, %llu MB of it free space",
@@ -3741,7 +3960,9 @@ void texture_frame(uint64_t completed) {
                  (long long)st_deferred.load(std::memory_order_relaxed));
     }
     completed_value = completed;
+    if (!present_ms[frame_no % kPresentRing]) present_ms[frame_no % kPresentRing] = tex_clock_ms();   // (the first present)
     frame_no++;
+    present_ms[frame_no % kPresentRing] = tex_clock_ms();   // (Ocarina Engine: the eviction's age in ms, below)
     {   // (staging arenas the GPU is done with, beyond 256 MB of them, and any over 64 MB: freed. A scene change stages
         // hundreds of MB to over a GB (the course maps, the terrain's ASTC arrays), and that host memory was kept)
         // (hookshot: 64 on a card of 6 GB or less. On one with resizable BAR the arenas are VRAM: VMA puts a host-visible buffer the GPU
@@ -3900,6 +4121,7 @@ void texture_frame(uint64_t completed) {
         // Safety clamp: do not exceed 75% of driver-allowed memory on constrained VRAM (prevents VK_ERROR_DEVICE_LOST)
         budget = std::min(budget, (allowed / 4) * 3);
     }
+    const uint64_t budget_ceiling = budget;   // (Ocarina Engine: the card's own or the preset's, before the driver's numbers. tex_stable)
     // (near what the driver allows, the budget shrinks by the excess. The excess of what the process holds less the
     // free space in VMA's blocks, which new images take before VMA makes a block: measured by the blocks alone, the
     // textures evicted freed space inside them that the driver still counted, so 10 frames later the budget shrank
@@ -3921,7 +4143,7 @@ void texture_frame(uint64_t completed) {
     // those images before anything is allocated, as they take the blocks' free space. Counted, the kept ones took the textures'
     // budget down by their size and textures in use went (and were made and uploaded again). pool_keep, above
     uint64_t pool_held = 0;
-    if (pool_pressed && pool_keep()) {
+    if (pool_pressed && (pool_keep() || pool_stable())) {
         std::lock_guard lk(pool_mu);
         pool_held = std::min(pool_bytes, pool_keep_cap());
     }
@@ -3957,6 +4179,31 @@ void texture_frame(uint64_t completed) {
         budget = std::min(budget, total_bytes > over ? total_bytes - over : 0);
     }
     if (budget < evict_to) evict_to = 0;   // (hookshot, RX_VK_COMPACT: the driver's limit asks for more: 7/8 of that, as before)
+    // (Ocarina Engine, RX_VK_TEX_STABLE: the budget held steady and the time a texture stays unused before it goes. Above, tex_stable)
+    const uint64_t raw_budget = budget;
+    static uint64_t spilled_seen = 0;
+    const uint64_t spilled_now = images_out_of_vram();
+    const bool spilled = spilled_now != spilled_seen;   // (an image went to system memory since the last look: VRAM is really full)
+    spilled_seen = spilled_now;
+    const bool stable = tex_stable();
+    bool urgent = false;
+    uint64_t evict_after_ms = 0, budget_floor = 0, in_use = 0;
+    if (stable) {
+        const uint64_t keep = tex_min_unused();
+        for (auto& kv : textures)
+            if (frame_no - std::min(frame_no, kv.second->last_frame) < keep) in_use += kv.second->bytes + kv.second->pad;
+        const uint64_t lo = allowed / 10 * 9, hi = std::max(allowed / 100 * tex_over_pct(), lo + 1);
+        urgent = spilled || (known && pressure >= hi);
+        // (the driver's own count at its limit with no room in the blocks, the squeeze above: no floor but what is in use)
+        const bool at_limit = known && !by_blocks && used > allowed / 100 * 97 && !room_in_blocks;
+        budget = stable_budget_step(raw_budget, budget_ceiling, in_use, urgent, at_limit ? 0 : tex_floor_pct(), &budget_floor);
+        // (where the budget is the limit itself, not the driver's count: a quarter over it, the presents alone)
+        const bool capped = !known || vram_env || preset_budget || dev.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+        if (capped && total_bytes > budget + budget / 4) urgent = true;
+        evict_to = budget;   // (the excess alone: a cut to 7/8 each time the line is crossed is what emptied the cache)
+        evict_after_ms = urgent ? 0 : !known || pressure <= lo ? tex_evict_ms() : tex_evict_ms() * (hi - pressure) / (hi - lo);
+        if (frame_no % 300 == 0) tex_churn_bytes = st_sb_made_bytes.exchange(0, std::memory_order_relaxed);
+    }
     if (frame_no % 600 == 0) {
         vma_log_heaps();
         vma_log_image_blocks();
@@ -3973,6 +4220,24 @@ void texture_frame(uint64_t completed) {
              (unsigned long long)(block_free >> 20), (unsigned long long)(total_bytes >> 20),
              (unsigned long long)(budget >> 20), textures.size(),
              known && used > allowed / 100 * 97 && room_in_blocks ? " (at the driver's limit, room in the blocks: not squeezed)" : "");
+        if (stable) {   // (Ocarina Engine: the last 600 presents' evictions for the budget, what came back, and the images allocated)
+            const unsigned long long ev = st_sb_evicted.exchange(0), ev_b = st_sb_evicted_bytes.exchange(0), re = st_sb_remade.exchange(0);
+            const unsigned long long k_age = st_sb_kept_age.exchange(0), k_hot = st_sb_kept_hot.exchange(0);
+            const unsigned long long i_tex = st_sb_img_tex.exchange(0), i_tgt = st_sb_img_target.exchange(0);
+            const unsigned long long i_other = st_sb_img_other.exchange(0), i_pool = st_sb_img_reused.exchange(0);
+            logf("vk: stable textures (RX_VK_TEX_STABLE=1; =0: as before): 600 presents: %llu evicted over the budget (%llu MB), %llu "
+                 "made again within 10 s of going; held back %llu as used within the time, %llu as made again lately (looks); "
+                 "images allocated %llu: %llu for textures, %llu for render targets, %llu other (%llu more taken from the target "
+                 "pool, RX_VK_TARGET_POOL_STABLE %s); budget %llu MB (by the driver's numbers alone %llu MB; floor %llu MB, the "
+                 "card's own %llu MB, used in the last %llu presents %llu MB); eviction after %llu ms unused, the count at %llu%% "
+                 "of what the driver allows%s", ev, ev_b >> 20, re, k_age, k_hot, i_tex + i_tgt + i_other, i_tex, i_tgt, i_other,
+                 i_pool, pool_stable() ? "on" : "off", (unsigned long long)(budget >> 20), (unsigned long long)(raw_budget >> 20),
+                 (unsigned long long)(budget_floor >> 20), (unsigned long long)(budget_ceiling >> 20),
+                 (unsigned long long)tex_min_unused(), (unsigned long long)(in_use >> 20), (unsigned long long)evict_after_ms,
+                 (unsigned long long)(allowed ? pressure / (allowed / 100 + 1) : 0),
+                 urgent ? (spilled ? " (an image went to system memory: by the presents alone, as before)"
+                                   : " (VRAM short: by the presents alone, as before)") : "");
+        }
         // (what takes it: decoded ASTC, the GPU's images, the rest; the largest)
         uint64_t astc_b = 0, rt_b = 0, other_b = 0, recent_b = 0, baked_b = 0;
         size_t baked_n = 0;
@@ -4153,7 +4418,10 @@ void texture_frame(uint64_t completed) {
     static uint64_t n_dead, b_dead, dead_logged_at;
     // (hookshot) the textures to go are chosen first and destroyed after; the write-backs among them go to the GPU in a few
     // batches (flush_textures), not one submission and one wait each: a sweep of 500 at a scene load stalled for seconds
-    struct Evict { Texture* tex; bool flush, shifted; };
+    struct Evict { Texture* tex; bool flush, shifted, over; };
+    // (Ocarina Engine, RX_VK_TEX_STABLE) over the budget, by time too unless VRAM is really short (above, tex_stable)
+    const uint64_t now_ms = tex_clock_ms();
+    const bool by_time = stable && !sweep && evict_after_ms > 0;
     std::vector<Evict> evict;
     uint64_t pending_bytes = 0;   // (chosen below, their bytes not yet off total_bytes)
     for (auto& [last, tex] : order) {
@@ -4165,6 +4433,19 @@ void texture_frame(uint64_t completed) {
         const bool shifted = drawn_over_shifted(tex);
         if (frame_no - last < need_unused && !shifted) continue;   // (younger: only a dead transient target goes)
         if (tex->last_value > completed) continue;
+        // (Ocarina Engine: unused for the time as well, and three times that if it was made again soon after it last went. Not what
+        // another image was drawn over: that one holds nothing)
+        if (by_time && !shifted && !drawn_over(tex)) {
+            const uint64_t age = present_age_ms(last, now_ms);
+            if (age < evict_after_ms) {
+                st_sb_kept_age.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            if (age < evict_after_ms * 3 && remade_hot(evicted_key(tex->gpu, tex->width, tex->height, tex->nvn_format), now_ms)) {
+                st_sb_kept_hot.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+        }
         // (nor what the GPU wrote and the game still has: the image is its only copy, and one made again over that
         // storage started empty or from stale memory: a sky or course texture drawn once, garbage from then on.
         // RX_VK_EVICT_RENDERED=1: as before)
@@ -4221,7 +4502,7 @@ void texture_frame(uint64_t completed) {
         // tiled pattern over the Deku Tree's planks and Hyrule Field's path, with a 16 GB card's textures at the 6 GB budget
         // (issue 386). RX_VK_EVICT_NO_FLUSH=1: not written back, as before)
         static const bool no_flush = getenv("RX_VK_EVICT_NO_FLUSH") != nullptr;
-        evict.push_back({tex, !no_flush && !overwritten && tex->gpu_written && !tex->released && flushable(*tex), shifted});
+        evict.push_back({tex, !no_flush && !overwritten && tex->gpu_written && !tex->released && flushable(*tex), shifted, overwritten});
         pending_bytes += tex->bytes + tex->pad;
     }
     {   // (the write-backs: batches of up to 64 textures or ~512 MB of staging memory, each one submission and one wait)
@@ -4249,6 +4530,11 @@ void texture_frame(uint64_t completed) {
     for (const Evict& e : evict) {   // (and each one's bookkeeping and its end, as before)
         Texture* tex = e.tex;
         if (e.shifted) n_dead++, b_dead += tex->bytes;
+        if (stable && !sweep && !e.over) {   // (Ocarina Engine: one with content of its own gone for the budget: counted, and when)
+            st_sb_evicted.fetch_add(1, std::memory_order_relaxed);
+            st_sb_evicted_bytes.fetch_add(tex->bytes + tex->pad, std::memory_order_relaxed);
+            note_evicted(evicted_key(tex->gpu, tex->width, tex->height, tex->nvn_format), now_ms);
+        }
         watch_tex(tex, "evicted");
         if (!tex->gpu_written && tex->uploaded && !remade_skip_old()) {   // (above: made again, it is uploaded from memory)
             std::lock_guard lk(from_memory_mu);

@@ -68,7 +68,30 @@ uint64_t hos_sys_alloc(uint64_t size, uint64_t align) {
     return a;
 }
 
-uint64_t hos_region_alloc(uint64_t size, uint64_t align) {
+/* (port-samuel) HOS_LAZY_REGIONS (Windows; on by default, =0: as before): an address region the game asks for
+   (nn::os::AllocateAddressRegion) is only reserved, as on the console: its pages are committed when the game maps them
+   (AllocateMemoryPages, MapPhysicalMemory), when the Vulkan import takes them, or on first touch (commit_on_touch), and a
+   freed region's pages are decommitted (those under a Vulkan import stay, zeroed, as FreeMemoryPages does). Committed
+   whole, a region counted in the process's private bytes (the commit charge) all its life, mapped or not, and a freed
+   one stayed counted (DiscardVirtualMemory gives the RAM back, not the commit) */
+static int lazy_regions(void) {
+#if defined(_WIN32) && !defined(A64_MEM_ZERO) && !defined(__EMSCRIPTEN__)
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("HOS_LAZY_REGIONS");
+        v = e ? atoi(e) != 0 : 1;
+    }
+    extern int hos_large_pages;   /* (hos_main.c: the window committed whole in large pages: nothing to save) */
+    return v && !hos_large_pages;
+#else
+    return 0;
+#endif
+}
+
+static uint64_t region_alloc(uint64_t size, uint64_t align, int commit);
+uint64_t hos_region_alloc(uint64_t size, uint64_t align) { return region_alloc(size, align, 1); }
+
+static uint64_t region_alloc(uint64_t size, uint64_t align, int commit) {
     if (align < 0x1000) align = 0x1000;
     size = (size + 0xFFF) & ~0xFFFULL;
     LOCK();
@@ -111,7 +134,7 @@ uint64_t hos_region_alloc(uint64_t size, uint64_t align) {
         if (found < region_floor && found >= HOS_HEAP_BASE) region_floor = found;   /* (not the holes below) */
     }
     UNLOCK();
-    if (found) hos_commit(found, size);
+    if (found && commit) hos_commit(found, size);
     if (!found) hos_fatal(NULL, "address space exhausted (%#llx bytes asked, heap %#llx)", (unsigned long long)size,
                           (unsigned long long)hos_heap_size);
     return found;
@@ -165,7 +188,19 @@ void hos_region_free(uint64_t addr) {
         }
     }
     UNLOCK();
-    if (freed_size) discard_pages(freed, freed_size);
+    if (!freed_size) return;
+#if defined(_WIN32) && !defined(A64_MEM_ZERO) && !defined(__EMSCRIPTEN__)
+    if (lazy_regions() && hos_guest_range(freed, freed_size) && !getenv("HOS_KEEP_FREED_PAGES")) {
+        /* (port-samuel, HOS_LAZY_REGIONS) decommitted: the commit charge goes back too. Pages a Vulkan import holds stay
+           committed, zeroed (FreeMemoryPages' rule: decommitted pages under an import faulted the device) */
+        extern int rx_guest_imported(uint64_t lo, uint64_t hi);
+        const uint64_t lo = (freed + 0xFFF) & ~0xFFFULL, hi = (freed + freed_size) & ~0xFFFULL;
+        if (hi > lo && rx_guest_imported(lo, hi)) discard_pages(freed, freed_size);
+        else if (hi > lo) VirtualFree(GP(lo), (SIZE_T)(hi - lo), MEM_DECOMMIT);
+        return;
+    }
+#endif
+    discard_pages(freed, freed_size);
 }
 
 /* ---- nn::os memory -------------------------------------------------------------------------------------- */
@@ -234,7 +269,19 @@ HLE(_ZN2nn2os19AllocateMemoryBlockEPmm) {
 /* nn::os::AllocateAddressRegion(unsigned long*, unsigned long) -> Result */
 HLE(_ZN2nn2os21AllocateAddressRegionEPmm) {
     HOS_TRACE_CALL("AllocateAddressRegion");
-    G64(ARG(0)) = hos_region_alloc(ARG(1), 0x10000);
+    const int lazy = lazy_regions();
+    G64(ARG(0)) = region_alloc(ARG(1), 0x10000, !lazy);
+    if (lazy) {   /* (port-samuel) what the lazy commit left out of the commit charge: the first ones and every 1 GB */
+        static uint64_t reserved, said;
+        static int n;
+        reserved += ARG(1);
+        if (++n <= 4 || reserved >= said + (1ULL << 30)) {
+            said = reserved;
+            hos_log("mem: address region of %llu MB reserved, committed as the game maps it (%llu MB in %d regions so far; "
+                    "HOS_LAZY_REGIONS=0: committed whole)", (unsigned long long)(ARG(1) >> 20),
+                    (unsigned long long)(reserved >> 20), n);
+        }
+    }
     RET(0);
 }
 
@@ -256,6 +303,9 @@ HLE(_ZN2nn2os19AllocateMemoryPagesEmm) {
     }
     static int zero_all = -1;
     if (zero_all < 0) zero_all = getenv("HOS_ZERO_ALL_PAGES") != NULL;
+    /* (port-samuel, HOS_LAZY_REGIONS) a lazy region's pages below 4 GB are committed here too, before the zeroing below, so
+       that host APIs given them (ReadFile into a game buffer) find them usable. A commit leaves committed pages as they are */
+    if (lazy_regions() && end <= (1ULL << 32)) hos_commit(a, n);
     if (end > (1ULL << 32) && !zero_all) {
         /* (mkw-recomp) above 4 GB the used-page bitmap does not reach, and zeroing the whole range wiped live data
            when the game mapped pages over memory it already used (a heap's list lost its links). Horizon's rule
