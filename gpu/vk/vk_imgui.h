@@ -22,6 +22,8 @@ bool begin(uint32_t w, uint32_t h);
 const Fonts& fonts();
 /// The start-up screen's logo (assets/hookshot.png), or null; its width over its height in *aspect
 ImTextureData* logo(float* aspect);
+/// (ocarina) The Ocarina Engine icon (gpu/vk/ocarina_logo.h: nx2/ocarina_logo.py), or null; its width over its height in *aspect
+ImTextureData* brand_logo(float* aspect);
 /// The frame's drawing over the window's image `index` (TRANSFER_DST_OPTIMAL before and after): new glyphs and textures
 /// copied in on cmd first (no wait on the queue), then one render pass
 void record(VkCommandBuffer cmd, uint32_t index, uint32_t w, uint32_t h);

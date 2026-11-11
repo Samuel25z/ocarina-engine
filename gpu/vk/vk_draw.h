@@ -69,6 +69,7 @@ void draw_stats3(int64_t* pending_skips, int64_t* waits, double* wait_ms);
 /// of the cold, those a worker has built since, and the workers' time in them. False: no stage libraries (RX_VK_GPL)
 bool draw_stats4(int64_t* links, double* link_ms, int64_t* lib_hits, int64_t* lib_cold, int64_t* lib_built, double* lib_build_ms);
 void draw_skip_report(double frames);   // (hookshot) skips by the line that made them
+void draw_zero_report();                // (zero-travadas) the "vk: zero stutter (textures)" line, every 600 presents
 int64_t draw_desc_reused();
 /// (RX_VK_DESC_SLOTGEN) Of those, the reuses the global registrations' generation check would have rebuilt for
 int64_t draw_slotgen_saves();

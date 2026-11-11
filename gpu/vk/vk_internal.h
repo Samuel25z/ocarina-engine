@@ -120,6 +120,24 @@ BufferRef gpu_buffer(uint64_t gpu, uint64_t size);   // (empty when no pool hold
 /// imported pool. written: the GPU may write it (copied back to guest memory at the submission's end).
 BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written);
 BufferRef stream_copy(const void* src, uint64_t n);   // vk_draw.cpp: bytes in the recording's stream, as a binding
+// (zero-travadas) A pool's import (vkAllocateMemory over the game's pages: 15-60 ms a 16 MB chunk on NVIDIA) was made where the
+// draw that first bound the chunk was, on the replay thread: the "descriptors" and "commands" spikes of the frame traces (each
+// "pool ... imported in 44 ms" line of the log sits right before a slow submit of that length). Now the import goes to the
+// imports' thread and the bindings that say they can (ImportCopyOk) are served meanwhile: 1: from a copy in the recording's
+// stream (vertices, indices, a read storage buffer); 2: gpu_buffer_bind answers nothing and the caller reads the range itself
+// (a uniform buffer: as submitted, into the stream). Everything else waits for the import, as before.
+// RX_VK_ASYNC_IMPORT: unset: those bindings, on NVIDIA; 0: off; 1: every read binding, any card (as before this); 2: those, any card
+int memory_import_copy_kind(int kind);   // (vk_memory.cpp: this thread's, set; the one before returned)
+bool gpu_bind_was_copy();                // (vk_memory.cpp: this thread's last gpu_buffer_bind answered a stream copy; read once)
+uint64_t stream_serial();                // (vk_draw.cpp: changes with each recording this thread begins: a stream copy lasts that long)
+void memory_zero_report();               // (vk_memory.cpp: the "vk: zero stutter (memory)" line, every 600 presents)
+struct ImportCopyOk {
+    int before;
+    explicit ImportCopyOk(int kind) : before(memory_import_copy_kind(kind)) {}
+    ~ImportCopyOk() { memory_import_copy_kind(before); }
+    ImportCopyOk(const ImportCopyOk&) = delete;
+    ImportCopyOk& operator=(const ImportCopyOk&) = delete;
+};
 /// Authored constants in the recording's stream: never recycled until its recording completes.
 /// Fill mapped, then flush memory through binding.offset + binding.size before GPU use.
 struct UniformUpload {
@@ -265,7 +283,21 @@ struct ImageMove {
 };
 /// The free space inside the textures' pool's blocks, and what the blocks hold in all; false without the pool
 bool textures_pool_usage(uint64_t* block_bytes, uint64_t* free_bytes);
-bool image_compact_begin(uint64_t max_bytes_a_pass, uint32_t max_moves_a_pass);
+/// (targets: the render targets' blocks instead, Ocarina Engine's VRAM governor; vk_texture.cpp moves their images too)
+bool image_compact_begin(uint64_t max_bytes_a_pass, uint32_t max_moves_a_pass, bool targets = false);
+/// (Ocarina Engine, RX_VK_VRAM_GOV) the image pools now: their blocks, the free space in them, how many blocks; the blocks VMA
+/// holds in device-local memory in all (dedicated allocations too). False without the textures' and the targets' pools
+struct ImagePoolsUsage {
+    uint64_t tex_blocks = 0, tex_free = 0, tgt_blocks = 0, tgt_free = 0, misc_blocks = 0, misc_free = 0, device_blocks = 0;
+    uint32_t tex_n = 0, tgt_n = 0, misc_n = 0;
+    uint64_t block = 0, misc_block = 0;   // (the pools' block sizes)
+};
+bool image_pools_usage(ImagePoolsUsage* u);
+/// (vk_texture.cpp) the block size of the pool of the other images under the VRAM governor; 0: as before (RX_VK_IMAGE_BLOCK_MB)
+uint64_t vram_gov_misc_block_bytes();
+/// (vk_memory.cpp) the mirrors' budget before the VRAM governor's cut, and the cut (RX_VK_VRAM_GOV: the last of its levers)
+uint64_t mirror_budget_base();
+void vram_gov_mirror_cut(uint64_t bytes);
 bool image_compact_active();
 /// A pass begun: the moves VMA asks for. False: nothing left to move, the compaction is over (then *freed_bytes and
 /// *freed_blocks say what went back to the driver in all)

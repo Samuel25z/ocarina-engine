@@ -45,6 +45,8 @@
 #include "vk_antilag.h"
 #include "upscaler_rows.h"
 #include "menu_restart.h"
+#include "ocarina_brand.h"   // (ocarina: the banner's name and icon, the start-up screen's)
+#include "ocarina_update.h"  // (ocarina: the Gameplay tab's update rows)
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 #ifndef HOOKSHOT_VERSION   // (nx2/build.py gives it to this file: nx2/version.py)
 #define HOOKSHOT_VERSION "unknown"
@@ -99,6 +101,17 @@ const char* tx_framegen(int v) {
     return t[v];
 }
 const char* tx_onoff(int v) { return v ? "On" : "Off"; }
+// (ocarina) The Gameplay tab's update rows (ocarina_update.h): no value of their own; told apart by their names' addresses.
+// Their hint, under the help, is what the update says now (variant -1), or its longest lines (measure_help)
+const char kUpdateHeading[] = "Ocarina Engine v" OCARINA_VERSION;
+const char kUpdateVersionRow[] = "Versão";
+const char kUpdateButtonRow[] = "Atualização";
+const char* update_hint(int, int variant) {
+    if (variant >= 0) return ocarina_update::sample(variant);
+    static std::string now;
+    now = ocarina_update::view().detail;
+    return now.empty() ? nullptr : now.c_str();
+}
 const char* tx_profile(int v) { return v ? "Handheld" : "Docked"; }   // (opts.handheld: the Profile row)
 const char* tx_menu_shortcut(int v) {
     // (F1 is never turned off: the menu is always one key away. Esc as well, as a PC game's pause menu)
@@ -855,6 +868,14 @@ Row rows[] = {
     {TAB_DEBUG, "Sampler cache", &opts.sampler_cache, 0, 1, 1, tx_onoff,
      "What a sampler holds is kept beside it on the replay thread, so resolving a sampler that was not registered anew takes no "
      "lock. Helps while the game streams textures. Applies after restart.", nullptr, true},
+    // (ocarina) the update: a heading, the version and what GitHub has, the button (vk_menu.cpp is_update_row)
+    {TAB_GAMEPLAY, kUpdateHeading, nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},
+    {TAB_GAMEPLAY, kUpdateVersionRow, nullptr, 0, 0, 0, nullptr,
+     "A versão do Ocarina Engine deste jogo e a mais nova publicada no GitHub. O jogo pergunta uma vez a cada início, sem atrasar "
+     "nada, e não manda nenhum dado seu.", update_hint, false, true},
+    {TAB_GAMEPLAY, kUpdateButtonRow, nullptr, 0, 0, 0, nullptr,
+     "Procurar atualização pergunta ao GitHub agora. Com uma versão nova, Atualizar baixa a hookshot_vk.dll, confere se ela serve "
+     "para este jogo e a coloca no lugar; ela vale a partir do próximo início.", update_hint, false, true},
     // (Restart and Quit stay the table's last two: kRestartRow and kQuitRow count back from its end)
     {TAB_GAMEPLAY, "Restart", nullptr, 0, 0, 0, nullptr,
      "Starts the game again. Save your progress first. Press Enter or A twice to restart. Esc or B "
@@ -866,6 +887,8 @@ constexpr int kQuitRow = sizeof rows / sizeof rows[0] - 1;
 constexpr int kRestartRow = kQuitRow - 1;
 const Row* pending = nullptr;   // (Restart or Quit: shows Confirm until its second press)
 bool cheats_env = false;   // (HOS_OOT_CHEATS=1: on whatever the Debug tab says)
+/// (ocarina) The update's version row or its button (not the heading)
+bool is_update_row(const Row& r) { return r.name == kUpdateVersionRow || r.name == kUpdateButtonRow; }
 /// The debug tools: the Debug tab's row, or HOS_OOT_CHEATS=1
 bool cheats_on() { return cheats_env || opts.debug_tools; }
 std::atomic<int> protect_hearts{-1};
@@ -1259,7 +1282,8 @@ void save() {
         if (!mic_want.empty()) fprintf(f, "microphone_device=%s\n", mic_want.c_str());   // (hookshot: also while it is unplugged)
         // (2: game_speed below 2 was only ever the old default, see menu_init; 3: the mouse's buttons are bindings, see
         // host/nn_hid.c binds_load; 4: Descriptor reuse on by default, see menu_init and vk_draw.cpp desc_slotgen_on)
-        fprintf(f, "options_version=4\n");
+        // (5, zero-travadas: Descriptor reuse and Sampler cache both on by default, see menu_init and vk_draw.cpp)
+        fprintf(f, "options_version=5\n");
         fputs(others.c_str(), f);
         if (!can_bind()) fputs(kept.c_str(), f);
         for (int i = 0; i < HOS_KEY_N && can_bind(); i++) {   // (the keys-only controls, HOS_KEY_*, have no pad_ line)
@@ -1465,7 +1489,7 @@ float measure_help(ui::Ctx& c, float width) {
     float most = 0;
     for (const Row& r : rows) {
         float hint = 0;
-        for (int v = r.lo; r.value && r.hint && v <= r.hi; v++)
+        for (int v = r.lo; (r.value || is_update_row(r)) && r.hint && v <= r.hi; v++)   // (ocarina: the update's, lo = hi = 0)
             for (int k = 0; const char* t = r.hint(v, k); k++)
                 hint = std::max(hint, ui::para(c, c.f.body, 16 * c.s, ImVec2(), 0, t, width - 18 * c.s, false));
         if (r.help) most = std::max(most, ui::para(c, c.f.body, 18 * c.s, ImVec2(), 0, r.help, width, false) + (hint ? 14 * c.s + hint : 0));
@@ -1840,15 +1864,33 @@ void draw_options(ui::Ctx& c) {
     }
     {   // (which build, at the banner's left, so a report can say it without opening the log; the release alone when the whole
         // line would run into the tabs)
-        std::string ver = std::string("Hookshot ") + HOOKSHOT_VERSION;
-        const float room = (c.w - total) * 0.5f - 60 * s - c.safe, px = 15 * s;
+        const bool brand = brand_on();   // (ocarina: the icon, "Ocarina Engine" over the version and the credit)
+        std::string rel = HOOKSHOT_VERSION;
+        const auto make = [&] { return brand ? rel + " - " + kBrandCredit : "Hookshot " + rel; };
+        std::string ver = make();
+        float room = (c.w - total) * 0.5f - 60 * s - c.safe, lx = c.safe;
+        float aspect = 1;
+        ImTextureData* icon = brand ? ui::brand_logo(&aspect) : nullptr;
+        const float ih = hh - 16 * s;   // (the icon: the banner's height less a margin)
+        if (icon && ih * aspect + 8 * s < room * 0.35f) {
+            c.d->AddImage(icon->GetTexRef(), ImVec2(lx, ty - ih * 0.5f), ImVec2(lx + ih * aspect, ty + ih * 0.5f));
+            lx += ih * aspect + 8 * s, room -= ih * aspect + 8 * s;
+        }
+        const float px = brand ? 12 * s : 15 * s, vy = brand ? ty + 10 * s : ty;
         const auto width = [&](float p) { return ui::size_of(c.f.body, p, ver.c_str()).x; };
-        if (width(px) > room && ver.find(" (") != std::string::npos) ver.resize(ver.find(" ("));
+        if (width(px) > room && rel.find(" (") != std::string::npos) rel.resize(rel.find(" (")), ver = make();
         // (still too long, as a source build's "v2.0.11-821-g7b81752-dirty" since the Audio tab: at Small and Medium smaller
         // until it fits, on half-point steps, 10 points at the least; at Large, the size for a TV across the room, at its size
         // or not at all, as before)
-        const float fit = ui::fit_px(px, opts.menu_size == 3 ? px : kVersionMinPt * s, 0.5f * s, room, width);
-        if (fit > 0) ui::text_mid(c, c.f.body, fit, c.safe, ty, ui::kBannerInk, ver.c_str());
+        float fit = ui::fit_px(px, opts.menu_size == 3 ? px : kVersionMinPt * s, 0.5f * s, room, width);
+        if (brand && fit <= 0) ver = kBrandCredit, fit = ui::fit_px(px, kVersionMinPt * s, 0.5f * s, room, width);   // (the credit at least)
+        if (fit > 0) ui::text_mid(c, c.f.body, fit, lx, vy, ui::kBannerInk, ver.c_str());
+        if (brand) {
+            const float np = 17 * s;
+            const auto nwidth = [&](float p) { return ui::size_of(c.f.heading, p, kBrandName).x; };
+            const float nfit = ui::fit_px(np, kVersionMinPt * s, 0.5f * s, room, nwidth);
+            if (nfit > 0) ui::text_mid(c, c.f.heading, nfit, lx, ty - 9 * s, ui::kBannerInk, kBrandName);
+        }
     }
     // the rows, in the column; the help beside it
     float cx0, cx1, hx0, hx1;
@@ -1857,7 +1899,7 @@ void draw_options(ui::Ctx& c) {
     column(c, cx0, cx1, hh);
     const int count = tab_row_count(cur_tab), sel = tab_selected[cur_tab];
     const Row& selr = rows[tab_row_to_global(cur_tab, sel)];
-    const char* hint = selr.value && selr.hint ? selr.hint(*selr.value, -1) : nullptr;
+    const char* hint = selr.value && selr.hint ? selr.hint(*selr.value, -1) : is_update_row(selr) ? selr.hint(0, -1) : nullptr;
     const std::string pending_line = (cur_tab == TAB_GRAPHICS || cur_tab == TAB_DEBUG) && restart_pending() ? restart_line(c, 16 * s, hx1 - hx0 - 66 * s) : "";
     static float help_tall = 0, help_tall_w = 0;
     if (help_tall_w != hx1 - hx0) help_tall_w = hx1 - hx0, help_tall = measure_help(c, hx1 - hx0 - 48 * s);
@@ -1866,6 +1908,13 @@ void draw_options(ui::Ctx& c) {
     ui::Prompt prompt_list[5] = {{ui::kUpDown, "Choose"}, {ui::kLeftRight, "Change"}, {ui::kTabs, "Tabs"}, {ui::kBack, "Close"}};
     int prompts_n = cur_tab == TAB_MOTION ? 3 : 4;
     if (!selr.value) prompt_list[1] = {ui::kConfirm, confirms ? (pending == &selr ? "Confirm" : selr.name) : "Open"};
+    static std::string update_prompt;   // (ocarina: the update's button says what it does now)
+    if (is_update_row(selr)) {
+        const ocarina_update::View u = ocarina_update::view();
+        update_prompt = u.can_press ? u.button : "";
+        if (update_prompt.empty()) prompts_n--, prompt_list[1] = prompt_list[2], prompt_list[2] = prompt_list[3];   // (nothing to press)
+        else prompt_list[1] = {ui::kConfirm, update_prompt.c_str()};
+    }
     if (cur_tab == TAB_MOTION) prompt_list[2] = {ui::kBack, "Back"};   // (Esc: to Controls)
     if (selr.cheat >= 0) {   // (a debug tool: Change when Left and Right do something, then what confirm does)
         prompts_n = 1;
@@ -1919,6 +1968,10 @@ void draw_options(ui::Ctx& c) {
             halves_cell(c, va, vb, "Off", "On", tool == "On", selected, false);
         } else if (r.cheat >= 0 && !tool.empty()) {   // (a debug tool with a value: arrows when Left and Right choose it)
             choice_cell(c, va, vb, tool, selected, cheat_chooses(r.cheat), cheat_chooses(r.cheat));
+        } else if (is_update_row(r)) {   // (ocarina: the version and what GitHub has; the button, labelled with what it does now)
+            const ocarina_update::View u = ocarina_update::view();
+            if (r.name == kUpdateButtonRow) ui::button(c, va, vb, u.button.c_str(), selected);
+            else choice_cell(c, va, vb, u.status, selected, false, false);
         } else if (!r.value) {   // (a page, or Restart and Quit: Confirm until the second press)
             if (pending == &r) choice_cell(c, va, vb, "Press again to confirm", selected, false, false);
             else {
@@ -2447,10 +2500,11 @@ void draw_startup(ui::Ctx& c) {
     const float lh = 112 * s, top = h * 0.5f - 176 * s;
     for (int i = 40; i >= 1; i--) c.d->AddCircleFilled(ImVec2(cx, top + lh * 0.5f + 70 * s), h * 0.021f * i, ui::rgba(46, 33, 18, 4), 128);
     float aspect = 1;
-    ImTextureData* logo = ui::logo(&aspect);
+    ImTextureData* logo = brand_on() ? ui::brand_logo(&aspect) : nullptr;   // (ocarina: its icon, else Hookshot's logo)
+    if (!logo) logo = ui::logo(&aspect);
     if (logo) c.d->AddImage(logo->GetTexRef(), ImVec2(cx - lh * aspect * 0.5f, top), ImVec2(cx + lh * aspect * 0.5f, top + lh));
     float y = top + lh + 16 * s;
-    ui::spaced(c, c.f.heading, 42 * k, ImVec2(cx, y), ui::rgba(246, 232, 204), "HOOKSHOT", 6 * k);
+    ui::spaced(c, c.f.heading, (brand_on() ? 36 : 42) * k, ImVec2(cx, y), ui::rgba(246, 232, 204), brand_on() ? "OCARINA ENGINE" : "HOOKSHOT", 6 * k);
     ui::flourish(c, cx - 190 * k, cx + 190 * k, y + 66 * k, ui::kAccent);
     ui::text_centre(c, c.f.body, 14.5f * k, ImVec2(cx, y + 78 * k), ui::kDim, v.version.c_str());
     if (!v.title.empty()) {
@@ -2587,6 +2641,10 @@ void menu_init() {
         // (Descriptor reuse is on by default from options_version 4: a file from before wrote its 0 whether chosen or not, as
         // the off default it then was; fewer stutters and a better 1% low in the field, the flash checks clean, 2026-11-10)
         if (version < 4) opts.descriptor_reuse = 1;
+        // (zero-travadas: both rows on for a file from before options_version 5, whatever it said: its Sampler cache 0 was the
+        // off default written whether chosen or not, and the two off were a third more frames over 50 ms on a GTX 1660. A
+        // choice made in the menu from now on is saved with version 5 and kept)
+        if (version < 5) opts.descriptor_reuse = 1, opts.sampler_cache = 1;
     }
     // An opt-in profile for 4 GB cards: keep existing options authoritative, but make a first run usable on
     // low-VRAM hardware without requiring the menu to render first.
@@ -3165,7 +3223,10 @@ void menu_tick() {
                 }
             }
         } else if (r.cheat >= 0) cheat_press(r.cheat, press, changed);   // (a debug tool: on the Debug tab itself)
-        else if (press[7] && is_motion_row(r)) cur_tab = TAB_MOTION, tab_selected[TAB_MOTION] = 0, press[7] = false, changed = true;
+        else if (press[7] && is_update_row(r)) {   // (ocarina: Atualizar or Procurar atualização; nothing while it works)
+            if (!press[5]) ocarina_update::press();
+            press[7] = false, changed = true;
+        } else if (press[7] && is_motion_row(r)) cur_tab = TAB_MOTION, tab_selected[TAB_MOTION] = 0, press[7] = false, changed = true;
         else if (press[7] && !r.value && can_bind()) page = 1, csel = 0, ccol = 0, changed = true;
         if ((press[3] || press[4] || press[7]) && r.value) {   // (Enter, or A, as Right)
             if (press[7]) press[4] = true;

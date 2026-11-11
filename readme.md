@@ -8,7 +8,23 @@ Zelda: Ocarina of Time (Switch 2) no PC, em placas comuns, não só nas topo de 
 O Ocarina Engine não traz o jogo. Você monta o jogo com o HookshotBuilder a partir da sua própria cópia, e o Ocarina Engine
 troca só o renderizador (`hookshot_vk.dll`).
 
-## O que muda em relação ao Hookshot (v0.2)
+## Novo na v0.3: menos travadas ainda, e atualização pelo menu
+
+Medido na GTX 1660 Super (Burgo de Hyrule, mesmo caminho repetido, 3 pares alternados de 200 s): a v0.3 contra a mesma DLL com as correções desligadas (= v0.2):
+**quadros acima de 50 ms 174 contra 292 (-40%), acima de 100 ms 15 contra 19 (-22%), 28,9 contra 27,3 fps.** As travadas de 110 ms por sincronismo de memória sumiram.
+
+- **Importação de memória em segundo plano:** quando o jogo começa a usar um pedaço novo de memória, o driver demorava 15 a 60 ms para "prender" essas páginas no meio do desenho. Agora isso roda numa thread de fundo (em placas NVIDIA).
+- **Páginas tardias sem espera:** as páginas que a placa ainda estava escrevendo de volta são copiadas pela própria placa, em vez de o jogo parar e esperar.
+- **Invalidação por textura:** quando uma textura sai da memória, só os desenhos que a usavam são refeitos, não todos.
+- **Descriptor reuse e Sampler cache** ligados de fábrica (menu Debug).
+- **Trava de VRAM:** a memória da placa fica abaixo do limite que o driver permite (meta de 88%): devolve ao driver o espaço vazio preso nos blocos, enxuga o orçamento de texturas só no excesso e, por último, os espelhos. No notebook com RTX 4050 6 GB, praça do Burgo: 4,9-5,0 GB em vez de 5,3-5,4 GB, **~28 fps em vez de ~20** e cerca de 1/5 dos quadros acima de 50 ms. `RX_VK_VRAM_GOV=0` desliga; `RX_VK_VRAM_TARGET_PCT=<50-97>` muda a meta.
+- **Correções trazidas do Hookshot oficial e do Mako:** congelamento em placas AMD ao fechar menu ou mapa (programas que o driver AMD derruba ficam fora dele), perda da placa ao desenhar em fatias 3D comprimidas, leitura da CPU que agora espera a escrita da GPU, desenhos que escrevem memória mantidos enquanto o pipeline compila, chefes e inimigos novos que apareciam todos azuis, texturas adiadas só uma vez e texturas grandes zeradas limpas na GPU.
+- **Botão Atualizar** (Insert/F1 > Gameplay): o jogo avisa quando sai uma versão nova do Ocarina Engine e troca o `hookshot_vk.dll` sozinho, com um reinício. `OCARINA_NO_UPDATE_CHECK=1` (variável do sistema) desliga.
+- **Marca:** título da janela, abertura e menu dizem Ocarina Engine (`RX_VK_BRAND=0` volta ao original).
+
+Para desligar e comparar (no `hookshot_env.txt`): `RX_VK_ASYNC_IMPORT=0`, `RX_VK_LATE_LIVE=0`, `RX_VK_TEX_GONE_EXACT=0`, `RX_VK_DESC_SLOTGEN=0`, `RX_VK_SAMPLER_CACHE=0`.
+
+## O que mudou na v0.2 em relação ao Hookshot
 
 Comparado com o Hookshot 2.1.0, mesmo jogo, mesmo caminho repetido na praça do Burgo de Hyrule, 100% de resolução, sem geração de quadros:
 
@@ -39,7 +55,7 @@ Cada mudança pode ser desligada para comparar (no `hookshot_env.txt`): `RX_VK_S
 3. Copie o `hookshot_env.txt` do release para a pasta do jogo.
 4. Abra o jogo. Na primeira vez ele prepara os shaders de novo (um minuto e pouco).
 
-Esta versão (v0.2.0) é para o **HookshotBuilder v2.1.0**. Cada release diz com qual versão do builder ele funciona. Se o jogo não abrir, a versão do builder não casa:
+Esta versão (v0.3.0) é para o **HookshotBuilder v2.1.0**. A partir dela, as próximas versões chegam pelo botão Atualizar no menu do jogo (Insert/F1 > Gameplay). Cada release diz com qual versão do builder ele funciona. Se o jogo não abrir, a versão do builder não casa:
 use a indicada no release.
 
 ## Quem faz

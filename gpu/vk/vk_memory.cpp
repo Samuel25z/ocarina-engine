@@ -964,6 +964,61 @@ std::atomic<bool> captures_seen{false};
 std::atomic<uint64_t> cap_view_gen{1};   // (bumped when a capture is published or a page is stamped: cached reads go stale)
 void cap_view_bump() { cap_view_gen.fetch_add(1, std::memory_order_release); }
 double st_tk_all, st_tk_stamp, st_tk_copy, st_tk_late, st_tk_lock;   // (memory_take_capture's parts, ms)
+// (zero-travadas) what the "vk: zero stutter (memory)" line counts, since the last one (memory_zero_report)
+std::atomic<int64_t> zs_sync_imports{0}, zs_sync_import_us{0}, zs_sync_import_worst_us{0};   // (imports where the replay was)
+std::atomic<int64_t> zs_bg_wait_n{0}, zs_bg_wait_us{0}, zs_bg_wait_worst_us{0};              // (waits for one under way)
+std::atomic<int64_t> zs_bg_sent{0}, zs_copy_n{0}, zs_copy_bytes{0}, zs_copy_memo{0}, zs_copy_own{0}, zs_copy_over{0};
+std::atomic<int64_t> zs_late_pages{0}, zs_late_takes{0}, zs_late_waits{0}, zs_late_wait_us{0}, zs_late_wait_worst_us{0},
+    zs_late_cpu_waits{0};
+inline void zs_worst(std::atomic<int64_t>& worst, int64_t v) {
+    int64_t w = worst.load(std::memory_order_relaxed);
+    while (v > w && !worst.compare_exchange_weak(w, v, std::memory_order_relaxed)) {}
+}
+inline int64_t zs_us_since(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+}
+// (zero-travadas) A capture's late pages (the ones a submission still on the GPU writes back: capture_make) made the replay wait
+// for that submission before it recorded the next one: 7-8 ms a frame in the stretches where the GPU ran behind (100 waits in
+// 600 takes on an RTX 4050), 70-118 ms alone when an upload burst held the GPU. Now, when that submission is not done at the
+// take, those pages are left out of the capture: a mirror sync then copies them from guest memory on the GPU ("from guest
+// memory as it was at the replay"), in the uploads of a recording that is queued after that submission, so the write-back has
+// landed when the copy runs, which is what the wait was for. Nobody waits. Kept here until that submission is done: a read of
+// such a page on the CPU (memory_read_as_submitted) still waits for it, as the take did. RX_VK_LATE_LIVE=0: the take waits, as before
+bool late_live_on() {
+    static const bool on = !getenv("RX_VK_LATE_LIVE") || atoi(getenv("RX_VK_LATE_LIVE")) != 0;
+    return on;
+}
+struct LateLive {
+    uint32_t page;
+    uint64_t value;
+};
+std::mutex late_live_mu;
+std::vector<LateLive> late_live;                 // (late_live_mu)
+std::atomic<uint32_t> late_live_n{0};            // (its size, read without the lock)
+std::atomic<uint32_t> late_live_lo{0}, late_live_hi{0};   // (and the pages it spans)
+void late_live_bounds_locked() {
+    uint32_t lo = ~0u, hi = 0;
+    for (const LateLive& e : late_live) lo = std::min(lo, e.page), hi = std::max(hi, e.page);
+    late_live_lo.store(lo, std::memory_order_relaxed), late_live_hi.store(hi, std::memory_order_relaxed);
+    late_live_n.store((uint32_t)late_live.size(), std::memory_order_release);
+}
+/// A CPU read of guest pages [page0, page1]: waits for the write-back of a late page among them (only called while there are any)
+void late_live_wait(uint64_t page0, uint64_t page1) {
+    if (page1 < late_live_lo.load(std::memory_order_relaxed) || page0 > late_live_hi.load(std::memory_order_relaxed)) return;
+    uint64_t v = 0;
+    {
+        const uint64_t done = vk_timeline_completed();
+        std::lock_guard lk(late_live_mu);
+        const size_t before = late_live.size();
+        std::erase_if(late_live, [&](const LateLive& e) { return e.value <= done; });
+        for (const LateLive& e : late_live)
+            if (e.page >= page0 && e.page <= page1) v = std::max(v, e.value);
+        if (late_live.size() != before) late_live_bounds_locked();
+    }
+    if (!v) return;
+    zs_late_cpu_waits.fetch_add(1, std::memory_order_relaxed);
+    vk_timeline_wait(v);
+}
 int64_t st_tk_late_n;   // (the takes that waited for the GPU for their late pages)   // (a capture was ever made: the replay thread's; without it nothing owns pages)
 
 // ---- texture storage in the capture ----
@@ -1102,6 +1157,10 @@ inline SubmittedPage& submitted_page_for(uint64_t page) {   // (a page and its n
 bool memory_read_as_submitted(uint64_t gpu, void* dst, uint64_t n) {
     // (once a capture exists, every uniform word took pools_mu to ask whether its page was in one. A page in none keeps
     // that answer until a stamp or a new capture)
+    if (n && late_live_n.load(std::memory_order_acquire)) {   // (zero-travadas: a late page left to the GPU's copy, read here)
+        const uint64_t g = gpu < (1ull << 40) ? gpu : host->gpu_guest(gpu);
+        if (g) late_live_wait(g >> kPageShift, (g + n - 1) >> kPageShift);
+    }
     if (!host->gpu_read(gpu, dst, n)) return false;
     if (!n || !capture_on() || !captures_seen.load(std::memory_order_relaxed)) return true;
     const uint64_t guest = gpu < (1ull << 40) ? gpu : host->gpu_guest(gpu);
@@ -1608,7 +1667,33 @@ void memory_recording_value(uint64_t value, uint64_t completed) {
 }
 bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed) {
     const auto tk0 = std::chrono::steady_clock::now();
-    if (c->late_value && c->map) {   // (the pages a submission still on the GPU writes back: see capture_make)
+    if (c->late_value && c->map && late_live_on() && vk_timeline_completed() < c->late_value) {
+        // (zero-travadas, above: that submission is not done. Its pages leave the capture's copied ones, so no table entry and
+        // no shadow is made of their stale copy: the mirror sync reads them from guest memory on the GPU, and the texture
+        // storage among them loses its shadow page below, as any page written and not copied)
+        size_t w = 0, j = 0;
+        for (size_t i = 0; i < c->copied.size(); i++) {   // (late and slots: both indices into pages, ascending)
+            while (j < c->late.size() && c->late[j] < c->slots[i]) j++;
+            if (j < c->late.size() && c->late[j] == c->slots[i]) continue;
+            c->copied[w] = c->copied[i], c->slots[w] = c->slots[i], w++;
+        }
+        c->copied.resize(w), c->slots.resize(w);
+        {
+            const uint64_t done = vk_timeline_completed();
+            std::lock_guard lk(late_live_mu);
+            std::erase_if(late_live, [&](const LateLive& e) { return e.value <= done; });
+            for (const uint32_t i : c->late) {
+                if (late_live.size() >= 4096) break;   // (a bound: the rest are read as they are, as a page in no capture)
+                bool known = false;
+                for (LateLive& e : late_live)
+                    if (e.page == c->pages[i]) e.value = std::max(e.value, c->late_value), known = true;
+                if (!known) late_live.push_back({c->pages[i], c->late_value});
+            }
+            late_live_bounds_locked();
+        }
+        zs_late_pages.fetch_add((int64_t)c->late.size(), std::memory_order_relaxed);
+        zs_late_takes.fetch_add(1, std::memory_order_relaxed);
+    } else if (c->late_value && c->map) {   // (the pages a submission still on the GPU writes back: see capture_make)
         // (timed apart: the replay thread waits here for the GPU, the more often the fewer pools have a mirror. With
         // RX_VK_MIRROR_MB=1024 on an 8 GB card it was most of a capture's 2.4-3 ms, six submits a frame: Hyrule Field at
         // 35-45 fps instead of 55, issue 995)
@@ -1616,6 +1701,11 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
         vk_timeline_wait(c->late_value);
         st_tk_late += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw).count();
         st_tk_late_n++;
+        {   // (zero-travadas: the waits left, for the "vk: zero stutter (memory)" line)
+            const int64_t us = zs_us_since(tw);
+            if (us >= 100) zs_late_waits.fetch_add(1, std::memory_order_relaxed), zs_late_wait_us.fetch_add(us, std::memory_order_relaxed);
+            zs_worst(zs_late_wait_worst_us, us);
+        }
         uint8_t* const base = (uint8_t*)host->guest_base();
         for (uint32_t i : c->late)
             guarded_copy((uint8_t*)c->map + (uint64_t)i * 4096, base + ((uint64_t)c->pages[i] << kPageShift), 4096);
@@ -1962,9 +2052,13 @@ Pool* pool_lookup(uint64_t guest, uint64_t size) {
                 return false;
             };
             if (under_way()) {
+                const auto w0 = std::chrono::steady_clock::now();
                 bg_done_cv.wait(lk, [&] { return !under_way(); });
                 waited = true;
                 st_bg_waits++;
+                const int64_t us = zs_us_since(w0);   // (zero-travadas: what is left of an import made off the replay thread)
+                zs_bg_wait_n.fetch_add(1, std::memory_order_relaxed), zs_bg_wait_us.fetch_add(us, std::memory_order_relaxed);
+                zs_worst(zs_bg_wait_worst_us, us);
             }
         }
         if (waited) {
@@ -2024,6 +2118,9 @@ Pool* pool_lookup(uint64_t guest, uint64_t size) {
             static double total_ms;
             static int n, logged;
             total_ms += ms, n++;
+            zs_sync_imports.fetch_add(1, std::memory_order_relaxed);   // (zero-travadas: the ones still made where the replay is)
+            zs_sync_import_us.fetch_add((int64_t)(ms * 1000.0), std::memory_order_relaxed);
+            zs_worst(zs_sync_import_worst_us, (int64_t)(ms * 1000.0));
             if ((ms >= 2.0 && logged++ < 200) || n % 256 == 0)
                 logf("vk: pool %#llx+%#llx imported in %.1f ms as %#llx..%#llx (%d imports, %.0f ms in all)",
                      (unsigned long long)range.lo, (unsigned long long)(range.hi - range.lo), ms, (unsigned long long)lo,
@@ -2098,6 +2195,29 @@ bool mirror_on() {
 /// under way (sent now or before) and nothing covers it yet; false: the synchronous path as before (covered, outside the game's
 /// pools, or next to an import that would have to grow). RX_VK_ASYNC_IMPORT=1 (opt-in: background imports slowed AMD before) (pools_mu held)
 int64_t st_async_sent, st_async_copies;
+// (zero-travadas: vk_internal.h, ImportCopyOk) 0: off, 1: every read binding, 2: the bindings that say they can be served meanwhile
+int async_import_mode() {
+    static const int mode = [] {
+        const char* e = getenv("RX_VK_ASYNC_IMPORT");
+        const bool nvidia = dev.props.vendorID == 0x10DE;
+        const int v = e ? atoi(e) : -1;
+        const int m = v < 0 ? (nvidia ? 2 : 0) : v == 0 ? 0 : v == 2 ? 2 : 1;
+        logf("vk: pool imports off the replay thread: %s (RX_VK_ASYNC_IMPORT%s; 0: off, 1: every read binding, 2: vertices, indices, "
+             "uniform and read storage buffers)", m == 0 ? "off" : m == 1 ? "every read binding" : "the bindings that can wait",
+             e ? "" : nvidia ? " unset, NVIDIA" : " unset, not NVIDIA");
+        return m;
+    }();
+    return mode;
+}
+thread_local int tl_copy_kind = 0;         // (ImportCopyOk: 0 none, 1 a stream copy, 2 the caller reads the range itself)
+thread_local bool tl_bind_copied = false;  // (gpu_bind_was_copy)
+struct CopyMemo {   // (a range copied into this recording's stream: the same binding again takes the same copy)
+    uint64_t guest = 0, size = 0, serial = 0;
+    BufferRef ref{};
+};
+thread_local CopyMemo copy_memo[64];
+thread_local uint64_t copy_serial = 0, copy_bytes = 0;   // (the bytes copied in the recording stream_serial() names)
+constexpr uint64_t kCopyBytesMax = 16ull << 20;          // (a recording's bound: past it a binding waits for the import)
 bool import_in_background(uint64_t guest, uint64_t size) {
     if (guest_pools.empty() || !size || !dev.external_memory_host) return false;
     bg_drain();
@@ -2119,6 +2239,10 @@ bool import_in_background(uint64_t guest, uint64_t size) {
         }
         return false;
     }
+    {   // (zero-travadas: one that failed lately is not sent again at every binding: the synchronous path answers, held as it is)
+        std::lock_guard hk(import_holds_mu);
+        if (!import_holds.allow(lo, hi, import_now_ms())) return false;
+    }
     std::lock_guard lk(bg_mu);
     for (const uint64_t x : bg_inflight)
         if (x >= lo && x < hi) return true;   // (under way)
@@ -2127,6 +2251,7 @@ bool import_in_background(uint64_t guest, uint64_t size) {
     bg_inflight.push_back(lo);
     bg_queue.push_back({lo, hi});
     bg_cv.notify_one();
+    zs_bg_sent.fetch_add(1, std::memory_order_relaxed);
     if (st_async_sent++ % 32 == 0)
         logf("vk: imports in the background: %lld sent, %lld bindings served from a copy meanwhile", (long long)st_async_sent,
              (long long)st_async_copies);
@@ -2146,7 +2271,15 @@ bool preset_caps_memory() {
     return !vram || vram <= ((nominal_gb[opts.preset] << 30) + (768ull << 20));
 }
 namespace {
+// (Ocarina Engine, RX_VK_VRAM_GOV) what the VRAM governor takes off the mirrors' budget, the last of its levers and slowly
+// (vk_texture.cpp): with less, the idle mirrors go at the next give-back and no new one is made past it. 0: none
+std::atomic<uint64_t> gov_mirror_cut{0};
+uint64_t mirror_budget_uncut();
 uint64_t mirror_budget() {
+    const uint64_t b = mirror_budget_uncut();
+    return b - std::min(b, gov_mirror_cut.load(std::memory_order_relaxed));
+}
+uint64_t mirror_budget_uncut() {
     // (a quarter of the card, at most the 3 GB it was for all: on a 6 GB laptop those and the textures were past what the card has)
     static const uint64_t b = [] {
         if (const char* e = getenv("RX_VK_MIRROR_MB")) return (uint64_t)atoi(e) << 20;
@@ -2695,16 +2828,39 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
     ParLock plk;   // (before pools_mu, always: a mirror sync records into the shared upload command buffer)
     std::lock_guard lk(pools_mu);
     {   // (hookshot, smoothness: import_in_background above. Reads up to 4 MB; not in a parallel replay's segment)
-        static const bool async_import = [] { const char* e = getenv("RX_VK_ASYNC_IMPORT"); return e && atoi(e) != 0; }();
-        if (async_import && !written && !par && size <= (4u << 20) && guest < (1ull << 40) &&
+        // (zero-travadas: on by default on NVIDIA for the bindings that say they can be served meanwhile, vk_internal.h)
+        const int mode = async_import_mode();
+        const int kind = mode == 1 ? 1 : mode == 2 ? tl_copy_kind : 0;
+        if (kind && !written && !par && size <= (4u << 20) && guest < (1ull << 40) &&
             !(last_pool && guest >= last_pool->lo && guest + size <= last_pool->hi) && import_in_background(guest, size)) {
-            uint64_t avail = 0;
-            const uint8_t* src = host->gpu_ptr(gpu, &avail);
-            if (src && avail >= size)
-                if (const BufferRef r = stream_copy(src, size)) {
-                    st_async_copies++;
-                    return r;
-                }
+            if (kind == 2) {   // (the caller reads it as submitted into the stream: uniform_range)
+                zs_copy_own.fetch_add(1, std::memory_order_relaxed);
+                return {};
+            }
+            const uint64_t serial = stream_serial();
+            CopyMemo& m = copy_memo[bind_slot(guest, size) & 63];
+            if (m.serial == serial && m.guest == guest && m.size == size && m.ref.buffer != VK_NULL_HANDLE) {
+                zs_copy_memo.fetch_add(1, std::memory_order_relaxed);
+                tl_bind_copied = true;
+                return m.ref;
+            }
+            if (copy_serial != serial) copy_serial = serial, copy_bytes = 0;
+            if (mode == 1 || copy_bytes + size <= kCopyBytesMax) {
+                uint64_t avail = 0;
+                const uint8_t* src = host->gpu_ptr(gpu, &avail);
+                if (src && avail >= size)
+                    if (const BufferRef r = stream_copy(src, size)) {
+                        st_async_copies++;
+                        copy_bytes += size;
+                        zs_copy_n.fetch_add(1, std::memory_order_relaxed);
+                        zs_copy_bytes.fetch_add((int64_t)size, std::memory_order_relaxed);
+                        m = CopyMemo{guest, size, serial, r};
+                        tl_bind_copied = true;
+                        return r;
+                    }
+            } else {
+                zs_copy_over.fetch_add(1, std::memory_order_relaxed);   // (it waits for the import below: what is left of it)
+            }
         }
     }
     Pool* p = pool_of(guest, size);
@@ -2765,6 +2921,36 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
         rb_hazard_locked(p->lo + off, p->lo + std::min(off + size, p->hi - p->lo));   // (memory_rb_refresh)
     }
     return remember({p->mirror, off, size, 0});
+}
+
+int memory_import_copy_kind(int kind) {
+    const int before = tl_copy_kind;
+    tl_copy_kind = kind;
+    return before;
+}
+bool gpu_bind_was_copy() {
+    const bool was = tl_bind_copied;
+    tl_bind_copied = false;
+    return was;
+}
+/// (zero-travadas) Every 600 presents: the costly events the two changes here are about, since the last line
+void memory_zero_report() {
+    const auto take = [](std::atomic<int64_t>& a) { return a.exchange(0, std::memory_order_relaxed); };
+    const int64_t si = take(zs_sync_imports), si_us = take(zs_sync_import_us), si_w = take(zs_sync_import_worst_us);
+    const int64_t bw = take(zs_bg_wait_n), bw_us = take(zs_bg_wait_us), bw_w = take(zs_bg_wait_worst_us);
+    const int64_t sent = take(zs_bg_sent), cn = take(zs_copy_n), cb = take(zs_copy_bytes), cm = take(zs_copy_memo);
+    const int64_t own = take(zs_copy_own), over = take(zs_copy_over);
+    const int64_t lp = take(zs_late_pages), lt = take(zs_late_takes), lw = take(zs_late_waits), lw_us = take(zs_late_wait_us);
+    const int64_t lw_w = take(zs_late_wait_worst_us), lc = take(zs_late_cpu_waits);
+    const int mode = async_import_mode();
+    logf("vk: zero stutter (memory): 600 presents: pool imports where the replay was %lld (%.1f ms, the slowest %.1f ms), sent to "
+         "the imports' thread %lld, waits for one under way %lld (%.1f ms, the slowest %.1f ms); bindings served meanwhile: %lld "
+         "copies (%.1f MB), %lld the same copy again, %lld uniform ranges read as submitted, %lld past a recording's 16 MB (waited) "
+         "(RX_VK_ASYNC_IMPORT %s); captures' late pages: %lld pages of %lld takes left to the GPU's copy, %lld takes waited for "
+         "the GPU (%.1f ms, the slowest %.1f ms), %lld CPU reads waited for one (RX_VK_LATE_LIVE %s)",
+         (long long)si, si_us / 1000.0, si_w / 1000.0, (long long)sent, (long long)bw, bw_us / 1000.0, bw_w / 1000.0, (long long)cn,
+         cb / 1048576.0, (long long)cm, (long long)own, (long long)over, mode == 0 ? "off" : mode == 1 ? "1" : "2", (long long)lp,
+         (long long)lt, (long long)lw, lw_us / 1000.0, lw_w / 1000.0, (long long)lc, late_live_on() ? "on" : "off");
 }
 
 // ---- mirrors given back ----
@@ -2871,8 +3057,12 @@ void mirrors_give_back(uint64_t want_bytes) {   // (pools_mu held)
         if (p.mstate == Pool::MIRROR_ON && p.retired_value <= mem_completed && !p.inherit_pending) mirror_free(p);
     }
     std::vector<Pool*> idle;
+    // (Ocarina Engine, RX_VK_VRAM_GOV) while the VRAM governor has cut the budget, a mirror not bound for 120 submissions is idle
+    // enough to go for it, so the cut is reached in seconds (the same rule otherwise: the GPU done with it; a new one past the
+    // budget is refused, so none comes back meanwhile)
+    const uint64_t idle_epochs = gov_mirror_cut.load(std::memory_order_relaxed) ? 120 : kIdleEpochs;
     for (auto& [lo, p] : imported)
-        if (p.mstate == Pool::MIRROR_ON && mirror_epoch - p.synced_epoch > kIdleEpochs && p.last_value <= mem_completed)
+        if (p.mstate == Pool::MIRROR_ON && mirror_epoch - p.synced_epoch > idle_epochs && p.last_value <= mem_completed)
             idle.push_back(&p);
     std::sort(idle.begin(), idle.end(), [](const Pool* a, const Pool* b) { return a->synced_epoch < b->synced_epoch; });
     for (Pool* p : idle)
@@ -3752,6 +3942,8 @@ void memory_end_submission(VkCommandBuffer cmd) {
     mirror_upload = false;
 }
 
+uint64_t mirror_budget_base() { return mirror_budget_uncut(); }
+void vram_gov_mirror_cut(uint64_t bytes) { gov_mirror_cut.store(bytes, std::memory_order_relaxed); }
 void memory_stats(int64_t* mirrors, uint64_t* mirror_mb, int64_t* sync_bytes, int64_t* sync_copies, int64_t* wb_bytes) {
     *mirrors = st_mirrors, *mirror_mb = mirror_bytes >> 20, *sync_bytes = st_sync_bytes, *sync_copies = st_sync_copies;
     *wb_bytes = st_wb_bytes;

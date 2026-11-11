@@ -9,6 +9,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -25,6 +26,8 @@
 #include "vk_reflex.h"
 #include "vk_antilag.h"
 #include "vk_progress.h"
+#include "ocarina_brand.h"   // (ocarina: the window's title)
+#include "ocarina_update.h"  // (ocarina: the menu's update, asked for once the window's renderer starts)
 
 namespace vkx {
 #define VKX_DEFINE(f) PFN_##f f;
@@ -984,6 +987,24 @@ static void choose_present_queue() {
     logf("vk: presents on a queue of their own, of compute family %u (RX_VK_PRESENT_QUEUE=0: off)", dev.present_family);
 }
 
+#ifdef _WIN32
+// (ocarina) The window's title as Ocarina Engine's: the host's leading "Hookshot" (host/hos.h HOS_GAME_TITLE) replaced, what
+// follows it kept; another title gets the name in front. Once, here: the host sets its title at CreateWindowA and never
+// again. start runs on the window's own thread (host/display.c display_main), so the text is set directly
+void brand_title(HWND hwnd) {
+    if (!brand_on()) return;
+    wchar_t old[256] = {};
+    GetWindowTextW(hwnd, old, 256);
+    const wchar_t* rest = old;
+    if (!wcsncmp(old, L"Hookshot", 8)) rest = old + 8;
+    else if (!wcsncmp(old, kBrandNameW, wcslen(kBrandNameW))) return;   // (already)
+    std::wstring t = kBrandNameW;
+    if (rest == old && *old) t += L" - ";
+    t += rest;
+    SetWindowTextW(hwnd, t.c_str());
+}
+#endif
+
 int start(void* hwnd) {
     main_window = (HWND)hwnd;
     if (!hwnd) {   // (HOS_HEADLESS: no window; the frames are rendered all the same, RX_VK_SHOTS writes them out)
@@ -1000,6 +1021,8 @@ int start(void* hwnd) {
     si.hinstance = GetModuleHandleA(nullptr);
     si.hwnd = (HWND)hwnd;
     if (vkCreateWin32SurfaceKHR(dev.instance, &si, nullptr, &dev.surface) != VK_SUCCESS) return 0;
+    brand_title((HWND)hwnd);
+    ocarina_update::begin();   // (ocarina: in the background; the last update's leftovers removed)
     VkBool32 ok = VK_FALSE;
     vkGetPhysicalDeviceSurfaceSupportKHR(dev.physical, dev.queue_family, dev.surface, &ok);
     if (!ok) return 0;

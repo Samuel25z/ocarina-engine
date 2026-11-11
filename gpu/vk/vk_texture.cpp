@@ -50,6 +50,7 @@
 #include "bc_levels.h"
 #include "astc_bc_policy.h"
 #include "vram_compact.h"
+#include "vram_gov.h"
 #include "keep_rendered.h"
 #include "target_overlap.h"
 #include "host_shaders/block_linear_unswizzle_2d_comp_spv.h"
@@ -339,12 +340,15 @@ void note_made(uint64_t k) {
 }
 /// (texture_frame, every look) The budget held steady: `raw` is what the driver's numbers ask for now, `ceiling` the card's own (or
 /// the preset's), `in_use` what the last presents used. Above. texture_frame's thread alone
-uint64_t stable_budget_step(uint64_t raw, uint64_t ceiling, uint64_t in_use, bool urgent, uint64_t floor_pct, uint64_t* floor_out) {
+/// (Ocarina Engine, RX_VK_VRAM_GOV) low_cap: while the VRAM governor squeezes, the floor at most this (0: none)
+uint64_t stable_budget_step(uint64_t raw, uint64_t ceiling, uint64_t in_use, bool urgent, uint64_t floor_pct, uint64_t* floor_out,
+                            uint64_t low_cap = 0) {
     static uint64_t value = 0;
     static uint32_t below = 0, above = 0;
     ceiling = std::max(ceiling, raw);
-    const uint64_t low = urgent ? std::min(ceiling, in_use)
-                                : std::max(ceiling / 100 * floor_pct, std::min(ceiling, in_use + in_use / 8));
+    uint64_t low = urgent ? std::min(ceiling, in_use)
+                          : std::max(ceiling / 100 * floor_pct, std::min(ceiling, in_use + in_use / 8));
+    if (low_cap) low = std::min(low, low_cap);
     const uint64_t target = std::clamp(raw, low, ceiling);
     if (!value) {
         value = target;
@@ -374,6 +378,7 @@ struct Dead {
     uint64_t pool_key = 0;                // (a render target's image: to the pool below, with its views, not destroyed)
     std::unordered_map<uint64_t, VkImageView> view_map;
     uint64_t bytes = 0;
+    VkImageCreateInfo ci{};               // (Ocarina Engine, RX_VK_VRAM_GOV: as it was made, for the compaction of the pool's images)
 };
 std::deque<Dead> dead;
 
@@ -391,6 +396,7 @@ struct Pooled {
     VmaAllocation allocation;
     std::unordered_map<uint64_t, VkImageView> views;
     uint64_t bytes, since;
+    VkImageCreateInfo ci;   // (Ocarina Engine, RX_VK_VRAM_GOV: as it was made: the compaction of the targets' blocks moves it, no copy)
 };
 std::mutex pool_mu;
 std::unordered_map<uint64_t, std::vector<Pooled>> target_pool;   // by pool_key_of
@@ -504,7 +510,7 @@ void pool_destroy(Pooled& p) {
 /// (texture_frame) a dead render target's image the GPU is done with, into the pool
 void pool_put(Dead& d) {
     std::lock_guard lk(pool_mu);
-    target_pool[d.pool_key].push_back(Pooled{d.image, d.allocation, std::move(d.view_map), d.bytes, frame_no});
+    target_pool[d.pool_key].push_back(Pooled{d.image, d.allocation, std::move(d.view_map), d.bytes, frame_no, d.ci});
     pool_bytes += d.bytes, pool_n++;
 }
 /// (texture_frame, each present) the pool over its bound, or all of it while VRAM is short, and what waits in it unused for 120
@@ -1705,6 +1711,76 @@ bool upload(Texture& tex, const Ranges* dirty) {
     }
     return ok;
 }
+/// (hookshot) A big texture whose whole storage is zero: the image cleared to zero on the GPU, not unswizzled on the CPU. All-zero
+/// bits are 0 in every format this path takes (not ASTC or BC, not one widened on the way), so the clear is what the unswizzle
+/// would have made. The game's shadow map (12288 x 12288 D16, 288 MB, its storage fresh and zero) took 73 ms of the replay
+/// thread at a scene change; the check reads the storage once, on several threads, and stops at the first byte that is not 0.
+/// RX_VK_ZERO_UPLOAD=0: off
+bool upload_all_zero(Texture& tex, uint64_t total, const Ranges* dirty, bool widened_format) {
+    static const bool off = getenv("RX_VK_ZERO_UPLOAD") && atoi(getenv("RX_VK_ZERO_UPLOAD")) == 0;
+    if (off || total < (32ull << 20) || tex.astc || tex.bc || tex.sparse || widened_format || !tex.image ||
+        tex.type == VK_IMAGE_TYPE_3D || is_bc(tex.format) || is_astc(tex.format))
+        return false;
+    if (dirty) {   // (only an upload of the whole storage: a part of it says nothing of the rest)
+        uint64_t covered = 0;
+        for (const auto& r : *dirty) covered += std::min(r.second, total) - std::min(r.first, total);
+        if (covered < total) return false;
+    }
+    // (live memory, as the GPU unswizzle reads it: not a storage the capture kept as it was at its submit, which the CPU path reads)
+    if (tex.gpu >= (1ull << 40) || memory_has_shadow(tex.gpu, total)) return false;
+    uint64_t avail = 0;
+    const uint8_t* p = host->gpu_ptr(tex.gpu, &avail);
+    if (!p || avail < total) return false;
+    const auto t0 = std::chrono::steady_clock::now();
+    std::atomic<bool> found{false};
+    const uint32_t nthreads = std::clamp(std::thread::hardware_concurrency() / 2, 1u, 8u);
+    const uint64_t per = ((total / nthreads) + 4095) & ~4095ull;
+    auto part = [&](uint32_t t) {
+        const uint64_t a = std::min<uint64_t>(total, (uint64_t)t * per), b = std::min<uint64_t>(total, a + per);
+        for (uint64_t at = a; at < b && !found.load(std::memory_order_relaxed); at += 65536) {
+            const uint64_t end = std::min<uint64_t>(b, at + 65536);
+            uint64_t acc = 0;
+            uint64_t k = at;
+            for (; k + 8 <= end; k += 8) {
+                uint64_t w;
+                std::memcpy(&w, p + k, 8);
+                acc |= w;
+            }
+            for (; k < end; k++) acc |= p[k];
+            if (acc) found.store(true, std::memory_order_relaxed);
+        }
+    };
+    if (nthreads > 1) {
+        std::vector<std::thread> th;
+        for (uint32_t t = 1; t < nthreads; t++) th.emplace_back(part, t);
+        part(0);
+        for (auto& x : th) x.join();
+    } else {
+        part(0);
+    }
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    static std::atomic<int> told{0};
+    if (found.load()) {
+        if (told.fetch_add(1) < 4)
+            logf("vk: upload: %ux%u NVN %#x (%llu MB) is not all zero (checked in %.1f ms): unswizzled as before", tex.width,
+                 tex.height, tex.nvn_format, (unsigned long long)(total >> 20), ms);
+        return false;
+    }
+    texture_resident_flush(&tex);
+    checkpoint_mark(upload_cmd(), tex.gpu, 'u');
+    const VkImageSubresourceRange range{tex.aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+    if (tex.aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {
+        const VkClearDepthStencilValue z{0.0f, 0};
+        vkCmdClearDepthStencilImage(upload_cmd(), tex.image, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &range);
+    } else {
+        const VkClearColorValue z{};
+        vkCmdClearColorImage(upload_cmd(), tex.image, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &range);
+    }
+    if (told.fetch_add(1) < 4)
+        logf("vk: upload: %ux%u NVN %#x (%llu MB) is all zero: cleared on the GPU (checked in %.1f ms)", tex.width, tex.height,
+             tex.nvn_format, (unsigned long long)(total >> 20), ms);
+    return true;
+}
 bool upload_inner(Texture& tex, const Ranges* dirty) {
     PROF(PROF_UPLOAD);
     if (!tex.gpu || tex.samples != VK_SAMPLE_COUNT_1_BIT) return false;
@@ -1738,6 +1814,7 @@ bool upload_inner(Texture& tex, const Ranges* dirty) {
     const bool linear = nvn_tex_is_linear(&tex.d);
     int widen_from = 0;
     widened(tex.d.format ? vk_format(tex.nvn_format).format : tex.format, &widen_from);
+    if (upload_all_zero(tex, total, dirty, widen_from != 0)) return true;
     const int src_bpb = tex.bpb;
     const int out_bpb = tex.astc ? 4 : widen_from ? (widen_from == 3 ? 4 : widen_from == 6 ? 8 : 16) : src_bpb;
     const uint32_t copy_layers = tex.type == VK_IMAGE_TYPE_3D ? 1 : tex.layers;
@@ -2044,12 +2121,38 @@ bool texture_dirty(Texture& tex, uint32_t gen, Ranges& out) {
 }
 
 uint64_t destroy_gen = 1;   // (bumped when textures go: what was resolved to them goes stale)
+// (zero-travadas) and which texture each bump was for (null: none in particular, as the textures left for a later frame), the
+// last kGoneLog of them: texture_outlived answers from it whether one texture's views stood through the bumps since a
+// generation. Every bump goes through gone_note. Written where the generation is (the replay thread, between recordings)
+constexpr uint64_t kGoneLog = 512;
+const Texture* gone_log[kGoneLog];   // [generation % kGoneLog]: the texture whose end, or whose views' end, made it
+void gone_note(const Texture* tex) {
+    destroy_gen++;
+    gone_log[destroy_gen % kGoneLog] = tex;
+}
+
+/// (hookshot) a texture's image's create info, as create() made it: the compaction makes the moved one with it
+VkImageCreateInfo image_info_of(const Texture& t) {
+    VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ci.flags = t.create_flags;
+    ci.imageType = t.type;
+    ci.format = t.format;
+    ci.extent = {t.width, t.height, t.depth};
+    ci.mipLevels = t.levels;
+    ci.arrayLayers = t.layers;
+    ci.samples = t.samples;
+    ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ci.usage = t.usage;
+    ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    return ci;
+}
 
 void destroy_later(Texture& tex) {
-    destroy_gen++;
+    gone_note(&tex);
     Dead d{tex.last_value, tex.image, tex.allocation, {}, {}};
     if (tex.pool_key && tex.allocation && tex.sparse_chunks.empty() && pool_cap()) {   // (a render target's: to the pool, its views too)
         d.pool_key = tex.pool_key, d.view_map = std::move(tex.views), d.bytes = tex.bytes + tex.pad;
+        d.ci = image_info_of(tex);
         tex.views.clear();
     } else {
         for (auto& kv : tex.views)
@@ -2057,6 +2160,8 @@ void destroy_later(Texture& tex) {
     }
     d.memory = tex.sparse_chunks;
     dead.push_back(std::move(d));
+    for (const auto& attachment : tex.block_attachments)
+        dead.push_back(Dead{tex.last_value, attachment.image, attachment.allocation, {}, {}});
     total_bytes -= std::min(total_bytes, tex.bytes + tex.pad);
 }
 
@@ -2295,22 +2400,15 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
             vkGetPhysicalDeviceImageFormatProperties(dev.physical, x.format, x.type, VK_IMAGE_TILING_OPTIMAL,
                 x.usage, flags, &limits) == VK_SUCCESS)
             x.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
-        // (and colour attachment views, raw too: OoT renders the slices of two 64^3 BC4 noise volumes as RGBA16UI targets, one
-        // texel a block (53509044401d78d2, while an area loads). Without the usage those views were not made, the volumes
-        // stayed zero, and the foliage's dithered LOD crossfade, which reads them, left trees bare at mid distance, #1151.
-        // 3D images take the usage on the driver's word for the 2D one: the query does not cover 2D_ARRAY_COMPATIBLE's
-        // per-slice attachment views)
-        if (format_props(raw).optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) {
-            // (asked with the flags a 3D image is made with below; a refused image is made again without the usage)
-            const VkImageCreateFlags asked = flags | (x.type != VK_IMAGE_TYPE_3D ? 0u
-                : VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT | (dev.view_2d_of_3d ? VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT : 0u));
+        // Render to raw block views of 2D images. A 3D image's attachments use a separate uncompressed mip
+        if (x.type != VK_IMAGE_TYPE_3D && (format_props(raw).optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) {
             const VkResult r = vkGetPhysicalDeviceImageFormatProperties(dev.physical, x.format, x.type, VK_IMAGE_TILING_OPTIMAL,
-                x.usage | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, asked, &limits);
-            if (r == VK_SUCCESS || x.type == VK_IMAGE_TYPE_3D) x.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+                x.usage | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, flags, &limits);
+            if (r == VK_SUCCESS) x.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
             static int told;
             if (r != VK_SUCCESS && told++ < 4)
-                logf("vk: BC image %ux%ux%u (vk %d) as a raw colour attachment: the driver says %d%s", x.width, x.height, x.depth,
-                     (int)x.format, (int)r, x.type == VK_IMAGE_TYPE_3D ? " (3D: taken)" : "");
+                logf("vk: BC image %ux%u (vk %d) as a raw colour attachment: the driver says %d", x.width, x.height,
+                     (int)x.format, (int)r);
         }
     }
     if (x.type == VK_IMAGE_TYPE_2D && x.layers >= 6 && x.width == x.height && x.samples == VK_SAMPLE_COUNT_1_BIT)
@@ -2650,6 +2748,13 @@ Texture* texture_get(const nvn_tex* t, bool for_sampling) {
 uint64_t texture_destroy_generation() {
     return destroy_gen;
 }
+bool texture_outlived(const Texture* tex, uint64_t since) {
+    const uint64_t now = destroy_gen;
+    if (!tex || since > now || now - since > kGoneLog) return false;   // (older than the log: not known)
+    for (uint64_t g = since + 1; g <= now; g++)
+        if (gone_log[g % kGoneLog] == tex) return false;
+    return true;
+}
 
 uint32_t texture_epoch() {
     return epoch;
@@ -2664,10 +2769,17 @@ namespace {
 /// ones can be data (height maps, look-up tables) that a frame without would get wrong. RX_VK_UPLOAD_BUDGET_MS=<n>: the
 /// budget (40: only an area load's burst; at 8 the ground's streamed textures waited a frame in ordinary play and the ground
 /// flickered, Discord 2026-11-09), 0: no deferral, as before
-bool upload_defer(const Texture& tex) {
+/// (Mako) Left for later once only: the frames after it upload it whatever their budget. Before, a texture could be left frame
+/// after frame while other uploads (textures made again after eviction, near the VRAM budget) took each frame's 40 ms first:
+/// the ground came in flat on arriving somewhere and stayed so until the pause menu's light frames let it through.
+/// RX_VK_DEFER_AGAIN=1: as before
+bool upload_defer(Texture& tex) {
     static const int64_t budget_ns = (int64_t)(getenv("RX_VK_UPLOAD_BUDGET_MS") ? atof(getenv("RX_VK_UPLOAD_BUDGET_MS")) : 40.0) * 1000000;
     if (!budget_ns || !upload_defer_ok || tex.uploaded || !tex.astc || tex.gpu_written) return false;
     if (frame_upload_ns.load(std::memory_order_relaxed) < budget_ns) return false;
+    static const bool again = getenv("RX_VK_DEFER_AGAIN") != nullptr;
+    if (!again && tex.deferred_at && tex.deferred_at != frame_no && frame_no - tex.deferred_at <= 8) return false;   // (left last time)
+    if (tex.deferred_at != frame_no) tex.deferred_at = frame_no;
     st_deferred.fetch_add(1, std::memory_order_relaxed), st_deferred_frame.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
@@ -2762,7 +2874,20 @@ Texture* texture_touch(Texture* tex, bool for_sampling) {
     // was unswizzled from that memory: 55 MB for the 3072 x 3072 x 3 shadow map, frame after frame. Not "storage
     // the write watch never saw written": the game fills memory before it makes a pool of it.)
     static const bool upload_all = getenv("RX_VK_UPLOAD_ALL") != nullptr;   // (A/B: such storage uploaded too)
-    uint32_t owned = !tex->uploaded && !upload_all ? gpu_owned_since(tex->gpu, tex->guest_size) : 0;
+    // (Mako) never for a block-compressed texture (ASTC, BC): the GPU cannot render into one, so its texels come from memory
+    // whatever render targets used that storage before. Skipped, a boss or a new enemy met for the first time (its textures
+    // loaded into the transient heaps' memory) was drawn with an empty texture, all blue, for the whole cutscene.
+    // RX_VK_SKIP_COMPRESSED_OVER_RT=1: as before
+    static const bool skip_compressed = getenv("RX_VK_SKIP_COMPRESSED_OVER_RT") != nullptr;
+    const bool compressed = tex->astc || tex->bc || (tex->format >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && tex->format <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK);
+    uint32_t owned = !tex->uploaded && !upload_all && (skip_compressed || !compressed) ? gpu_owned_since(tex->gpu, tex->guest_size) : 0;
+    if (!tex->uploaded && !upload_all && !skip_compressed && compressed) {
+        static std::atomic<int> told{0};
+        if (told.load(std::memory_order_relaxed) < 30 && gpu_owned_since(tex->gpu, tex->guest_size) && told++ < 30)
+            logf("vk: texture #%u %#llx %ux%u x%u NVN %#x (compressed) over storage render targets took: uploaded from the game's "
+                 "memory all the same (Mako)", tex->id, (unsigned long long)tex->gpu, tex->width, tex->height, tex->layers,
+                 tex->nvn_format);
+    }
     if (owned && !remade_skip_old()) {   // (one evicted that came from memory: uploaded from it again. Above)
         std::lock_guard lk(from_memory_mu);
         auto e = evicted_from_memory.find(evicted_key(tex->gpu, tex->width, tex->height, tex->nvn_format));
@@ -3019,6 +3144,105 @@ VkImageView texture_view(Texture* tex, const nvn_tex* t, const nvn_view* v, VkIm
         }
         return view;
     });
+}
+
+TextureAttachment texture_attachment(Texture* tex, const nvn_tex* t, const nvn_view* v) {
+    TextureAttachment out;
+    if (tex->type != VK_IMAGE_TYPE_3D || !is_bc(tex->format)) {
+        out.view = texture_view(tex, t, v, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Attachment, &out.format);
+        return out;
+    }
+
+    // NVIDIA's Pascal driver reports support for attaching a 2D raw view of a BC volume, then loses the device
+    // even on a clear. Render the encoded blocks into an uncompressed mip and copy them to the sampled volume.
+    const int nf = view_nvn_format(t, v);
+    const VkFormat format = view_format_of(tex->format, tex->astc, tex->bc, nf, ViewUse::Attachment, VK_FORMAT_UNDEFINED);
+    int bw, bh, widened_from;
+    int bytes = nvn_block_size(nf, &bw, &bh);
+    widened(vk_format(nf).format, &widened_from);
+    if (widened_from) bytes = widened_from * 4 / 3;
+    if (format == VK_FORMAT_UNDEFINED || bw != 1 || bh != 1 || bytes != tex->bpb ||
+        !(format_props(format).optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT))
+        return out;
+
+    const uint32_t level = image_level(tex, view_level(v));
+    const uint32_t depth = std::max(1u, tex->depth >> level);
+    const uint32_t slice = std::min(view_layer(v), depth - 1);
+    const uint64_t key = mix(mix(0xbc3d, format), (uint64_t)level << 32 | slice);
+    auto attachment = std::find_if(tex->block_attachments.begin(), tex->block_attachments.end(), [&](const auto& a) {
+        return a.level == level && a.format == format;
+    });
+    if (attachment == tex->block_attachments.end()) {
+        if (tex->view_failed_frame == frame_no) return out;
+        // Each compressed mip can round up to a different block extent, so it has its own uncompressed image
+        VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ci.flags = VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
+        ci.imageType = VK_IMAGE_TYPE_3D;
+        ci.format = format;
+        ci.extent = {(std::max(1u, tex->width >> level) + 3) / 4, (std::max(1u, tex->height >> level) + 3) / 4, depth};
+        ci.mipLevels = ci.arrayLayers = 1;
+        ci.samples = VK_SAMPLE_COUNT_1_BIT;
+        ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        Texture::BlockAttachment made{VK_NULL_HANDLE, nullptr, format, level};
+        if (!create_image(ci, made.image, made.allocation)) {
+            tex->view_failed_frame = frame_no;
+            return out;
+        }
+        try {
+            tex->block_attachments.push_back(made);
+        } catch (const std::exception&) {
+            destroy_image(made.image, made.allocation);
+            tex->view_failed_frame = frame_no;
+            return out;
+        }
+        attachment = std::prev(tex->block_attachments.end());
+        const uint64_t bytes = allocation_size(made.allocation);
+        tex->pad += bytes;
+        total_bytes += bytes;
+
+        InitRedirect redirect;
+        VkImageMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+        barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+        barrier.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = made.image;
+        barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, VK_REMAINING_ARRAY_LAYERS};
+        VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        dependency.imageMemoryBarrierCount = 1;
+        dependency.pImageMemoryBarriers = &barrier;
+        vkCmdPipelineBarrier2(upload_cmd(), &dependency);
+    }
+
+    out.view = cached_image_view(tex, key, [&](VkResult* result) {
+        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image = attachment->image;
+        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vi.format = format;
+        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, slice, 1};
+        VkImageView view = VK_NULL_HANDLE;
+        *result = vkCreateImageView(dev.device, &vi, nullptr, &view);
+        return *result == VK_SUCCESS ? view : VK_NULL_HANDLE;
+    });
+    out.format = format;
+    out.blocks = attachment->image;
+    return out;
+}
+
+void copy_block_attachment(VkCommandBuffer cmd, const Texture& tex, VkImage blocks, uint32_t level, uint32_t slice,
+                           bool to_attachment) {
+    const uint32_t width = std::max(1u, tex.width >> level), height = std::max(1u, tex.height >> level);
+    const VkImageSubresourceLayers compressed{VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1};
+    const VkImageSubresourceLayers raw{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    const VkOffset3D offset{0, 0, (int32_t)std::min(slice, std::max(1u, tex.depth >> level) - 1)};
+    // Vulkan takes the extent in source texels, which are blocks in the uncompressed attachment
+    const VkImageCopy region{to_attachment ? compressed : raw, offset, to_attachment ? raw : compressed, offset,
+                             to_attachment ? VkExtent3D{width, height, 1} : VkExtent3D{(width + 3) / 4, (height + 3) / 4, 1}};
+    vkCmdCopyImage(cmd, to_attachment ? tex.image : blocks, VK_IMAGE_LAYOUT_GENERAL,
+                   to_attachment ? blocks : tex.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
 }
 
 bool texture_copy_into_bc(VkCommandBuffer cmd, Texture* src, uint32_t src_level, uint32_t src_layer, int sx, int sy,
@@ -3776,7 +4000,193 @@ struct Compact {
     uint64_t runs = 0, all_moved = 0, all_freed = 0;
     // (the driver's count over 90% of what it allows, texture_frame's look every 10 presents: vram_compact.h)
     bool pressed = false;
+    // (Ocarina Engine, RX_VK_VRAM_GOV) the run under way is in the render targets' blocks (and the target pool's images move with
+    // their textures', without a copy: they hold nothing), and the governor started it
+    bool targets = false, by_gov = false;
 } compact;
+
+// ---- (Ocarina Engine, RX_VK_VRAM_GOV; on, =0: all as before) The VRAM governor ----
+// One target for the driver's count of what the process holds in VRAM, RX_VK_VRAM_TARGET_PCT (88) % of what the driver allows it,
+// on a dedicated GPU with VK_EXT_memory_budget and the textures compacted (RX_VK_COMPACT; on by default on cards of 8.5 GB or
+// less). Off with RX_VK_VRAM_MB, on an integrated GPU, or with a quality preset that caps the memory: those have their own limits.
+// Past the target (three looks in a row, vram_gov.h) its levers, in this order:
+// - the free space in VMA's blocks back to the driver: the compaction runs in the textures' blocks AND the render targets' (the
+//   pool with more to give back first), for as little as 64 MB past what a run leaves (vram_gov::slack), at most every 600
+//   presents in each; the other images' pool has 32 MB blocks (gov_misc_block);
+// - the texture budget held so that the count, less what the compaction can still give back, is at the target: the excess alone,
+//   through the stable budget's steps (tex_stable), its floor lowered while squeezing to what the last 8 presents used and an
+//   eighth (at least RX_VK_VRAM_GOV_TEX_FLOOR_PCT, 60, % of the card's own); what goes is still only what went unused for 60
+//   presents and the stable eviction's time;
+// - the mirrors' budget, once the count has stayed over for ~5 s (300 presents), 64 MB lower and 64 more every 100 presents
+//   while it stays over, down to their floor; their idle ones go sooner meanwhile (vk_memory.cpp); 64 MB back every 600 presents
+//   once it is 5% under the target. (A bound on the target pool was tried and dropped: b47gov1-K2 destroyed 1.3-2.4 GB of the
+//   pool's images every 600 presents for it, made again at once, and none of it was VRAM given back.)
+// Every 600 presents the "vk: VRAM governor:" line says where it stands and what each lever gave back since the line before.
+namespace {
+bool gov_env() {
+    static const bool on = !(getenv("RX_VK_VRAM_GOV") && !atoi(getenv("RX_VK_VRAM_GOV")));
+    return on;
+}
+uint64_t gov_pct() {
+    static const uint64_t pct =
+        getenv("RX_VK_VRAM_TARGET_PCT") ? (uint64_t)std::clamp(atoi(getenv("RX_VK_VRAM_TARGET_PCT")), 50, 97) : 88;
+    return pct;
+}
+/// what does not change while the game runs: the governor may be on
+bool gov_static() {
+    return gov_env() && dev.memory_budget && dev.props.deviceType != VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU &&
+           !getenv("RX_VK_VRAM_MB") && compact_on();
+}
+struct Gov {
+    bool on = false;
+    const char* off_why = "";
+    uint64_t target = 0, used = 0, allowed = 0, block_free = 0;
+    vram_gov::Hysteresis h;
+    ImagePoolsUsage pu{};
+    bool have_pu = false;
+    uint64_t next_tex = 0, next_tgt = 0;         // (the presents from which a run of its own may start in each pool)
+    uint64_t mirror_cut = 0;
+    uint32_t mirror_over = 0, mirror_under = 0;  // (looks in a row: over with nothing else left, 5% under)
+    uint64_t last_blocks = 0;                    // (VMA's device-local blocks at the last look)
+    // (since the last line)
+    uint32_t looks = 0, looks_over = 0;
+    uint64_t w_tex = 0, w_tgt = 0, w_down = 0, w_evicted = 0;
+    int64_t w_cut = 0;                           // (the mirrors' budget: less is negative)
+    uint64_t w_mirror0 = ~0ull;                  // (the mirrors at the line before)
+} gov;
+/// (vk_vma.cpp's images_pool, when it is made) the other images' blocks: 32 MB under the governor (RX_VK_VRAM_GOV_MISC_BLOCK_MB;
+/// 0: the image pools' size, as before), not with RX_VK_IMAGE_BLOCK_MB set or the render targets in the textures' blocks
+uint64_t gov_misc_block() {
+    if (!gov_static() || getenv("RX_VK_IMAGE_BLOCK_MB") || (getenv("RX_VK_TARGET_BLOCKS") && !atoi(getenv("RX_VK_TARGET_BLOCKS"))))
+        return 0;
+    static const int mb = getenv("RX_VK_VRAM_GOV_MISC_BLOCK_MB") ? atoi(getenv("RX_VK_VRAM_GOV_MISC_BLOCK_MB")) : 32;
+    return mb > 0 ? (uint64_t)std::max(8, mb) << 20 : 0;
+}
+uint64_t gov_reclaim_tex(const ImagePoolsUsage& u) { return vram_gov::reclaimable(u.tex_free, u.block, u.tex_n); }
+uint64_t gov_reclaim_tgt(const ImagePoolsUsage& u) { return vram_gov::reclaimable(u.tgt_free, u.block, u.tgt_n); }
+void gov_set_mirror_cut(uint64_t cut) {
+    gov.mirror_cut = cut;
+    vram_gov_mirror_cut(cut);
+}
+/// (texture_frame, every 10 presents, before the texture budget) where the count stands, and the state of the levers
+void gov_look(bool known, uint64_t used, uint64_t allowed, uint64_t block_free, bool preset_budget) {
+    gov.have_pu = image_pools_usage(&gov.pu);
+    if (gov.last_blocks > gov.pu.device_blocks) gov.w_down += gov.last_blocks - gov.pu.device_blocks;
+    gov.last_blocks = gov.pu.device_blocks;
+    gov.used = used, gov.allowed = allowed, gov.block_free = block_free;
+    const char* why = !gov_env()                ? "RX_VK_VRAM_GOV=0"
+                      : !dev.memory_budget        ? "the driver gives no budget (VK_EXT_memory_budget)"
+                      : dev.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? "an integrated GPU"
+                      : getenv("RX_VK_VRAM_MB")   ? "RX_VK_VRAM_MB"
+                      : !compact_on()             ? "the textures not compacted (RX_VK_COMPACT)"
+                      : preset_budget             ? "a quality preset caps the memory"
+                      : !known || !allowed        ? "no budget from the driver"
+                      : !gov.have_pu              ? "no image pools of their own"
+                                                  : nullptr;
+    gov.on = !why;
+    gov.off_why = why ? why : "";
+    if (!gov.on) {
+        gov.h.reset();
+        if (gov.mirror_cut) gov.w_cut += (int64_t)gov.mirror_cut, gov_set_mirror_cut(0);
+        gov.mirror_over = gov.mirror_under = 0;
+        return;
+    }
+    gov.target = vram_gov::target(allowed, gov_pct());
+    gov.looks++;
+    if (used > gov.target) gov.looks_over++;
+    gov.h.look(used, allowed, gov.target);
+}
+/// (texture_frame, after the texture budget) the last lever: the mirrors. (The first measure, b47gov1-K2 on a 6 GB RTX 4050 in
+/// Hyrule Market: 60 of 60 looks over the target and never a cut, as it waited for "nothing else left", and the compaction, under
+/// way or worth one at nearly every look while the textures refilled their blocks, was always something left.) Now: the count
+/// over the target and a percent for 30 looks in a row (300 presents, ~5 s), whatever else is under way, then 64 MB more every
+/// 10 looks while it stays over, down to the mirrors' floor (vram_gov::mirror_most_cut); 64 MB back every 60 looks 5% under it
+void gov_look_end() {
+    if (!gov.on) return;
+    const uint64_t band = gov.allowed / 100;
+    static const uint64_t env_min =
+        getenv("RX_VK_VRAM_GOV_MIRROR_MIN_MB") ? (uint64_t)std::max(0, atoi(getenv("RX_VK_VRAM_GOV_MIRROR_MIN_MB"))) << 20 : 0;
+    const uint64_t most = vram_gov::mirror_most_cut(mirror_budget_base(), env_min, getenv("RX_VK_MIRROR_MB") != nullptr);
+    if (gov.h.squeeze && gov.used > gov.target + band) gov.mirror_over++;
+    else gov.mirror_over = 0;
+    if (gov.used + 5 * band < gov.target) gov.mirror_under++;
+    else gov.mirror_under = 0;
+    const uint64_t step = 64ull << 20;
+    if (gov.mirror_over >= 30 && gov.mirror_cut < most) {
+        const uint64_t before = gov.mirror_cut;
+        gov_set_mirror_cut(std::min(most, gov.mirror_cut + step)), gov.mirror_over = 20;
+        gov.w_cut -= (int64_t)(gov.mirror_cut - before);
+        logf("vk: VRAM governor: the count over the target for 5 s: the mirrors' budget %llu MB (%llu MB cut)",
+             (unsigned long long)((mirror_budget_base() - std::min(mirror_budget_base(), gov.mirror_cut)) >> 20),
+             (unsigned long long)(gov.mirror_cut >> 20));
+    } else if (gov.mirror_under >= 60 && gov.mirror_cut) {
+        const uint64_t back = std::min(gov.mirror_cut, step);
+        gov_set_mirror_cut(gov.mirror_cut - back), gov.w_cut += (int64_t)back, gov.mirror_under = 0;
+    }
+    if (gov.mirror_cut > most) gov.w_cut += (int64_t)(gov.mirror_cut - most), gov_set_mirror_cut(most);
+}
+/// (texture_frame, every 600 presents) the line
+void gov_log(uint64_t total, uint64_t budget, uint64_t budget_floor) {
+    int64_t mirrors = 0, sync_b = 0, sync_c = 0, wb_b = 0;
+    uint64_t mirror_mb = 0;
+    memory_stats(&mirrors, &mirror_mb, &sync_b, &sync_c, &wb_b);
+    uint64_t pool_now = 0;
+    {
+        std::lock_guard lk(pool_mu);
+        pool_now = pool_bytes;
+    }
+    const uint64_t mirror0 = gov.w_mirror0 == ~0ull ? mirror_mb : gov.w_mirror0;
+    gov.w_mirror0 = mirror_mb;
+    const ImagePoolsUsage& u = gov.pu;
+    const uint64_t pools_free = u.tex_free + u.tgt_free + u.misc_free;
+    const uint64_t compacted = gov.w_tex + gov.w_tgt;
+    const uint64_t pct_now = gov.allowed ? gov.used * 100 / gov.allowed : 0;
+    if (!gov.on) {
+        logf("vk: VRAM governor: off (%s); %llu MB used of %llu MB allowed (%llu%%), %llu MB free in the blocks; textures %llu MB "
+             "(budget %llu MB); mirrors %llu MB; target pool %llu MB; given back since the last line: %llu MB by compaction "
+             "(textures %llu, render targets %llu)", gov.off_why, (unsigned long long)(gov.used >> 20),
+             (unsigned long long)(gov.allowed >> 20), (unsigned long long)pct_now, (unsigned long long)(gov.block_free >> 20),
+             (unsigned long long)(total >> 20), (unsigned long long)(budget >> 20), (unsigned long long)mirror_mb,
+             (unsigned long long)(pool_now >> 20), (unsigned long long)(compacted >> 20), (unsigned long long)(gov.w_tex >> 20),
+             (unsigned long long)(gov.w_tgt >> 20));
+    } else {
+        logf("vk: VRAM governor: target %llu MB (%llu%%), %llu MB used of %llu MB allowed (%llu%%), over the target %u of %u looks%s; "
+             "free in the blocks %llu MB (textures' %llu of %u blocks, render targets' %llu of %u, other images' %llu of %u, the "
+             "rest %llu); textures %llu MB (budget %llu MB, floor %llu MB%s); mirrors %llu MB (budget %llu MB, %llu MB of it cut); "
+             "target pool %llu MB; given back since the last line: %llu MB by compaction (textures %llu, render targets %llu), %llu "
+             "MB of blocks freed otherwise (empty blocks, dedicated memory), %llu MB of textures evicted for the budget, mirrors' "
+             "budget %+lld MB (mirrors %llu -> %llu MB)",
+             (unsigned long long)(gov.target >> 20), (unsigned long long)gov_pct(), (unsigned long long)(gov.used >> 20),
+             (unsigned long long)(gov.allowed >> 20), (unsigned long long)pct_now, gov.looks_over, gov.looks,
+             gov.h.squeeze ? ", squeezing" : "", (unsigned long long)(gov.block_free >> 20), (unsigned long long)(u.tex_free >> 20),
+             u.tex_n, (unsigned long long)(u.tgt_free >> 20), u.tgt_n, (unsigned long long)(u.misc_free >> 20), u.misc_n,
+             (unsigned long long)((gov.block_free - std::min(gov.block_free, pools_free)) >> 20), (unsigned long long)(total >> 20),
+             (unsigned long long)(budget >> 20), (unsigned long long)(budget_floor >> 20),
+             gov.h.squeeze ? ", the governor's" : "", (unsigned long long)mirror_mb,
+             (unsigned long long)((mirror_budget_base() - std::min(mirror_budget_base(), gov.mirror_cut)) >> 20),
+             (unsigned long long)(gov.mirror_cut >> 20), (unsigned long long)(pool_now >> 20),
+             (unsigned long long)(compacted >> 20), (unsigned long long)(gov.w_tex >> 20), (unsigned long long)(gov.w_tgt >> 20),
+             (unsigned long long)((gov.w_down - std::min(gov.w_down, compacted)) >> 20), (unsigned long long)(gov.w_evicted >> 20),
+             (long long)(gov.w_cut / (1 << 20)), (unsigned long long)mirror0,
+             (unsigned long long)mirror_mb);
+    }
+    gov.looks = gov.looks_over = 0;
+    gov.w_tex = gov.w_tgt = gov.w_down = gov.w_evicted = 0;
+    gov.w_cut = 0;
+}
+}  // namespace
+uint64_t vram_gov_misc_block_bytes() { return gov_misc_block(); }
+
+/// (a compaction's blocks given back: in all, and for the governor's line)
+void compact_count(uint64_t freed) {
+    compact.all_freed += freed;
+    (compact.targets ? gov.w_tgt : gov.w_tex) += freed;
+}
+/// (a compaction over: the next look, and the governor's next run in that pool)
+void compact_rest() {
+    compact.next_check = frame_no + vram_compact::rest(compact.pressed);
+    if (compact.by_gov) (compact.targets ? gov.next_tgt : gov.next_tex) = frame_no + 600;
+}
 const Texture* present_source = nullptr;   // (what the present shows this frame: do_present holds its image and view)
 void compact_step(uint64_t completed) {
     if (!compact_on()) return;
@@ -3789,13 +4199,13 @@ void compact_step(uint64_t completed) {
         uint64_t freed = 0;
         uint32_t blocks = 0;
         if (!image_compact_pass_end(&freed, &blocks)) {
-            compact.all_moved += compact.moved, compact.all_freed += freed;
-            logf("vk: VRAM compacted: %llu textures moved (%llu MB) in %llu passes, %llu left where they were; %u blocks (%llu MB) "
-                 "given back to the driver; %llu MB in all so far", (unsigned long long)compact.moved,
-                 (unsigned long long)(compact.moved_bytes >> 20), (unsigned long long)compact.passes,
+            compact.all_moved += compact.moved, compact_count(freed);
+            logf("vk: VRAM compacted%s: %llu %s moved (%llu MB) in %llu passes, %llu left where they were; %u blocks (%llu MB) "
+                 "given back to the driver; %llu MB in all so far", compact.targets ? " (render targets)" : "",
+                 (unsigned long long)compact.moved, compact.targets ? "images" : "textures", (unsigned long long)(compact.moved_bytes >> 20), (unsigned long long)compact.passes,
                  (unsigned long long)compact.ignored, blocks, (unsigned long long)(freed >> 20),
                  (unsigned long long)(compact.all_freed >> 20));
-            compact.next_check = frame_no + vram_compact::rest(compact.pressed);
+            compact_rest();
         }
         return;   // (the images the GPU is done with are freed now, before the next pass opens)
     }
@@ -3804,54 +4214,97 @@ void compact_step(uint64_t completed) {
         compact.next_check = frame_no + 120;
         static const uint64_t min_free = (uint64_t)(getenv("RX_VK_COMPACT_MB") ? std::max(1, atoi(getenv("RX_VK_COMPACT_MB"))) : 512) << 20;
         uint64_t block_bytes = 0, free_bytes = 0;
-        if (!textures_pool_usage(&block_bytes, &free_bytes)) return;
+        const bool have_textures = textures_pool_usage(&block_bytes, &free_bytes);
         // (Ocarina Engine, RX_VK_TEX_STABLE) not for less than RX_VK_COMPACT_MB while the textures made in the last 300 presents
         // would fill that free space: given back, the blocks were asked of the driver again seconds later (36 runs and 15.7 GB of
         // blocks in twelve minutes of Hyrule Market, a 128 MB block's allocation with VRAM full among the 27-50 ms images)
         const bool refilling = tex_stable() && tex_churn_bytes >= free_bytes;
-        if (free_bytes < vram_compact::run_from(min_free, compact.pressed && !refilling)) return;
-        if (!image_compact_begin(64ull << 20, 12)) return;
+        bool go = have_textures && free_bytes >= vram_compact::run_from(min_free, compact.pressed && !refilling);
+        bool targets = false, by_gov = false;
+        if (!go && gov.on && gov.h.squeeze) {
+            // (Ocarina Engine, RX_VK_VRAM_GOV) the count over the target: the pool with more to give back past what a run leaves
+            // (vram_gov::slack), the textures' only for 256 MB or more while they refill their blocks
+            ImagePoolsUsage u{};
+            if (image_pools_usage(&u)) {
+                uint64_t r_tex = frame_no >= gov.next_tex ? gov_reclaim_tex(u) : 0;
+                const uint64_t r_tgt = frame_no >= gov.next_tgt ? gov_reclaim_tgt(u) : 0;
+                if (refilling && r_tex < (256ull << 20)) r_tex = 0;
+                if (std::max(r_tex, r_tgt) >= (64ull << 20)) {
+                    go = by_gov = true;
+                    targets = r_tgt > r_tex;
+                    block_bytes = targets ? u.tgt_blocks : u.tex_blocks, free_bytes = targets ? u.tgt_free : u.tex_free;
+                }
+            }
+        }
+        if (!go) return;
+        if (!image_compact_begin(64ull << 20, 12, targets)) return;
+        compact.targets = targets, compact.by_gov = by_gov;
         compact.runs++, compact.moved = compact.moved_bytes = compact.ignored = compact.passes = 0;
-        logf("vk: VRAM compaction %llu begins: the textures' blocks hold %llu MB, %llu MB of it free space",
-             (unsigned long long)compact.runs, (unsigned long long)(block_bytes >> 20), (unsigned long long)(free_bytes >> 20));
+        logf("vk: VRAM compaction %llu begins%s: the %s' blocks hold %llu MB, %llu MB of it free space", (unsigned long long)compact.runs,
+             by_gov ? " (the VRAM governor's)" : "", targets ? "render targets" : "textures", (unsigned long long)(block_bytes >> 20),
+             (unsigned long long)(free_bytes >> 20));
     }
     static thread_local std::vector<ImageMove> moves;
     uint64_t freed_now = 0;
     uint32_t blocks_now = 0;
     if (!image_compact_pass(moves, &freed_now, &blocks_now)) {   // (nothing left to move)
-        compact.all_moved += compact.moved, compact.all_freed += freed_now;
-        logf("vk: VRAM compaction %llu over: %llu textures moved (%llu MB) in %llu passes, %llu left where they were; %u blocks "
+        compact.all_moved += compact.moved, compact_count(freed_now);
+        logf("vk: VRAM compaction %llu over: %llu %s moved (%llu MB) in %llu passes, %llu left where they were; %u blocks "
              "(%llu MB) given back to the driver, %llu MB in all so far", (unsigned long long)compact.runs,
-             (unsigned long long)compact.moved, (unsigned long long)(compact.moved_bytes >> 20), (unsigned long long)compact.passes,
+             (unsigned long long)compact.moved, compact.targets ? "images" : "textures", (unsigned long long)(compact.moved_bytes >> 20), (unsigned long long)compact.passes,
              (unsigned long long)compact.ignored, blocks_now, (unsigned long long)(freed_now >> 20),
              (unsigned long long)(compact.all_freed >> 20));
-        compact.next_check = frame_no + vram_compact::rest(compact.pressed);
+        compact_rest();
         return;
     }
     std::unordered_map<VmaAllocation, Texture*> by_allocation;
     by_allocation.reserve(textures.size());
     for (auto& kv : textures)
         if (kv.second->allocation) by_allocation[kv.second->allocation] = kv.second.get();
+    // (Ocarina Engine, RX_VK_VRAM_GOV) in the render targets' blocks, the target pool's images too: they hold nothing (the next
+    // texture to take one clears it), so a new image at the new place and the old one destroyed now (the GPU was done with it
+    // before it went into the pool); pool_mu held through the moves, so none is taken meanwhile, and pool_trim waits for the
+    // pass's end (texture_frame)
+    std::unique_lock<std::mutex> pool_lk;
+    std::unordered_map<VmaAllocation, Pooled*> pooled;
+    if (compact.targets) {
+        pool_lk = std::unique_lock<std::mutex>(pool_mu);
+        for (auto& kv : target_pool)
+            for (Pooled& p : kv.second) pooled[p.allocation] = &p;
+    }
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     for (size_t i = 0; i < moves.size(); i++) {
         const auto f = by_allocation.find(moves[i].src);
         Texture* t = f == by_allocation.end() ? nullptr : f->second;   // (none: an image the GPU is not done with)
+        if (!t && compact.targets) {
+            const auto pf = pooled.find(moves[i].src);
+            Pooled* p = pf == pooled.end() ? nullptr : pf->second;
+            VkImage image = VK_NULL_HANDLE;
+            bool ok = p && p->image && p->ci.sType == VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO &&
+                      vkCreateImage(dev.device, &p->ci, nullptr, &image) == VK_SUCCESS;
+            if (ok && !image_compact_bind(i, image)) {
+                vkDestroyImage(dev.device, image, nullptr);
+                ok = false;
+            }
+            if (!ok) {
+                image_compact_ignore(i);
+                compact.ignored++;
+                continue;
+            }
+            for (auto& kv : p->views)
+                if (kv.second) vkDestroyImageView(dev.device, kv.second, nullptr);
+            p->views.clear();
+            vkDestroyImage(dev.device, p->image, nullptr);
+            p->image = image;
+            compact.moved++, compact.moved_bytes += p->bytes;
+            continue;
+        }
         const VkImageUsageFlags both = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         bool ok = t && t->image && !t->sparse && t != present_source && t->samples == VK_SAMPLE_COUNT_1_BIT &&
                   (t->usage & both) == both;
         VkImage image = VK_NULL_HANDLE;
         if (ok) {
-            VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};   // (as create() made it)
-            ci.flags = t->create_flags;
-            ci.imageType = t->type;
-            ci.format = t->format;
-            ci.extent = {t->width, t->height, t->depth};
-            ci.mipLevels = t->levels;
-            ci.arrayLayers = t->layers;
-            ci.samples = t->samples;
-            ci.tiling = VK_IMAGE_TILING_OPTIMAL;
-            ci.usage = t->usage;
-            ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            const VkImageCreateInfo ci = image_info_of(*t);   // (as create() made it)
             ok = vkCreateImage(dev.device, &ci, nullptr, &image) == VK_SUCCESS;
             if (ok && !image_compact_bind(i, image)) {
                 vkDestroyImage(dev.device, image, nullptr);
@@ -3892,27 +4345,28 @@ void compact_step(uint64_t completed) {
         for (auto& kv : t->views)
             if (kv.second) compact.old_views.push_back(kv.second);
         t->views.clear();   // (made again when next asked for)
+        gone_note(t);        // (zero-travadas: its views are gone, so what was resolved to them is stale; texture_outlived)
         t->image = image;
         t->last_value = std::max(t->last_value, rec_value);   // (its end, if it goes now, waits for the copy too)
         compact.moved++, compact.moved_bytes += t->bytes + t->pad;
     }
     compact.passes++;
-    if (!cmd) {   // (nothing of this pass could be moved: ended at once)
+    if (!cmd) {   // (nothing of this pass could be moved, or only the target pool's images: ended at once)
         uint64_t freed = 0;
         uint32_t blocks = 0;
         if (!image_compact_pass_end(&freed, &blocks)) {
-            compact.all_moved += compact.moved, compact.all_freed += freed;
-            logf("vk: VRAM compacted: %llu textures moved (%llu MB) in %llu passes, %llu left where they were; %u blocks (%llu MB) "
-                 "given back to the driver; %llu MB in all so far", (unsigned long long)compact.moved,
-                 (unsigned long long)(compact.moved_bytes >> 20), (unsigned long long)compact.passes,
+            compact.all_moved += compact.moved, compact_count(freed);
+            logf("vk: VRAM compacted%s: %llu %s moved (%llu MB) in %llu passes, %llu left where they were; %u blocks (%llu MB) "
+                 "given back to the driver; %llu MB in all so far", compact.targets ? " (render targets)" : "",
+                 (unsigned long long)compact.moved, compact.targets ? "images" : "textures", (unsigned long long)(compact.moved_bytes >> 20), (unsigned long long)compact.passes,
                  (unsigned long long)compact.ignored, blocks, (unsigned long long)(freed >> 20),
                  (unsigned long long)(compact.all_freed >> 20));
-            compact.next_check = frame_no + vram_compact::rest(compact.pressed);
+            compact_rest();
         }
         return;
     }
     full_barrier(cmd, "compaction: after the copies");
-    destroy_gen++;   // (what was resolved to the moved textures' views is stale)
+    gone_note(nullptr);   // (what was resolved to the moved textures' views is stale: each one noted above)
     compact.in_pass = true, compact.value = rec_value;
 }
 
@@ -3953,7 +4407,7 @@ void texture_frame(uint64_t completed) {
     if (const int64_t d = st_deferred_frame.exchange(0, std::memory_order_relaxed)) {
         // (the views and descriptor sets resolved to the placeholder this frame go stale, as when textures go: the next frame
         // looks those textures up again, and uploads them)
-        destroy_gen++;
+        gone_note(nullptr);   // (zero-travadas: no texture's own end; what resolved to the placeholder is looked up again all the same)
         static int told;
         if (told++ < 40 || st_deferred.load(std::memory_order_relaxed) % 2000 < d)
             logf("vk: %lld new ASTC textures left for a later frame (this frame's uploads took their budget; %lld so far)", (long long)d,
@@ -4085,7 +4539,7 @@ void texture_frame(uint64_t completed) {
         for (VkDeviceMemory m : it->memory) vkFreeMemory(dev.device, m, nullptr);
         it = dead.erase(it);
     }
-    pool_trim();
+    if (!(compact.in_pass && compact.targets)) pool_trim();   // (Ocarina Engine, RX_VK_VRAM_GOV: the pool's images may be in the pass's moves)
     // A budget: RX_VK_VRAM_MB of textures (default 4096), and less when the driver says the process is near what it
     // may have (other programs use the GPU too). The least recently used go first, down to 7/8 of it; nothing the
     // last 8 presents used, nothing recorded work may still read.
@@ -4122,6 +4576,7 @@ void texture_frame(uint64_t completed) {
         budget = std::min(budget, (allowed / 4) * 3);
     }
     const uint64_t budget_ceiling = budget;   // (Ocarina Engine: the card's own or the preset's, before the driver's numbers. tex_stable)
+    gov_look(known, used, allowed, block_free, preset_budget);   // (Ocarina Engine, RX_VK_VRAM_GOV: where the count stands)
     // (near what the driver allows, the budget shrinks by the excess. The excess of what the process holds less the
     // free space in VMA's blocks, which new images take before VMA makes a block: measured by the blocks alone, the
     // textures evicted freed space inside them that the driver still counted, so 10 frames later the budget shrank
@@ -4159,7 +4614,13 @@ void texture_frame(uint64_t completed) {
     // 2560 x 1440 had 11-12 frames over 33 ms against 34-49 uncompacted, and a 1% low of 37 fps against 26-29
     if (compact_on() && known && !by_blocks) {
         static const uint64_t pct = getenv("RX_VK_COMPACT_PCT") ? (uint64_t)std::clamp(atoi(getenv("RX_VK_COMPACT_PCT")), 50, 90) : 85;
-        const uint64_t held = vram_compact::held_budget(budget, total_bytes, used, reclaim, allowed, pct);
+        // (Ocarina Engine, RX_VK_VRAM_GOV) under the governor, at its target, and what the compaction can still give back of the
+        // render targets' blocks comes off the count too, past what a run leaves there (vram_gov.h): the textures go for the
+        // excess the free space cannot pay for, not before the compaction has given it back. (The textures' own free space comes
+        // off whole, as before: what an eviction frees there pays for it at the next look, no ratchet)
+        const uint64_t held = gov.on ? vram_compact::held_budget(budget, total_bytes, used, reclaim + gov_reclaim_tgt(gov.pu), allowed,
+                                                                 gov_pct())
+                                     : vram_compact::held_budget(budget, total_bytes, used, reclaim, allowed, pct);
         // (and what goes is the excess alone. Over its budget the cache is cut to 7/8 of it, below: right for a budget that
         // is a size, but this one is "what the textures hold less the excess", crossed again whenever anything else grows.
         // A recorder started beside the game took 0.8 GB of the allowance as play came back from 14 s in the menu: the line
@@ -4190,13 +4651,29 @@ void texture_frame(uint64_t completed) {
     uint64_t evict_after_ms = 0, budget_floor = 0, in_use = 0;
     if (stable) {
         const uint64_t keep = tex_min_unused();
-        for (auto& kv : textures)
-            if (frame_no - std::min(frame_no, kv.second->last_frame) < keep) in_use += kv.second->bytes + kv.second->pad;
+        uint64_t in_use8 = 0;   // (Ocarina Engine, RX_VK_VRAM_GOV: what the last 8 presents used, the governor's floor below)
+        for (auto& kv : textures) {
+            const uint64_t age = frame_no - std::min(frame_no, kv.second->last_frame);
+            if (age < keep) in_use += kv.second->bytes + kv.second->pad;
+            if (age < 8) in_use8 += kv.second->bytes + kv.second->pad;
+        }
         const uint64_t lo = allowed / 10 * 9, hi = std::max(allowed / 100 * tex_over_pct(), lo + 1);
         urgent = spilled || (known && pressure >= hi);
         // (the driver's own count at its limit with no room in the blocks, the squeeze above: no floor but what is in use)
         const bool at_limit = known && !by_blocks && used > allowed / 100 * 97 && !room_in_blocks;
-        budget = stable_budget_step(raw_budget, budget_ceiling, in_use, urgent, at_limit ? 0 : tex_floor_pct(), &budget_floor);
+        // (Ocarina Engine, RX_VK_VRAM_GOV) while the governor squeezes, the floor gives way below the card's own: what the last 8
+        // presents used and an eighth, and RX_VK_VRAM_GOV_TEX_FLOOR_PCT (60) % of the card's own. In b47gov1-K2 (a 6 GB RTX 4050,
+        // Hyrule Market) what the last 60 presents used (1.9-2.3 GB, 3 s at the 20 fps of that run) and its eighth put the floor at
+        // the card's own (1957 MB) all along, the governor's budget (1.73-1.84 GB) never applied, and every block the compaction
+        // gave back the textures took again. What goes is still only what went unused for the presents and the time (below)
+        uint64_t gov_low = 0;
+        if (gov.on && gov.h.squeeze) {
+            static const uint64_t gov_floor_pct = getenv("RX_VK_VRAM_GOV_TEX_FLOOR_PCT")
+                                                      ? (uint64_t)std::clamp(atoi(getenv("RX_VK_VRAM_GOV_TEX_FLOOR_PCT")), 10, 100)
+                                                      : 60;
+            gov_low = std::max(budget_ceiling / 100 * gov_floor_pct, in_use8 + in_use8 / 8);
+        }
+        budget = stable_budget_step(raw_budget, budget_ceiling, in_use, urgent, at_limit ? 0 : tex_floor_pct(), &budget_floor, gov_low);
         // (where the budget is the limit itself, not the driver's count: a quarter over it, the presents alone)
         const bool capped = !known || vram_env || preset_budget || dev.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
         if (capped && total_bytes > budget + budget / 4) urgent = true;
@@ -4204,6 +4681,8 @@ void texture_frame(uint64_t completed) {
         evict_after_ms = urgent ? 0 : !known || pressure <= lo ? tex_evict_ms() : tex_evict_ms() * (hi - pressure) / (hi - lo);
         if (frame_no % 300 == 0) tex_churn_bytes = st_sb_made_bytes.exchange(0, std::memory_order_relaxed);
     }
+    gov_look_end();   // (Ocarina Engine, RX_VK_VRAM_GOV: the mirrors, the last lever)
+    if (frame_no % 600 == 0) gov_log(total_bytes, budget, budget_floor);
     if (frame_no % 600 == 0) {
         vma_log_heaps();
         vma_log_image_blocks();
@@ -4530,6 +5009,7 @@ void texture_frame(uint64_t completed) {
     for (const Evict& e : evict) {   // (and each one's bookkeeping and its end, as before)
         Texture* tex = e.tex;
         if (e.shifted) n_dead++, b_dead += tex->bytes;
+        if (!sweep && !e.over) gov.w_evicted += tex->bytes + tex->pad;   // (Ocarina Engine, RX_VK_VRAM_GOV: the governor's line)
         if (stable && !sweep && !e.over) {   // (Ocarina Engine: one with content of its own gone for the budget: counted, and when)
             st_sb_evicted.fetch_add(1, std::memory_order_relaxed);
             st_sb_evicted_bytes.fetch_add(tex->bytes + tex->pad, std::memory_order_relaxed);

@@ -46,6 +46,7 @@
 #include "vk_texture.h"
 #include "movie_upscale_policy.h"
 #include "skip_code.h"
+#include "driver_faults.h"
 
 #include "shaders/clear_f_frag_spv.h"
 #include "shaders/clear_i_frag_spv.h"
@@ -402,6 +403,7 @@ const uint64_t kStream = (getenv("RX_VK_STREAM_MB") ? (uint64_t)std::max(1, atoi
 std::atomic<uint64_t> stream_peak{0}, stream_extra{0}, stream_grown{0};
 std::deque<RecordingRes> res;   // (a deque: a recording thread keeps its own in place while another is added)
 thread_local RecordingRes* cur = nullptr;
+thread_local uint64_t stream_serial_n = 0;   // (zero-travadas: stream_serial(), bumped as this thread begins a recording)
 
 VkDescriptorPool make_pool() {
     // (each recording's pool: 8192 sets of up to 32768 descriptors a type, for the programs with more descriptors than the push limit,
@@ -924,6 +926,7 @@ void pcache_init() {
 struct Targets {
     Texture* color[8]{};
     VkImageView color_view[8]{};
+    VkImage block_image[8]{};
     VkFormat color_format[8]{};
     int color_view_nvn[8]{};   // (hookshot) the NVN format each is drawn in (view_nvn_format): the pipeline state list's
     uint32_t color_level[8]{}, color_layer[8]{}, depth_level = 0, depth_layer = 0;   // (the levels and layers viewed)
@@ -931,6 +934,7 @@ struct Targets {
     VkImageView depth_view = VK_NULL_HANDLE;
     VkFormat depth_format = VK_FORMAT_UNDEFINED;
     int n = 0;
+    bool has_block_images = false;
     uint32_t width = 0, height = 0;
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
 };
@@ -1005,20 +1009,79 @@ bool depth_aspect(VkFormat f) {
     return is_depth_format(f) && f != VK_FORMAT_S8_UINT;
 }
 
+// (hookshot) The programs the driver faulted on (driver_faults.h): not asked of it again in this run, nor in later runs on the
+// same driver (hookshot_driver_faults.txt beside the executable). One program's builds go to the driver one at a time on AMD,
+// where a build behind a faulted one hung (issue 996); other drivers keep building a program's variants in parallel.
+// RX_VK_DRIVER_FAULTS=0: off; =1: the default; =2: one at a time on every driver
+constexpr VkResult kDriverFault = (VkResult)-77;   // (what the guards below answer for a fault in the driver)
+int driver_faults_mode() {
+    static const int mode = getenv("RX_VK_DRIVER_FAULTS") ? std::clamp(atoi(getenv("RX_VK_DRIVER_FAULTS")), 0, 2) : 1;
+    return mode;
+}
+bool driver_faults_on() { return driver_faults_mode() != 0; }
+std::string driver_faults_path() {
+    char exe[MAX_PATH];
+    const DWORD n = game_module_path(exe, MAX_PATH);
+    std::string dir(exe, n);
+    return dir.substr(0, dir.find_last_of("\\/") + 1) + "hookshot_driver_faults.txt";
+}
+driver_faults::Quarantine& fault_quarantine() {
+    static driver_faults::Quarantine q;
+    static std::once_flag once;
+    std::call_once(once, [] {   // (the earlier runs' faults, this device's driver only)
+        std::string text;
+        if (FILE* f = fopen(driver_faults_path().c_str(), "rb")) {
+            char b[4096];
+            size_t n;
+            while ((n = fread(b, 1, sizeof b, f)) > 0) text.append(b, n);
+            fclose(f);
+        }
+        const auto keys = driver_faults::parse(text, dev.props.vendorID, dev.props.driverVersion);
+        q.load(keys);
+        q.set_serial(driver_faults_mode() == 2 || dev.props.vendorID == 0x1002);
+        if (!keys.empty())
+            logf("vk: %zu programs the driver faulted on in earlier runs are not asked of it (%s; RX_VK_DRIVER_FAULTS=0: they are)",
+                 keys.size(), driver_faults_path().c_str());
+        if (q.serial())
+            logf("vk: one build of a program goes to the driver at a time (%s; RX_VK_DRIVER_FAULTS=0: as many as ask)",
+                 driver_faults_mode() == 2 ? "RX_VK_DRIVER_FAULTS=2" : "AMD");
+    });
+    return q;
+}
+void driver_fault_note(uint64_t key) {
+    static std::mutex mu;
+    std::lock_guard lk(mu);
+    const std::string path = driver_faults_path();
+    FILE* f = fopen(path.c_str(), "ab");
+    if (!f) {   // (a folder the game cannot write to: Program Files)
+        static bool told;
+        if (!told) told = true, logf("vk: %s could not be written: the faulted programs are kept out for this run only", path.c_str());
+        return;
+    }
+    fseek(f, 0, SEEK_END);   // (in append mode ftell says 0 until the first write, on Windows: the file's own end)
+    if (ftell(f) == 0)
+        fputs("# Hookshot: programs the graphics driver's compiler faulted on, not asked of it again on that driver\n"
+              "# (gpu/vk/driver_faults.h). <vendor> <driver version> <program key>. Delete this file to try them again.\n", f);
+    fputs(driver_faults::line(dev.props.vendorID, dev.props.driverVersion, key).c_str(), f);
+    fclose(f);
+}
+
 // (hookshot) A driver's compiler that faults on a shader (amdvlk64.dll on a mesh program, Hookshot issue 26) costs that one draw, not the game
 #ifdef _WIN32
 __declspec(noinline) VkResult guarded_graphics(VkPipelineCache cache, const VkGraphicsPipelineCreateInfo* ci, VkPipeline* pl) {
     __try {
         return vkCreateGraphicsPipelines(dev.device, cache, 1, ci, nullptr, pl);
     } __except (1) {
+        *pl = VK_NULL_HANDLE;   // (whatever the driver wrote before it faulted is not a pipeline)
         logf("vk: the driver faulted compiling a graphics pipeline (exception %#lx): that one is left out", (unsigned long)GetExceptionCode());
-        return VK_ERROR_UNKNOWN;
+        return (VkResult)-77;   // (a fault in the driver, as guarded_compute's: driver_faults.h keeps the program out)
     }
 }
 __declspec(noinline) VkResult guarded_compute(VkPipelineCache cache, const VkComputePipelineCreateInfo* ci, VkPipeline* pl) {
     __try {
         return vkCreateComputePipelines(dev.device, cache, 1, ci, nullptr, pl);
     } __except (1) {
+        *pl = VK_NULL_HANDLE;   // (whatever the driver wrote before it faulted is not a pipeline)
         logf("vk: the driver faulted compiling a compute pipeline (exception %#lx): that one is left out", (unsigned long)GetExceptionCode());
         return (VkResult)-77;   // (a fault in the driver, told apart from what it returns)
     }
@@ -1064,8 +1127,9 @@ static void install_driver_fault_guard() {
 VkResult guarded_graphics(VkPipelineCache cache, const VkGraphicsPipelineCreateInfo* ci, VkPipeline* pl) {
     install_driver_fault_guard();
     if (sigsetjmp(fault_jmp, 1) != 0) {
+        *pl = VK_NULL_HANDLE;   // (whatever the driver wrote before it faulted is not a pipeline)
         logf("vk: the driver faulted compiling a graphics pipeline: that one is left out");
-        return VK_ERROR_UNKNOWN;
+        return (VkResult)-77;
     }
     fault_armed = 1;
     const VkResult r = vkCreateGraphicsPipelines(dev.device, cache, 1, ci, nullptr, pl);
@@ -1075,6 +1139,7 @@ VkResult guarded_graphics(VkPipelineCache cache, const VkGraphicsPipelineCreateI
 VkResult guarded_compute(VkPipelineCache cache, const VkComputePipelineCreateInfo* ci, VkPipeline* pl) {
     install_driver_fault_guard();
     if (sigsetjmp(fault_jmp, 1) != 0) {
+        *pl = VK_NULL_HANDLE;   // (whatever the driver wrote before it faulted is not a pipeline)
         logf("vk: the driver faulted compiling a compute pipeline: that one is left out");
         return (VkResult)-77;
     }
@@ -2094,16 +2159,37 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
     // (measured: 21 of 21). gpl_libs_cached: RX_VK_GPL_NO_CACHE=1 keeps them out, as before. With our cache: through
     // graphics_with, so in play one compiled goes into the play generation, and an ask under the flag still goes to pcache)
     const bool lib_cached = (part == 1 || part == 2) && gpl_libs_cached();
+    // (hookshot) a program the driver faulted on is not asked of it again, and on AMD one program's builds go to it one at a
+    // time, so a second build waits here and not inside the driver behind a faulted one (driver_faults.h, issue 996). A cold
+    // probe does not wait: another build of its program under way is, for it, a compile that is required
+    const bool gated = driver_faults_on();
+    if (gated) {
+        const auto gate = fault_quarantine().begin(p.key, !cold);
+        if (gate == driver_faults::Quarantine::kBusy) return *cold = true, VK_NULL_HANDLE;
+        if (gate == driver_faults::Quarantine::kFaulted) {
+            static std::atomic<int> told{0};
+            if (told++ < 10)
+                logf("vk: a pipeline of %016llx left out: the driver faulted on that program (%s)", (unsigned long long)p.key,
+                     driver_faults_path().c_str());
+            return VK_NULL_HANDLE;
+        }
+    }
     const VkPipelineCache cache = lib_cached || (part < 0 && !driver_cache_only) ? pcache : VK_NULL_HANDLE;
     VkResult r = graphics_with(cache, &ci, &pl);
-    // The AMD Windows compiler can reject ordinary graphics pipelines with its optimizer on.
-    if (dev.props.vendorID == 0x1002 && dev.task_mesh_fallback && !p.mesh && part < 0 && r == VK_ERROR_UNKNOWN &&
-        !(ci.flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT)) {
+    // The AMD Windows compiler can reject ordinary graphics pipelines with its optimizer on. (A fault caught in it is kDriverFault
+    // now, VK_ERROR_UNKNOWN before: the retry stays for both, under the gate)
+    if (dev.props.vendorID == 0x1002 && dev.task_mesh_fallback && !p.mesh && part < 0 &&
+        (r == VK_ERROR_UNKNOWN || r == kDriverFault) && !(ci.flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT)) {
         ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
         pl = VK_NULL_HANDLE;
         r = graphics_with(cache, &ci, &pl);
         if (r == VK_SUCCESS)
             logf("vk: graphics pipeline for %016llx recovered with optimization disabled", (unsigned long long)p.key);
+    }
+    if (gated && fault_quarantine().end(p.key, r == kDriverFault)) {
+        logf("vk: the driver faulted building a pipeline of %016llx: that program is not asked of it again (%s)",
+             (unsigned long long)p.key, driver_faults_path().c_str());
+        driver_fault_note(p.key);
     }
     if (cold && r == VK_PIPELINE_COMPILE_REQUIRED) return *cold = true, VK_NULL_HANDLE;
     if (part >= 0) {
@@ -2399,6 +2485,21 @@ bool handle_is_storage_pointer(const Shader::Info& info, const Shader::TextureDe
     return false;
 }
 
+/// (zero-travadas, vk_internal.h ImportCopyOk) Whether a program's vertices, indices, uniform and read storage buffers may be
+/// served from the recording's stream while their pool's import is under way. Not one that follows pointers through guest
+/// memory's page table (uses_global_memory): the table has the pool only once it is imported, so such a program's own bindings
+/// import it where they are, as before
+bool import_copy_ok(const Program& p) {
+    for (const Stage& st : p.stages)
+        if (st.info.uses_global_memory) return false;
+    return true;
+}
+thread_local bool desc_copy_ok = false;   // (import_copy_ok of the program whose descriptors are being built)
+// (zero-travadas) RX_VK_TEX_GONE_EXACT (on; =0: as before): a resolved handle outlives the textures that went since it was
+// resolved, unless its own did (texture_outlived). The destroy generation is one number for every texture: on a present where
+// any texture was evicted (most of them, with the VRAM full) every handle of every draw was resolved again under the lock, the
+// slot's registration copied, the texture and its view looked up
+std::atomic<int64_t> st_gone_kept{0}, st_gone_redone{0};
 /// The view a texture handle samples (null: nothing resolves)
 /// The handles a recording resolved, with what they gave (draws bind the same textures again and again: the slot
 /// lookup, the cache's key and the view's are made once a recording, and again when a slot is registered anew)
@@ -2465,7 +2566,19 @@ VkImageView texture_view_of(uint32_t handle, VkImageViewType want, ViewUse use, 
         else if (it->second.destroy_gen != dgen) st_gen++;
         else st_hit++;
     }
-    if (it != handle_hits().end() && it->second.version == version && it->second.destroy_gen == dgen) {
+    bool hit = it != handle_hits().end() && it->second.version == version;
+    if (hit && it->second.destroy_gen != dgen) {   // (zero-travadas: textures went since; this one's own?)
+        static const bool gone_exact = !getenv("RX_VK_TEX_GONE_EXACT") || atoi(getenv("RX_VK_TEX_GONE_EXACT")) != 0;
+        // (one that resolved to nothing, the dummy or a texture left for a later frame, is always looked up again, as before)
+        if (gone_exact && it->second.tex && it->second.view && texture_outlived(it->second.tex, it->second.destroy_gen)) {
+            it->second.destroy_gen = dgen;
+            st_gone_kept.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            hit = false;
+            st_gone_redone.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (hit) {
         if (it->second.tex && it->second.tex_epoch != texture_epoch()) {   // (once a submission: its age and contents)
             if (!texture_touch_quick(it->second.tex, it->second.sampling)) {
                 ParLock lk;
@@ -2625,7 +2738,11 @@ VkDescriptorBufferInfo uniform_range(const NvnState& s, const Stage& st, uint32_
             }
         // (RX_VK_UB_SNAPSHOT=1: the contents as they are now, in the stream, not the pool the GPU reads later)
         static const bool snapshot = getenv("RX_VK_UB_SNAPSHOT") != nullptr;
-        BufferRef b = snapshot ? BufferRef{} : gpu_buffer_bind(u.addr, n, false);
+        BufferRef b{};
+        if (!snapshot) {   // (zero-travadas: its pool's import under way: nothing, and the copy below is what the draw reads)
+            ImportCopyOk meanwhile(desc_copy_ok ? 2 : 0);
+            b = gpu_buffer_bind(u.addr, n, false);
+        }
         if (b && b.offset % align == 0) return {b.buffer, b.offset, n};
         const uint64_t at = stream_alloc(n, align);   // (unaligned or outside the pools: copied into the stream)
         if (at == UINT64_MAX) return bi;
@@ -2733,7 +2850,9 @@ bool menu_env_on(const char* env_name, const char* ini_key_name, bool def = fals
 bool desc_slotgen_on() {
     static int on = -1;
     if (on < 0) {
-        on = menu_env_on("RX_VK_DESC_SLOTGEN", "descriptor_reuse", true, 4);   // (on by default since options_version 4)
+        // (on by default since options_version 4; zero-travadas: and for every file before version 5, with the Sampler cache:
+        // the two rows off made 72.7 frames over 50 ms where on made 47.7, a GTX 1660 in Hyrule Market, 2026-11-11)
+        on = menu_env_on("RX_VK_DESC_SLOTGEN", "descriptor_reuse", true, 5);
         if (on)
             logf("vk: descriptor slotgen ready: draws keep their descriptors through the registrations of slots they do not "
                  "sample (menu: Descriptor reuse)");
@@ -2745,7 +2864,7 @@ bool desc_slotgen_on() {
 bool sampler_cache_on() {
     static int on = -1;
     if (on < 0) {
-        on = menu_env_on("RX_VK_SAMPLER_CACHE", "sampler_cache");
+        on = menu_env_on("RX_VK_SAMPLER_CACHE", "sampler_cache", true, 5);   // (zero-travadas: on by default since options_version 5)
         if (on) logf("vk: sampler cache ready: sampler ids answer their parameters without the registrations' lock (menu: Sampler cache)");
     }
     return on;
@@ -2844,6 +2963,7 @@ bool table_track_open(int logged, int seen, int unlimited) {
 void build_descriptors(const NvnState& s, const Program& p) {
     dw().reset();
     dw().prog = &p;
+    desc_copy_ok = import_copy_ok(p);   // (zero-travadas)
     desc_fp().clear(), desc_fp_dummy = false;   // (RX_VK_DESC_SLOTGEN: the samplers' generation is read before the first handle,
     desc_samp_seen = sampler_registrations_generation();   // (so one registered during the build still forces the next rebuild)
     desc_destroy_seen = texture_destroy_generation();      // (an eviction retires views behind the slots' backs: it bumps only this)
@@ -2957,7 +3077,11 @@ void build_descriptors(const NvnState& s, const Program& p) {
                 // (hookshot) a storage buffer table's entries (count > 1, Info::global_tables): the ones past the table's
                 // end are whatever the constant buffer holds there, bound only when they look like a buffer
                 const bool plausible = d.count == 1 || (size && size <= (256ull << 20) && host->gpu_guest(base));
-                BufferRef b = addr && plausible ? gpu_buffer_bind(base, n, d.is_written && !bare) : BufferRef{};
+                BufferRef b{};
+                if (addr && plausible) {   // (zero-travadas: one buffer of its own size the program only reads may come from a copy meanwhile)
+                    ImportCopyOk meanwhile(desc_copy_ok && !d.is_written && !bare && d.count == 1 ? 1 : 0);
+                    b = gpu_buffer_bind(base, n, d.is_written && !bare);
+                }
                 // (AyyBeeDee20738, PR 138) a table entry's region that does not fit its pool this moment bound nothing, and the next
                 // frame bound it again: its reads flipped between the data and 0, the picture between bright and dark. Smaller,
                 // down to 1 MB, rather than nothing (and past what is bound the shaders' search now goes on to the page table)
@@ -3255,6 +3379,14 @@ VkResult shared_compute_pipeline(const VkComputePipelineCreateInfo* ci, VkPipeli
     return cached_compute(ci, out);
 }
 void draw_skip_report(double frames) { skip_report_impl(frames), fine_report(frames); }
+/// (zero-travadas) Every 600 presents: the resolved handles that outlived other textures' ends, and the ones looked up again
+void draw_zero_report() {
+    static const bool gone_exact = !getenv("RX_VK_TEX_GONE_EXACT") || atoi(getenv("RX_VK_TEX_GONE_EXACT")) != 0;
+    const int64_t kept = st_gone_kept.exchange(0, std::memory_order_relaxed), redone = st_gone_redone.exchange(0, std::memory_order_relaxed);
+    logf("vk: zero stutter (textures): 600 presents: after textures went, %lld resolved handles kept (their own texture stayed), "
+         "%lld looked up again (RX_VK_TEX_GONE_EXACT %s; =0: all of them looked up again, as before)", (long long)kept,
+         (long long)redone, gone_exact ? "on" : "off");
+}
 void descriptors_disturbed() {
     pushed()[0].cmd = pushed()[1].cmd = VK_NULL_HANDLE;
 }
@@ -3653,6 +3785,8 @@ namespace {
 struct Pass {
     bool open = false;
     VkImageView color[8]{};
+    VkImage block_image[8]{};
+    bool has_block_images = false;
     Texture* tex[8]{};   // (RX_VK_DUMP: what the pass renders into, and the last program it drew with)
     uint32_t level[8]{}, layer[8]{};
     Texture* depth_tex = nullptr;
@@ -3728,10 +3862,11 @@ Targets targets(NvnState& s) {
         if (tex && !(tex->aspect & VK_IMAGE_ASPECT_COLOR_BIT)) tex = nullptr;
         if (!tex) continue;
         const nvn_view* v = s.rt.has_cview[i] ? &s.rt.cview[i] : nullptr;
-        VkFormat f = VK_FORMAT_UNDEFINED;
-        const VkImageView view = texture_view(tex, t, v, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Attachment, &f);
+        const auto [view, f, blocks] = texture_attachment(tex, t, v);
         if (!view) continue;
         at.color[i] = tex, at.color_view[i] = view, at.color_format[i] = f, at.color_view_nvn[i] = view_nvn_format(t, v);
+        at.block_image[i] = blocks;
+        at.has_block_images |= blocks != VK_NULL_HANDLE;
         const uint32_t level = image_level(tex, view_level(v));
         at.color_level[i] = level, at.color_layer[i] = v ? view_layer(v) : 0;
         uint32_t w = std::max(1u, tex->width >> level), h = std::max(1u, tex->height >> level);
@@ -3748,6 +3883,7 @@ Targets targets(NvnState& s) {
         for (int j = 0; j < i; j++)
             if (at.color_view[i] && at.color_view[i] == at.color_view[j]) {
                 at.color[i] = nullptr, at.color_view[i] = VK_NULL_HANDLE, at.color_format[i] = VK_FORMAT_UNDEFINED, at.color_view_nvn[i] = 0;
+                at.block_image[i] = VK_NULL_HANDLE;
                 break;
             }
     while (at.n > 0 && !at.color[at.n - 1]) at.n--;   // (trailing empty targets)
@@ -3796,7 +3932,15 @@ void begin_pass(VkCommandBuffer cmd, const Targets& at) {
     for (int i = 0; i < at.n && same; i++) same = pass().color[i] == at.color_view[i];
     if (same) return;
     end_pass(cmd);
-    pass_start_barrier(cmd);   // (what the pass before wrote, and the transfers before it: vk_texture.cpp)
+    if (at.has_block_images) {
+        full_barrier(cmd, "barrier (before BC slice loads)");
+        for (int i = 0; i < at.n; i++)
+            if (at.block_image[i])
+                copy_block_attachment(cmd, *at.color[i], at.block_image[i], at.color_level[i], at.color_layer[i], true);
+        full_barrier(cmd, "barrier (after BC slice loads)");
+    } else {
+        pass_start_barrier(cmd);   // (what the pass before wrote, and the transfers before it: vk_texture.cpp)
+    }
     work_since_barrier = true;
     VkRenderingAttachmentInfo ca[8]{};
     bool marks = !texture_marked(at.depth);
@@ -3809,6 +3953,7 @@ void begin_pass(VkCommandBuffer cmd, const Targets& at) {
         ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         ca[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         pass().color[i] = at.color_view[i];
+        pass().block_image[i] = at.block_image[i];
         pass().tex[i] = at.color[i], pass().level[i] = at.color_level[i], pass().layer[i] = at.color_layer[i];
         texture_written(at.color[i], "a pass's colour target");
         texture_rendered(at.color[i]);
@@ -3824,6 +3969,7 @@ void begin_pass(VkCommandBuffer cmd, const Targets& at) {
         texture_rendered(at.depth);
     }
     pass().depth = at.depth_view;
+    pass().has_block_images = at.has_block_images;
     pass().depth_tex = at.depth, pass().depth_level = at.depth_level, pass().depth_layer = at.depth_layer;
     pass().n = at.n, pass().width = at.width, pass().height = at.height;
     VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
@@ -4446,6 +4592,7 @@ void draw_begin_recording(int slot, VkCommandBuffer cmd, uint64_t value) {
     r.used = 0, r.before = 0;
     r.c1_at.clear();
     cur = &r;
+    stream_serial_n++;   // (zero-travadas: the copies gpu_buffer_bind made in the last recording's stream are no longer handed out)
     pass() = Pass{};
     work_since_barrier = false;
     last_dyn_valid = false, last_desc_valid = false, last_vb_valid = false, last_pipeline = VK_NULL_HANDLE;
@@ -4700,6 +4847,13 @@ void end_pass(VkCommandBuffer cmd) {
     vkCmdEndRendering(cmd);
     pass().open = false;
     note_pass_end(cmd);   // (before the dumps and probes below: they record work, and the next pass's barrier is then a full one)
+    if (pass().has_block_images) {
+        full_barrier(cmd, "barrier (before BC slice stores)");
+        for (int i = 0; i < pass().n; i++)
+            if (pass().block_image[i])
+                copy_block_attachment(cmd, *pass().tex[i], pass().block_image[i], pass().level[i], pass().layer[i], false);
+        full_barrier(cmd, "barrier (after BC slice stores)");
+    }
     if (dump_on() && !dump_mesh_indirect().empty()) {
         for (const auto& [key, addr] : dump_mesh_indirect()) {
             const BufferRef r = gpu_buffer_bind(addr, 16, false);
@@ -6064,15 +6218,13 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
             if (skip) return;
         }
     }
-    // Not ready (translating, or its pipeline building): left out of the frame when its targets hold an earlier
-    // frame's picture already, which shows for a frame without it; waited for otherwise (a pass drawn once, a target
-    // made this frame), as totk-pc-recomp's TOTK_PIPE_SKIP rule. RX_VK_PIPE_WAIT=1: always waited for.
-    // (waited for by default: a draw left out showed as missing geometry in races, where many programs are new;
-    // RX_VK_PIPE_SKIP=1: left out when its targets hold an earlier frame's picture, as before)
-    // (hookshot: left out by default. Waiting, Ocarina froze 0.2-3 s at each area's first new programs, the most reported stutter;
-    // RX_VK_PIPE_SKIP=0: waited for, as mkw-recomp needs)
+    // Wait for translation before reading its stages. A pending pipeline may be left out only when no stage writes
+    // global memory or storage buffers/images and its targets hold an earlier frame's picture. RX_VK_PIPE_SKIP=0:
+    // pipelines are always waited for too.
+    // Waiting on unknown translations preserves writes but can restore first-visit pauses (previously 0.2-3 s).
+    // RX_VK_PIPE_SKIP=2 restores the old translation skip for persistent targets; after translation, memory-writing pipelines wait.
     static const bool always_wait = getenv("RX_VK_PIPE_SKIP") && atoi(getenv("RX_VK_PIPE_SKIP")) == 0;
-    const bool may_skip = !always_wait && targets_persistent(at);
+    static const bool legacy_translation_skip = getenv("RX_VK_PIPE_SKIP") && atoi(getenv("RX_VK_PIPE_SKIP")) == 2;
     auto wait_for = [&](const std::atomic<bool>& ready) {
         PROF_EXACT();
         const auto t0 = std::chrono::steady_clock::now();
@@ -6081,7 +6233,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         st_wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     };
     if (!cp->ready.load(std::memory_order_acquire)) {
-        if (may_skip) return void(st_pending_skips++);
+        if (legacy_translation_skip && targets_persistent(at)) return void(st_pending_skips++);
         wait_for(cp->ready);
     }
     if (exposure_log_on() && cp) exposure_note(s, *cp);
@@ -6112,6 +6264,19 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         pe = graphics_pipeline(p, s, at, topo, types);
     }
     if (!pe->ready.load(std::memory_order_acquire)) {
+        bool may_skip = !always_wait && targets_persistent(at);
+        if (may_skip)
+            for (const Stage& st : p.stages) {
+                const auto& info = st.info;
+                const auto written = [](const auto& ds) {
+                    return std::any_of(ds.begin(), ds.end(), [](const auto& d) { return d.is_written; });
+                };
+                if (info.stores_global_memory || written(info.storage_buffers_descriptors) ||
+                    written(info.image_buffer_descriptors) || written(info.image_descriptors)) {
+                    may_skip = false;
+                    break;
+                }
+            }
         if (may_skip) return void(st_pending_skips++);
         wait_for(pe->ready);
     }
@@ -6514,8 +6679,13 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
             if (vertex_bind_reuse(vb_addr, vb_size, vb_stamp, kept_vb[b].addr, kept_vb[b].size, kept_vb[b].stamp, kept_vb[b].ok))
                 r = kept_vb[b].ref;
             else {
-                r = gpu_buffer_bind(vb_addr, vb_size, false);
-                kept_vb[b] = {vb_addr, vb_size, gpu_bind_stamp(), r, r ? 1 : 0};
+                (void)gpu_bind_was_copy();
+                {   // (zero-travadas: from a copy in the stream while its pool's import is under way)
+                    ImportCopyOk meanwhile(import_copy_ok(p) ? 1 : 0);
+                    r = gpu_buffer_bind(vb_addr, vb_size, false);
+                }
+                // (a stream copy is this recording's alone: not kept for the submission's next part)
+                kept_vb[b] = {vb_addr, vb_size, gpu_bind_stamp(), r, r && !gpu_bind_was_copy() ? 1 : 0};
             }
             if (!r) {
                 complete = false;
@@ -6600,7 +6770,10 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         BufferRef ib;
         {
             FINE_SCOPE(FT_VERTEX);
-            ib = gpu_buffer_bind(d.ibuf, (uint64_t)std::max(d.count, 1) * unit, false);
+            {   // (zero-travadas: as the vertex streams above)
+                ImportCopyOk meanwhile(import_copy_ok(p) ? 1 : 0);
+                ib = gpu_buffer_bind(d.ibuf, (uint64_t)std::max(d.count, 1) * unit, false);
+            }
             if (!ib) SKIP_HERE();
             FINE_N(FC_IBIND, 1);
             bind_index(cmd, ib.buffer, ib.offset, itype);
@@ -8410,6 +8583,9 @@ void pipeline_cache_save(bool force) {
 namespace mkwvk {
 /// (hookshot) n bytes copied into the recording's stream, as a buffer binding (vk_memory.cpp gpu_buffer_bind: a read whose pool is
 /// still being imported in the background); empty when there is no recording or no room
+uint64_t stream_serial() {
+    return stream_serial_n;
+}
 BufferRef stream_copy(const void* src, uint64_t n) {
     if (!cur || !n) return {};
     const uint64_t align = std::max<uint64_t>({256, dev.props.limits.minUniformBufferOffsetAlignment,

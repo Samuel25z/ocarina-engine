@@ -93,9 +93,13 @@ VmaPool images_pool() {
     if (vmaFindMemoryTypeIndexForImageInfo(vma, &rep, &ai, &type) != VK_SUCCESS) return VK_NULL_HANDLE;
     VmaPoolCreateInfo pi{};
     pi.memoryTypeIndex = type;
-    pi.blockSize = kImageBlock;
+    // (Ocarina Engine, RX_VK_VRAM_GOV: with the textures and the render targets in pools of their own, this one holds a few images
+    // (DLSS's, the frame interpolation's, scratch: 6 of them, 21 MB, in Hyrule Market on a 6 GB laptop) and its 128 MB block was
+    // 107 MB of free space the driver counted. Smaller blocks there: vram_gov_misc_block_bytes)
+    const uint64_t misc_block = vram_gov_misc_block_bytes();
+    pi.blockSize = misc_block ? misc_block : kImageBlock;
     if (vmaCreatePool(vma, &pi, &image_pool) != VK_SUCCESS) image_pool = VK_NULL_HANDLE;
-    logf("vk: images from a pool of %llu MB blocks (memory type %u)%s", (unsigned long long)(kImageBlock >> 20), type,
+    logf("vk: images from a pool of %llu MB blocks (memory type %u)%s", (unsigned long long)(pi.blockSize >> 20), type,
          image_pool ? "" : ": not made");
     return image_pool;
 }
@@ -137,6 +141,28 @@ bool textures_pool_usage(uint64_t* block_bytes, uint64_t* free_bytes) {
     return true;
 }
 
+/// (Ocarina Engine, RX_VK_VRAM_GOV) the image pools' blocks and the free space in them, and every block VMA holds in device-local
+/// memory (dedicated allocations count as blocks there): what the governor reads every 10 presents
+bool image_pools_usage(ImagePoolsUsage* u) {
+    *u = {};
+    const auto one = [](VmaPool pool, uint64_t* blocks, uint64_t* free_bytes, uint32_t* count) {
+        if (!pool) return;
+        VmaStatistics st{};
+        vmaGetPoolStatistics(vma, pool, &st);
+        *blocks = st.blockBytes, *free_bytes = st.blockBytes - std::min(st.blockBytes, st.allocationBytes), *count = st.blockCount;
+    };
+    one(texture_pool, &u->tex_blocks, &u->tex_free, &u->tex_n);
+    one(target_image_pool, &u->tgt_blocks, &u->tgt_free, &u->tgt_n);
+    one(image_pool, &u->misc_blocks, &u->misc_free, &u->misc_n);
+    VmaBudget b[VK_MAX_MEMORY_HEAPS]{};
+    vmaGetHeapBudgets(vma, b);
+    for (uint32_t h = 0; h < dev.memory.memoryHeapCount; h++)
+        if (dev.memory.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) u->device_blocks += b[h].statistics.blockBytes;
+    u->misc_block = image_pool ? (vram_gov_misc_block_bytes() ? vram_gov_misc_block_bytes() : kImageBlock) : kImageBlock;
+    u->block = kImageBlock;
+    return texture_pool || target_image_pool;
+}
+
 // ---- the textures' pool compacted: VMA's defragmentation context and its open pass ----
 namespace {
 VmaDefragmentationContext compact_ctx = VK_NULL_HANDLE;
@@ -151,10 +177,11 @@ bool compact_over(uint64_t* freed_bytes, uint32_t* freed_blocks) {
     return false;
 }
 }
-bool image_compact_begin(uint64_t max_bytes_a_pass, uint32_t max_moves_a_pass) {
-    if (compact_ctx || !texture_pool) return false;
+bool image_compact_begin(uint64_t max_bytes_a_pass, uint32_t max_moves_a_pass, bool targets) {
+    VmaPool pool = targets ? target_image_pool : texture_pool;   // (Ocarina Engine, RX_VK_VRAM_GOV: the render targets' blocks too)
+    if (compact_ctx || !pool) return false;
     VmaDefragmentationInfo di{};
-    di.pool = texture_pool;
+    di.pool = pool;
     di.maxBytesPerPass = max_bytes_a_pass;
     di.maxAllocationsPerPass = max_moves_a_pass;
     return vmaBeginDefragmentation(vma, &di, &compact_ctx) == VK_SUCCESS;

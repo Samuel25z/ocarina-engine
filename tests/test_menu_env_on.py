@@ -1,11 +1,11 @@
-"""A Debug row read before the menu loads (gpu/vk/vk_draw.cpp menu_env_on): Descriptor reuse on by default from options_version 4.
+"""A Debug row read before the menu loads (gpu/vk/vk_draw.cpp menu_env_on): Descriptor reuse and Sampler cache on by default from options_version 5.
 
 The real menu_env_on from gpu/vk/vk_draw.cpp is compiled over a stub game path (the fixture's folder); each case writes a
-hookshot_options.ini (or none) and checks the answer for descriptor_reuse (on by default since options_version 4: an older
-file wrote its 0 as the off default it then was) and sampler_cache (off by default, no version rule):
+hookshot_options.ini (or none) and checks the answer for descriptor_reuse and sampler_cache (both on by default since
+options_version 5: an older file wrote its 0 as the off default it then was, or was a bench's):
 
 - no file: the default; a file without the line: the default;
-- options_version 3 with descriptor_reuse=0: on (the old default, moved); 4 with 0: off (chosen); 4 with 1: on;
+- options_version 3 or 4 with a row at 0: on (the old default, moved); 5 with 0: off (chosen); 5 with 1: on;
 - RX_VK_DESC_SLOTGEN over all of it.
 
 python -I -B tests/test_menu_env_on.py [--cxx clang++]
@@ -42,8 +42,8 @@ static DWORD game_module_path(char *path, DWORD size) { return snprintf(path, si
 BODY
 int main(int argc, char **argv) {
     if (argc != 3) return 2;
-    const bool reuse = menu_env_on("RX_VK_DESC_SLOTGEN", "descriptor_reuse", true, 4);
-    const bool sampler = menu_env_on("RX_VK_SAMPLER_CACHE", "sampler_cache");
+    const bool reuse = menu_env_on("RX_VK_DESC_SLOTGEN", "descriptor_reuse", true, 5);
+    const bool sampler = menu_env_on("RX_VK_SAMPLER_CACHE", "sampler_cache", true, 5);
     if (reuse != (atoi(argv[1]) != 0) || sampler != (atoi(argv[2]) != 0)) {
         fprintf(stderr, "FAIL: descriptor_reuse %d (want %s), sampler_cache %d (want %s)\n", reuse, argv[1], sampler, argv[2]);
         return 1;
@@ -54,15 +54,18 @@ int main(int argc, char **argv) {
 
 # (hookshot_options.ini's text or None for no file, RX_VK_DESC_SLOTGEN or None, descriptor reuse, sampler cache)
 CASES = (
-    (None, None, 1, 0),
-    ("output_res=1\noptions_version=4\n", None, 1, 0),
-    ("descriptor_reuse=0\nsampler_cache=0\noptions_version=3\n", None, 1, 0),
-    ("descriptor_reuse=0\nsampler_cache=1\n", None, 1, 1),
-    ("descriptor_reuse=0\nsampler_cache=1\noptions_version=4\n", None, 0, 1),
-    ("options_version=4\ndescriptor_reuse=1\n", None, 1, 0),
-    ("descriptor_reuse=0\noptions_version=4\n", "1", 1, 0),
-    ("descriptor_reuse=1\noptions_version=4\n", "0", 0, 0),
-    (None, "0", 0, 0),
+    (None, None, 1, 1),
+    ("output_res=1\noptions_version=4\n", None, 1, 1),
+    ("output_res=1\noptions_version=5\n", None, 1, 1),
+    ("descriptor_reuse=0\nsampler_cache=0\noptions_version=3\n", None, 1, 1),
+    ("descriptor_reuse=0\nsampler_cache=0\n", None, 1, 1),
+    ("descriptor_reuse=0\nsampler_cache=0\noptions_version=4\n", None, 1, 1),
+    ("descriptor_reuse=0\nsampler_cache=0\noptions_version=5\n", None, 0, 0),
+    ("descriptor_reuse=0\nsampler_cache=1\noptions_version=5\n", None, 0, 1),
+    ("options_version=5\ndescriptor_reuse=1\nsampler_cache=0\n", None, 1, 0),
+    ("descriptor_reuse=0\noptions_version=5\n", "1", 1, 1),
+    ("descriptor_reuse=1\noptions_version=5\n", "0", 0, 1),
+    (None, "0", 0, 1),
 )
 
 
@@ -89,8 +92,8 @@ def main():
             if env_value is not None:
                 env["RX_VK_DESC_SLOTGEN"] = env_value
             subprocess.run([str(exe), str(reuse), str(sampler)], cwd=work, env=env, check=True)
-    print("PASS: Descriptor reuse on by default and for options files before version 4; a version 4 choice and the "
-          "environment kept; Sampler cache unchanged")
+    print("PASS: Descriptor reuse and Sampler cache on by default and for options files before version 5; a version 5 choice "
+          "and the environment kept")
 
 
 if __name__ == "__main__":
