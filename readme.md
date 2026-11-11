@@ -31,7 +31,7 @@ Cada mudança pode ser desligada para comparar: `RX_VK_STAGING_REUSE=0`, `RX_VK_
 ## Como instalar
 
 1. Monte o jogo com o **HookshotBuilder** (página de Releases do Hookshot), como de costume.
-2. Baixe o `hookshot_vk.dll` da página de Releases deste repositório e coloque por cima do que está na pasta do jogo
+2. Baixe o `hookshot_vk.dll` da página de Releases deste repositório e coloque por cima do `hookshot_vk.dll` que já existe na pasta do jogo (nos builders mais novos ele fica dentro da subpasta `bin`)
    (guarde o original, se quiser voltar).
 3. Copie o `hookshot_env.txt` do release para a pasta do jogo.
 4. Abra o jogo. Na primeira vez ele prepara os shaders de novo (um minuto e pouco).
