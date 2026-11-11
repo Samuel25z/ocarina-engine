@@ -49,14 +49,30 @@ Cada mudança pode ser desligada para comparar (no `hookshot_env.txt`): `RX_VK_S
 
 ## Como instalar
 
-1. Monte o jogo com o **HookshotBuilder** (página de Releases do Hookshot), como de costume.
-2. Baixe o `hookshot_vk.dll` da página de Releases deste repositório e coloque por cima do `hookshot_vk.dll` que já existe na pasta do jogo (nos builders mais novos ele fica dentro da subpasta `bin`)
-   (guarde o original, se quiser voltar).
-3. Copie o `hookshot_env.txt` do release para a pasta do jogo.
-4. Abra o jogo. Na primeira vez ele prepara os shaders de novo (um minuto e pouco).
+O Ocarina Engine troca só o renderizador (`hookshot_vk.dll`) do jogo montado pelo Hookshot. Não traz o jogo: você precisa da sua própria cópia (o arquivo `.nup`).
 
-Esta versão (v0.3.0) é para o **HookshotBuilder v2.1.0**. A partir dela, as próximas versões chegam pelo botão Atualizar no menu do jogo (Insert/F1 > Gameplay). Cada release diz com qual versão do builder ele funciona. Se o jogo não abrir, a versão do builder não casa:
-use a indicada no release.
+### Já uso o Hookshot (só trocar os arquivos)
+1. Confira que o seu HookshotBuilder é o **v2.1.0** (é a versão com que esta release funciona).
+2. Feche o jogo.
+3. Na pasta do jogo, ache o `hookshot_vk.dll` (nos builders novos ele fica na subpasta `bin`). Guarde uma cópia dele, se quiser voltar.
+4. Baixe o `hookshot_vk.dll` da [última release](https://github.com/Samuel25z/ocarina-engine/releases/latest) e coloque por cima.
+5. Baixe o `hookshot_env.txt` e coloque ao lado do `hookshot.exe`.
+6. Abra o jogo. Na primeira vez ele prepara os shaders de novo (alguns minutos). Seus saves e suas opções continuam os mesmos.
+
+### Começando do zero (nunca usei o Hookshot)
+1. Baixe o **HookshotBuilder v2.1.0** na [página de releases do Hookshot](https://github.com/NotRexed/Hookshot/releases/tag/v2.1.0).
+2. Abra o builder, aponte para o seu `.nup` do jogo e monte. Leva um tempo e pede bastante espaço livre no disco.
+3. Quando terminar, siga os passos de "Já uso o Hookshot" acima.
+
+### Versões novas
+- A partir da v0.3, o próprio jogo avisa quando sai versão nova: menu **Insert/F1 > Gameplay > Atualização**. Ele baixa e troca a DLL; é só reiniciar o jogo.
+- **Atenção:** se você atualizar o Hookshot pelo HookshotBuilder, ele põe a DLL original de volta. Aí é só trocar de novo.
+- Se o jogo não abrir depois da troca, a versão do builder não casa com a da DLL: use o builder indicado na release.
+
+### English (short)
+**Already on Hookshot:** HookshotBuilder **v2.1.0** required. Close the game, replace `hookshot_vk.dll` (game folder or its `bin` subfolder) with the one from the [latest release](https://github.com/Samuel25z/ocarina-engine/releases/latest), put `hookshot_env.txt` next to `hookshot.exe`, start the game (it prepares shaders once). Saves and settings are kept.
+**From scratch:** build the game from your own `.nup` with [HookshotBuilder v2.1.0](https://github.com/NotRexed/Hookshot/releases/tag/v2.1.0), then do the above.
+**Updates:** from v0.3 on, the game offers new versions in **Insert/F1 > Gameplay**. Updating Hookshot through its builder puts the original DLL back; just replace it again.
 
 ## Quem faz
 
