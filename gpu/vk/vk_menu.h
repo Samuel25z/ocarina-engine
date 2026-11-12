@@ -82,7 +82,8 @@ struct Options {
                              // 2 English (vk_menu.cpp menu_pt); saved as menu_language
 };
 extern Options opts;
-/// (ocarina) The reports' notice (ocarina_report.cpp toast), by level: 1 the reports are saved, 2 they are also sent. Whether
+/// (ocarina) The reports' notice (ocarina_report.cpp toast), by level: 1 the reports are saved, 2 they are also sent (v0.4.0 to
+/// v0.4.3), 3 they are sent and the light performance reports too (shown again to whoever saw only 2's). Whether
 /// hookshot_options.ini says one of that level or above was shown (ocarina_report_notice=<level>), and that one is shown now
 /// (saved by the next menu_tick)
 bool menu_report_notice_seen(int level);

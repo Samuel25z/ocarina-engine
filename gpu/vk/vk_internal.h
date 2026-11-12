@@ -315,6 +315,7 @@ struct RamState {
 RamState ram_state();
 /// (every 600 presents, beside the "vk: memory:" line) what the guard sees and what its levers did
 void ram_guard_log();
+void mem_map_log_async();   // (Ocarina Engine: where the private bytes are, on a thread of its own)
 /// (vk_draw.cpp) whether the preparation's worker `me` of `of` may build now, by the commit left (each build ~256 MB at its peak;
 /// worker 0 always may). RX_VK_PREP_RAM=0: all of them, as before
 bool prep_worker_may_run(unsigned me, unsigned of);

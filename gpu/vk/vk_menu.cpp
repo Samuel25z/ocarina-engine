@@ -918,14 +918,16 @@ Row rows[] = {
      "momento vão no próximo relatório (RX_VK_BUG_KEY troca a tecla; 0 desliga).",
      report_hint, false, true},
     {TAB_GAMEPLAY, "Relatórios automáticos", &opts.auto_report, 0, 1, 1, tx_ligado,
-     "Ligado: quando o jogo fecha com erro (travou, a placa de vídeo parou ou foi fechado à força), o próximo início salva um "
-     "relatório .zip na pasta do jogo e avisa na tela; ficam no máximo 5. Se ele vai pela internet é a opção de baixo. Desligado: "
-     "nenhum relatório automático; Gerar relatório continua funcionando.", nullptr, false, true},
+     // (ocarina: the hint in English, its Portuguese in vk_menu_pt.h)
+     "On: when the game closes with an error (it froze, the graphics card stopped or it was forced closed), the next start saves a "
+     ".zip report in the game folder and says so on screen; at most 5 are kept. With sending on, stutters and low FPS also make "
+     "small performance reports, with no picture. Off: no automatic reports; Gerar relatório still works.", nullptr, false, true},
     {TAB_GAMEPLAY, "Enviar relatórios automaticamente", &opts.report_upload, 0, 1, 1, tx_ligado,
-     "Ligado: cada relatório (o automático, depois de um erro, e o do Gerar relatório) vai pela internet para o Ocarina Engine, "
-     "para o erro chegar a quem corrige sem você precisar anexar nada. Vão só os arquivos do relatório, sem seu nome de usuário, "
-     "o nome do computador ou suas pastas pessoais. Sem internet, ele vai no próximo início. Desligado: nada é enviado; os "
-     "relatórios ficam só na pasta do jogo.", nullptr, false, true},
+     "On: each report goes over the internet to Ocarina Engine, so the problem reaches whoever fixes it without you attaching "
+     "anything: the automatic one after an error, the Gerar relatório one, and small performance reports when the game stutters or "
+     "the FPS drops (at most 7 a session). Only the report's files go, without your user name, the computer's name or your "
+     "personal folders. With no internet, it goes at the next start. Off: nothing is sent; the reports stay in the game folder only.",
+     nullptr, false, true},
     // (Restart and Quit stay the table's last two: kRestartRow and kQuitRow count back from its end)
     {TAB_GAMEPLAY, "Restart", nullptr, 0, 0, 0, nullptr,
      "Starts the game again. Save your progress first. Press Enter or A twice to restart. Esc or B "
@@ -3065,7 +3067,7 @@ void menu_init() {
             if (!strcmp(line, "menu_size") && atoi(eq + 1) == 0) menu_auto = true;
             if (!strcmp(line, "vivid_colors")) old_vivid = atoi(eq + 1);   // (ocarina: the key before the levels)
             if (!strcmp(line, "vivid_level")) has_vivid_level = true;
-            if (!strcmp(line, "ocarina_report_notice")) report_notice.store(std::clamp(atoi(eq + 1), 0, 2));   // (ocarina)
+            if (!strcmp(line, "ocarina_report_notice")) report_notice.store(std::clamp(atoi(eq + 1), 0, 3));   // (ocarina)
             if (!strcmp(line, "microphone_device")) {   // (hookshot: the microphone, by its name)
                 mic_want = mic_key(eq + 1);
                 while (!mic_want.empty() && (mic_want.back() == '\n' || mic_want.back() == '\r')) mic_want.pop_back();

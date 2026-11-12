@@ -8,7 +8,7 @@
 // (ocarina) This DLL's release, as its GitHub tag without the "v" (ocarina_update.cpp compares the latest release's tag with it,
 // and fetches this tag's hookshot_env.txt to know whether the player changed theirs): raised with every release
 #ifndef OCARINA_VERSION
-#define OCARINA_VERSION "0.4.3"
+#define OCARINA_VERSION "0.4.4"
 #endif
 
 namespace mkwvk {

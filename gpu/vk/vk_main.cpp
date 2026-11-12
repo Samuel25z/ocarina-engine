@@ -88,6 +88,7 @@ void logf(const char* fmt, ...) {
     va_start(a, fmt);
     std::vsnprintf(b, sizeof b, fmt, a);
     va_end(a);
+    ocarina_report::log_line(b);   // (ocarina: the performance windows read their slow submits, RAM guard and VRAM lines here)
     if (host) host->log(b);
 }
 

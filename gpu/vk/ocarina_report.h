@@ -35,6 +35,21 @@ constexpr uint8_t kSlow = 1, kStallBig = 2, kStallMany = 4, kMark = 8;
 /// Each game frame, on the replay thread: cheap (a copy into the ring under an uncontended lock)
 void frame(Frame f);
 
+/// (vk_main.cpp logf) Each line of the log the renderer writes: the performance windows keep the "vk: slow submit", "vk: RAM
+/// guard: level" and "vk: VRAM:" lines' numbers (a few compares for any other line)
+///
+/// The performance reports (perf): every 5 minutes of play (frames shown with the window not minimized and the Insert menu closed;
+/// loads count, they cannot be told apart) the window is judged: more than 10 frames over 100 ms, a mean under 30 fps, a slow
+/// submit over 250 ms, more than 20 scene flickers, RAM guard level 2, VRAM used over what the driver allows (constants in
+/// ocarina_report.cpp). One that passes any makes a light report, ocarina-relatorio-desempenho-*.zip (the log's last 3000 lines,
+/// the window's frames, every window of the session, sistema.txt, the settings, motivo.txt; deflated, no picture, ~100-300 KB)
+/// sent as kind "desempenho": at most 7 a session, never two within 5 minutes. When the game's window closes (WM_CLOSE: the X,
+/// Alt+F4, the menu's Quit or Restart) the last window too, and a summary goes when the session had a problem, or when no light
+/// report of this version was made yet on this installation (the reference, after 3 minutes of play); it may follow the last
+/// window's report sooner than 5 minutes when at least 1 minute of play came after it. The window waits up to 2.5 s for it to go. Only with sending and the automatic reports on, and once the notice naming them (level 3) was shown.
+/// OCARINA_PERF_REPORT=0 (RX_VK_PERF_REPORT=0): none. OCARINA_PERF_TEST=1 (RX_VK_PERF_TEST=1): windows of 60 s, every one a problem
+void log_line(const char* line);
+
 /// Once, as the window's renderer starts (vk_main.cpp start): the last session's stalls file moved aside, and the automatic report
 /// of the last session when it did not end cleanly (in the background)
 void begin();

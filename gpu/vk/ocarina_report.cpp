@@ -1,8 +1,10 @@
-// (ocarina) Ocarina Engine's problem report: ocarina_report.h. A ZIP written by hand ("stored": no compression, so no library),
-// on a thread of its own at below-normal priority, then sent to the receiver unless that is turned off (ocarina_upload.h). What goes in is read with every sharing flag (the log is open
+// (ocarina) Ocarina Engine's problem report: ocarina_report.h. A ZIP written by hand ("stored": no compression, so no library;
+// the light performance reports deflated by ocarina_deflate.h), on a thread of its own at below-normal priority, then sent to
+// the receiver unless that is turned off (ocarina_upload.h). What goes in is read with every sharing flag (the log is open
 // for writing) and cleaned of the user's name, profile folder, computer name and e-mails (Scrub) before it is written
 #include "ocarina_report.h"
 #include "ocarina_brand.h"
+#include "ocarina_deflate.h"
 #include "ocarina_upload.h"
 #include "vk_internal.h"
 #include "vk_menu.h"   // (opts.auto_report, the notice's flag)
@@ -88,6 +90,84 @@ std::vector<Snapshot> snaps;
 bool snap_pending = false;
 uint64_t snap_seq = 0;
 Stall snap_why{};
+
+// ---- the performance windows (ocarina_report.h perf): every 5 minutes of play, what the frames and the log said ----
+// The limits: a window with any of these is a problem, and makes a light report (at most kMaxPerfPerSession a session, never
+// two within kPerfGapNs). OCARINA_PERF_TEST=1 (RX_VK_PERF_TEST=1): windows of 60 s, 60 s between reports, every window a problem
+constexpr int64_t kPerfWindowNs = 300'000'000'000;   // (5 minutes of play: frames shown, the window not minimized, the menu closed)
+constexpr int64_t kPerfGapNs = 300'000'000'000;      // (between two performance reports, at least)
+constexpr int kMaxPerfPerSession = 7;                // (a 30-minute session: 6 windows and the summary at the end)
+constexpr float kSlowFrameMs = 100;                  // (a frame longer than this is a hitch the player feels)
+constexpr int kSlowFramesMax = 10;                   // (more than this many in a window: a problem)
+constexpr double kFpsMin = 30;                       // (the window's mean below this: a problem; the game's cap is 60 or more)
+constexpr float kSlowSubmitMs = 250;                 // (a "vk: slow submit" line above this: a problem)
+constexpr int kFlickerMax = 20;                      // (scene flickers in a window, more than this: a problem; the menus and
+                                                     // loads alone give ~10 in a whole short session, the fog's bug hundreds)
+constexpr int kRamGuardLevel = 2;                    // (a "vk: RAM guard: level" this high: the commit or the RAM nearly gone)
+constexpr int64_t kVramOverMb = 0;                   // (a "vk: VRAM:" line with more used than the driver allows, by more than this)
+constexpr float kCountMaxMs = 5000;                  // (one frame counts at most this much play time: a pause is not play)
+constexpr int64_t kBaselinePlayNs = 180'000'000'000; // (the version's reference report: a session with at least this much play)
+constexpr int64_t kEndMinPlayNs = 60'000'000'000;    // (the last, unfinished window: its mean FPS judged only after this much)
+constexpr size_t kPerfLogLines = 3000;               // (the log's newest lines in a light report)
+constexpr size_t kPerfMaxFrames = 20000;             // (the newest frames of the window in its quadros.csv)
+constexpr int kPerfKeep = 10;                        // (light reports kept in the game folder, the newest)
+
+bool env_on(const char* a, const char* b) {
+    for (const char* k : {a, b})
+        if (const char* e = getenv(k); e && *e && atoi(e) != 0) return true;
+    return false;
+}
+bool env_off(const char* a, const char* b) {
+    for (const char* k : {a, b})
+        if (const char* e = getenv(k); e && *e == '0' && atoi(e) == 0) return true;
+    return false;
+}
+bool perf_test() {
+    static const bool t = env_on("OCARINA_PERF_TEST", "RX_VK_PERF_TEST");
+    return t;
+}
+int64_t perf_window_ns() { return perf_test() ? 60'000'000'000 : kPerfWindowNs; }
+int64_t perf_gap_ns() { return perf_test() ? 60'000'000'000 : kPerfGapNs; }
+int64_t perf_baseline_ns() { return perf_test() ? 30'000'000'000 : kBaselinePlayNs; }
+int64_t perf_end_min_ns() { return perf_test() ? 10'000'000'000 : kEndMinPlayNs; }
+
+/// One window of play: its frames (from frame(), under ring_mu), its log lines (log_line, under perf_mu), its flickers
+struct PerfWin {
+    int index = 0;
+    int64_t start_ns = 0, end_ns = 0;
+    uint64_t first_seq = 0, last_seq = 0;
+    double play_ms = 0;
+    uint64_t frames = 0;
+    int slow_frames = 0;
+    float longest_ms = 0;
+    // (the log's)
+    float longest_submit_ms = 0;
+    int slow_submits = 0;   // (above kSlowSubmitMs)
+    int ram_level = -1;     // (the highest "RAM guard: level"; -1 none seen)
+    int64_t vram_used_mb = -1, vram_allowed_mb = -1;   // (the line with the most over, or the most used)
+    int flickers = 0;
+    bool last = false;      // (the unfinished window at the end of the session)
+    std::string why, why_short;   // (the limits it passed: motivo.txt's lines, the receiver's X-Ocarina-Motivo)
+    std::string report;     // (its light report's file name, "" none)
+    double fps() const { return play_ms > 0 ? frames * 1000.0 / play_ms : 0; }
+};
+PerfWin perf_cur;   // (ring_mu: the frames' part of the window going on)
+std::mutex perf_mu;   // (the log's part, the history, the reports made)
+PerfWin perf_log;   // (perf_mu: the log's part of the window going on)
+std::vector<PerfWin> perf_done;   // (perf_mu: the session's windows, judged)
+int perf_made = 0;           // (perf_mu: light reports made this session)
+int64_t perf_last_ns = 0;    // (perf_mu: the last one's time)
+int perf_windows = 0;        // (perf_mu: windows closed)
+std::atomic<bool> perf_consent{false};   // (the notice that says the performance reports are sent was shown, now or before)
+
+/// OCARINA_PERF_REPORT=0 / RX_VK_PERF_REPORT=0: no performance windows, no light reports
+bool perf_off() {
+    static const bool off = env_off("OCARINA_PERF_REPORT", "RX_VK_PERF_REPORT");
+    return off;
+}
+/// A window of play ended (frame(), last false: on a thread of its own) or the session ends (last true: here, waited for);
+/// the name of the light report made, "" none
+std::string perf_closed(PerfWin w, bool last);
 
 std::string kind_text(uint8_t k) {
     std::string t = k & kStallBig ? "quadro acima de 1 s" : k & kStallMany ? "5 quadros acima de 250 ms em 10 s" : k & kSlow ? "quadro acima de 250 ms" : "";
@@ -444,6 +524,8 @@ struct Zip {
     struct Entry {
         std::string name;
         uint32_t crc, size, offset;
+        uint32_t csize = 0;
+        uint16_t method = 0;   // (0 stored, 8 deflated)
     };
     std::vector<Entry> entries;
     uint16_t dtime = 0, ddate = 0;
@@ -463,18 +545,23 @@ struct Zip {
         ddate = (uint16_t)((t.wYear - 1980) << 9 | t.wMonth << 5 | t.wDay);
         return f != nullptr;
     }
-    void add(const std::string& name, const std::string& data) {
+    /// deflate: the entry compressed (method 8) when that makes it smaller
+    void add(const std::string& name, const std::string& data, bool deflate = false) {
         if (!f || at + data.size() + 4096 > 0xFFFF0000u) {   // (no ZIP64: a report stays under 4 GB)
             ok = ok && f;
             return;
         }
         Entry e{name, crc32_of(data), (uint32_t)data.size(), (uint32_t)at};
+        std::string packed;
+        if (deflate && data.size() > 64) packed = ocarina_deflate::deflate_raw(data);
+        const bool packs = !packed.empty() && packed.size() < data.size();
+        e.method = packs ? 8 : 0, e.csize = packs ? (uint32_t)packed.size() : e.size;
         std::string h;
-        u32(h, 0x04034b50), u16(h, 20), u16(h, 0x0800), u16(h, 0), u16(h, dtime), u16(h, ddate);
-        u32(h, e.crc), u32(h, e.size), u32(h, e.size), u16(h, (uint16_t)name.size()), u16(h, 0);
+        u32(h, 0x04034b50), u16(h, 20), u16(h, 0x0800), u16(h, e.method), u16(h, dtime), u16(h, ddate);
+        u32(h, e.crc), u32(h, e.csize), u32(h, e.size), u16(h, (uint16_t)name.size()), u16(h, 0);
         h += name;
         put(h);
-        put(data);
+        put(packs ? packed : data);
         entries.push_back(e);
     }
     bool close() {
@@ -482,8 +569,8 @@ struct Zip {
         const uint32_t cd = (uint32_t)at;
         std::string c;
         for (const Entry& e : entries) {
-            u32(c, 0x02014b50), u16(c, 20), u16(c, 20), u16(c, 0x0800), u16(c, 0), u16(c, dtime), u16(c, ddate);
-            u32(c, e.crc), u32(c, e.size), u32(c, e.size), u16(c, (uint16_t)e.name.size()), u16(c, 0), u16(c, 0), u16(c, 0), u16(c, 0);
+            u32(c, 0x02014b50), u16(c, 20), u16(c, 20), u16(c, 0x0800), u16(c, e.method), u16(c, dtime), u16(c, ddate);
+            u32(c, e.crc), u32(c, e.csize), u32(c, e.size), u16(c, (uint16_t)e.name.size()), u16(c, 0), u16(c, 0), u16(c, 0), u16(c, 0);
             u32(c, 0), u32(c, e.offset);
             c += e.name;
         }
@@ -827,6 +914,53 @@ std::wstring report_name(bool automatic) {
 
 bool upload_on();   // (below: sending on)
 
+/// \n as \r\n (line ends as Notepad wants them)
+std::string crlf(const std::string& body) {
+    std::string s;
+    s.reserve(body.size() + body.size() / 32);
+    for (char ch : body) {
+        if (ch == '\n') s += '\r';
+        s += ch;
+    }
+    return s;
+}
+
+/// sistema.txt after its first lines: the PC, the window, the switches, what the log says, the stalls and the flickers.
+/// at_start: the automatic report of the start (the session is the last one, its log hookshot_log.1.txt)
+std::string system_body(const LogFacts& lf, bool at_start, const Scrub& scrub) {
+    std::string body = "\nPLACAS DE VÍDEO (Vulkan)\n" + gpus_text(!at_start);
+    body += "\nPROCESSADOR\n  " + cpu_text() + "\n";
+    MEMORYSTATUSEX ms{sizeof ms};
+    if (GlobalMemoryStatusEx(&ms))
+        body += fmt("\nMEMÓRIA RAM\n  %.1f GB no total, %.1f GB livres agora (%lu%% em uso)\n", ms.ullTotalPhys / 1073741824.0,
+                    ms.ullAvailPhys / 1073741824.0, (unsigned long)ms.dwMemoryLoad);
+    body += "\nWINDOWS\n  " + windows_text() + "\n";
+    body += "\nJANELA\n" + window_text();
+    body += "\nVARIÁVEIS DE AMBIENTE EM USO (RX_, HOS_, OCARINA_, HOOKSHOT_...)\n" + env_text(scrub);
+    body += at_start ? "\nÚLTIMAS LINHAS DO LOG DA SESSÃO QUE FECHOU COM ERRO (hookshot_log.1.txt)\n" : "\nÚLTIMAS LINHAS DO LOG (hookshot_log.txt)\n";
+    const std::pair<const char*, const std::string*> wanted[] = {{"VRAM", &lf.vram}, {"VRAM (governador)", &lf.governor},
+                                                                   {"detalhe de textura", &lf.detail}, {"replay", &lf.replay},
+                                                                   {"GPU time", &lf.gpu}, {"status", &lf.status},
+                                                                   {"piscadas da cena", &lf.flicker}};
+    for (const auto& [label, line] : wanted)
+        body +=fmt("  %s: %s\n", label, line->empty() ? "(não apareceu)" : line->c_str());
+    body += "\nERROS NO LOG (CRASH, FATAL, device lost)\n";
+    if (lf.errors.empty()) body += "  (nenhum)\n";
+    for (const std::string& e : lf.errors) body += "  " + e + "\n";
+    if (at_start) {
+        body += "\nCOMO O LOG TERMINOU (últimas linhas)\n";
+        for (const std::string& e : lf.tail) body += "  " + e + "\n";
+    }
+    body += "\nTRAVADAS DESTA SESSÃO\n" + stalls_text();
+    body += flicker_on() ? "\nPISCADAS DA CENA NESTA SESSÃO (detector de brilho; a série está em brilho.csv)\n" + flicker_text()
+                         : "\nPISCADAS DA CENA: detector desligado (RX_VK_FLICKER=0)\n";
+    {
+        std::lock_guard lk(ring_mu);
+        if (at_start && !ring_n) body +="  (relatório feito no início: o tempo dos quadros da sessão anterior não fica guardado, só as travadas dela)\n";
+    }
+    return body;
+}
+
 Made make_report(bool automatic, const std::string& why) {
     Made m;
     if (game_dir().empty()) {
@@ -920,40 +1054,7 @@ Made make_report(bool automatic, const std::string& why) {
     s += fmt("Ocarina Engine %s (hookshot_vk.dll), API do renderizador %d, o jogo pede a API %u\r\n", OCARINA_VERSION, MKWVK_API_VERSION,
              host ? host->version : 0u);
     if (!lf.first.empty()) s += "Jogo (1ª linha do log): " + lf.first + "\r\n";
-    std::string body = "\nPLACAS DE VÍDEO (Vulkan)\n" + gpus_text(!automatic);
-    body += "\nPROCESSADOR\n  " + cpu_text() + "\n";
-    MEMORYSTATUSEX ms{sizeof ms};
-    if (GlobalMemoryStatusEx(&ms))
-        body += fmt("\nMEMÓRIA RAM\n  %.1f GB no total, %.1f GB livres agora (%lu%% em uso)\n", ms.ullTotalPhys / 1073741824.0,
-                    ms.ullAvailPhys / 1073741824.0, (unsigned long)ms.dwMemoryLoad);
-    body += "\nWINDOWS\n  " + windows_text() + "\n";
-    body += "\nJANELA\n" + window_text();
-    body += "\nVARIÁVEIS DE AMBIENTE EM USO (RX_, HOS_, OCARINA_, HOOKSHOT_...)\n" + env_text(scrub);
-    body += automatic ? "\nÚLTIMAS LINHAS DO LOG DA SESSÃO QUE FECHOU COM ERRO (hookshot_log.1.txt)\n" : "\nÚLTIMAS LINHAS DO LOG (hookshot_log.txt)\n";
-    const std::pair<const char*, const std::string*> wanted[] = {{"VRAM", &lf.vram}, {"VRAM (governador)", &lf.governor},
-                                                                   {"detalhe de textura", &lf.detail}, {"replay", &lf.replay},
-                                                                   {"GPU time", &lf.gpu}, {"status", &lf.status},
-                                                                   {"piscadas da cena", &lf.flicker}};
-    for (const auto& [label, line] : wanted)
-        body +=fmt("  %s: %s\n", label, line->empty() ? "(não apareceu)" : line->c_str());
-    body += "\nERROS NO LOG (CRASH, FATAL, device lost)\n";
-    if (lf.errors.empty()) body += "  (nenhum)\n";
-    for (const std::string& e : lf.errors) body += "  " + e + "\n";
-    if (automatic) {
-        body += "\nCOMO O LOG TERMINOU (últimas linhas)\n";
-        for (const std::string& e : lf.tail) body += "  " + e + "\n";
-    }
-    body += "\nTRAVADAS DESTA SESSÃO\n" + stalls_text();
-    body += flicker_on() ? "\nPISCADAS DA CENA NESTA SESSÃO (detector de brilho; a série está em brilho.csv)\n" + flicker_text()
-                         : "\nPISCADAS DA CENA: detector desligado (RX_VK_FLICKER=0)\n";
-    {
-        std::lock_guard lk(ring_mu);
-        if (automatic && !ring_n) body +="  (relatório feito no início: o tempo dos quadros da sessão anterior não fica guardado, só as travadas dela)\n";
-    }
-    for (char ch : body) {   // (line ends as Notepad wants them)
-        if (ch == '\n') s += '\r';
-        s += ch;
-    }
+    s += crlf(system_body(lf, automatic, scrub));
     z.add("sistema.txt", scrub(s));
     if (!z.close()) {
         DeleteFileW(tmp.c_str());
@@ -1063,7 +1164,7 @@ bool menu_allows_upload() { return opts.report_upload != 0; }
 /// The one place a saved report goes on from: to the receiver, in the background, when sending is on (ocarina_upload.h).
 /// Called on the report's own thread, after it is written whole
 void deliver(const Made& m, bool automatic) {
-    if (upload_on()) ocarina_upload::queue(widen(m.name), automatic);
+    if (upload_on()) ocarina_upload::queue(widen(m.name), automatic ? ocarina_upload::Kind::kAuto : ocarina_upload::Kind::kManual);
 }
 
 /// No automatic reports: the menu's Relatórios automáticos row off, or OCARINA_AUTO_REPORT=0 / RX_VK_AUTO_REPORT=0
@@ -1097,12 +1198,364 @@ std::string last_session_problem() {
     if (!f.clean_end) return "o jogo fechou sem terminar normalmente (fechado à força, travou ou caiu)";
     return "";
 }
+
+// ---- the light performance reports ----
+/// Light reports are made and sent: sending on (the menu's row, OCARINA_REPORT_UPLOAD), the automatic reports on (the menu's
+/// row, OCARINA_AUTO_REPORT), not OCARINA_PERF_REPORT=0, and the notice that says so was shown
+bool perf_sending() { return !perf_off() && !auto_off() && upload_on() && perf_consent.load(); }
+
+/// The window's limits passed: w.why (motivo.txt's lines) and w.why_short (X-Ocarina-Motivo); true when any
+bool judge(PerfWin& w) {
+    std::string why, s;
+    const auto add = [&](const std::string& line, const std::string& short_) {
+        why += "- " + line + "\n";
+        s += (s.empty() ? "" : "; ") + short_;
+    };
+    if (w.slow_frames > kSlowFramesMax)
+        add(fmt("%d quadros acima de %.0f ms (limite: mais de %d numa janela); o maior, %.0f ms", w.slow_frames, kSlowFrameMs,
+                kSlowFramesMax, w.longest_ms),
+            fmt("quadros>%.0fms=%d (maior %.0fms)", kSlowFrameMs, w.slow_frames, w.longest_ms));
+    const bool fps_judged = w.frames && (!w.last || w.play_ms * 1e6 >= (double)perf_end_min_ns());
+    if (fps_judged && w.fps() < kFpsMin)
+        add(fmt("FPS médio %.1f (limite: abaixo de %.0f; o jogo vai até 60 ou mais)", w.fps(), kFpsMin), fmt("fps=%.1f", w.fps()));
+    if (w.longest_submit_ms > kSlowSubmitMs)
+        add(fmt("%d \"slow submit\" acima de %.0f ms no log, o maior de %.0f ms", w.slow_submits, kSlowSubmitMs, w.longest_submit_ms),
+            fmt("slow_submit=%.0fms", w.longest_submit_ms));
+    if (w.flickers > kFlickerMax)
+        add(fmt("%d piscadas da cena (limite: mais de %d numa janela)", w.flickers, kFlickerMax), fmt("piscadas=%d", w.flickers));
+    if (w.ram_level >= kRamGuardLevel)
+        add(fmt("RAM guard no nível %d (a memória do PC quase no fim; limite: nível %d)", w.ram_level, kRamGuardLevel),
+            fmt("ram_guard=%d", w.ram_level));
+    if (w.vram_used_mb >= 0 && w.vram_used_mb - w.vram_allowed_mb > kVramOverMb)
+        add(fmt("VRAM: %lld MB em uso de %lld MB que o driver permite", (long long)w.vram_used_mb, (long long)w.vram_allowed_mb),
+            fmt("vram=%lld/%lldMB", (long long)w.vram_used_mb, (long long)w.vram_allowed_mb));
+    if (perf_test()) add("teste: OCARINA_PERF_TEST=1 (toda janela conta como problema)", "teste");
+    w.why = why, w.why_short = s;
+    return !why.empty();
+}
+
+std::string window_line(const PerfWin& w) {
+    return fmt("janela %d (%.0f s de jogo%s): %.1f fps, %d quadros > %.0f ms (o maior %.0f ms), slow submit maior %.0f ms, %d piscadas, "
+               "RAM guard %d, VRAM %lld de %lld MB",
+               w.index, w.play_ms / 1000, w.last ? ", a última, incompleta" : "", w.fps(), w.slow_frames, kSlowFrameMs, w.longest_ms,
+               w.longest_submit_ms, w.flickers, w.ram_level, (long long)w.vram_used_mb, (long long)w.vram_allowed_mb);
+}
+
+/// The frames from seq `from` to `to` (inclusive, those still in the ring; the newest kPerfMaxFrames), compactly: no hour,
+/// one decimal, a 0 left empty
+std::string light_frames_csv(uint64_t from, uint64_t to, const char* what) {
+    std::vector<Frame> fr;
+    uint64_t first = 0;
+    {
+        std::lock_guard lk(ring_mu);
+        if (!ring_n) return "";
+        const uint64_t oldest = ring_n > kRing ? ring_n - kRing : 0;
+        to = std::min<uint64_t>(to, ring_n - 1);
+        from = std::max<uint64_t>({from, oldest, to + 1 > kPerfMaxFrames ? to + 1 - kPerfMaxFrames : 0});
+        if (from > to) return "";
+        first = from;
+        fr.reserve((size_t)(to - from + 1));
+        for (uint64_t s = from; s <= to; s++) fr.push_back(ring[s % kRing]);
+    }
+    std::string t = fmt("# Tempo de cada quadro do jogo (de um present ao seguinte), %s: do quadro %llu (%s) ao %llu (%s). Uma casa "
+                        "decimal; vazio = 0. gpu_ms: tempo da GPU lido nesse quadro; gpu_atrasada_ms: espera da GPU; replay_*: fases da "
+                        "CPU (amostradas, como no log)\n",
+                        what, (unsigned long long)first, hour_of(fr.front().at_ns).c_str(), (unsigned long long)(first + fr.size() - 1),
+                        hour_of(fr.back().at_ns).c_str());
+    t += "quadro,ms,gpu_ms,gpu_atrasada_ms";
+    for (const char* n : kPhaseNames) t += ",replay_", t += n, t += "_ms";
+    t += ",marca\n";
+    t.reserve(t.size() + fr.size() * 48);
+    const auto one = [&](float v) {
+        if (v < 0.05f && v > -0.05f) return;
+        char b[32];
+        snprintf(b, sizeof b, "%.1f", v);
+        t += b;
+    };
+    for (size_t i = 0; i < fr.size(); i++) {
+        const Frame& f = fr[i];
+        t += fmt("%llu,", (unsigned long long)(first + i));
+        one(f.ms), t += ',', one(f.gpu_ms), t += ',', one(f.behind_ms);
+        for (float p : f.phase_ms) t += ',', one(p);
+        t += ',', t += kind_text(f.flags), t += '\n';
+    }
+    return t;
+}
+
+std::string windows_csv(const std::vector<PerfWin>& all) {
+    std::string t = "janela,inicio,fim,jogo_s,quadros,fps_medio,quadros_acima_100ms,maior_quadro_ms,maior_slow_submit_ms,slow_submits_acima_250ms,"
+                    "piscadas,ram_guard_nivel,vram_usada_mb,vram_permitida_mb,limites_passados,relatorio\n";
+    for (const PerfWin& w : all)
+        t += fmt("%d,%s,%s,%.0f,%llu,%.1f,%d,%.0f,%.0f,%d,%d,%d,%lld,%lld,\"%s\",%s\n", w.index, hour_of(w.start_ns).c_str(),
+                 hour_of(w.end_ns).c_str(), w.play_ms / 1000, (unsigned long long)w.frames, w.fps(), w.slow_frames, w.longest_ms,
+                 w.longest_submit_ms, w.slow_submits, w.flickers, w.ram_level, (long long)w.vram_used_mb, (long long)w.vram_allowed_mb,
+                 w.why_short.c_str(), w.report.c_str());
+    return t;
+}
+
+/// The log's newest kPerfLogLines lines, as they are now (its queue flushed first)
+std::string log_tail_text() {
+    if (host && host->log_flush) host->log_flush();
+    std::string tail;
+    if (!read_file(in_dir(L"hookshot_log.txt"), &tail, 0, 2u << 20)) return "";
+    size_t at = tail.size(), lines = 0;
+    while (at > 0 && lines <= kPerfLogLines) {
+        const size_t nl = tail.rfind('\n', at - 1);
+        if (nl == std::string::npos) {
+            at = 0;
+            break;
+        }
+        if (nl + 1 < tail.size()) lines++;
+        if (lines > kPerfLogLines) {
+            at = nl + 1;
+            break;
+        }
+        at = nl;
+    }
+    return fmt("[... só as últimas %zu linhas do log, no relatório de desempenho ...]\n", kPerfLogLines) + tail.substr(at);
+}
+
+/// The light report: the log's last lines, the frames of the window, every window of the session, sistema.txt, the settings
+/// and motivo.txt, deflated (no picture, nothing of the older logs). at_end: the session's summary; baseline: the version's
+/// reference report
+Made make_perf_report(const PerfWin& w, const std::vector<PerfWin>& session, bool at_end, bool baseline, int nth) {
+    Made m;
+    if (game_dir().empty()) {
+        m.error = "a pasta do jogo não foi encontrada";
+        return m;
+    }
+    const Scrub scrub;
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    const std::wstring base = widen(fmt("ocarina-relatorio-desempenho-%04d%02d%02d-%02d%02d%02d", t.wYear, t.wMonth, t.wDay, t.wHour,
+                                        t.wMinute, t.wSecond));
+    std::wstring name = base + L".zip";
+    for (int k = 2; exists(in_dir(name.c_str())) && k < 100; k++) name = base + widen(fmt("-%d", k)) + L".zip";
+    const std::wstring path = in_dir(name.c_str()), tmp = path + L".tmp";
+    Zip z;
+    if (!z.open(tmp)) {
+        m.error = fmt("a pasta do jogo não aceitou o arquivo (erro %lu)", (unsigned long)GetLastError());
+        return m;
+    }
+    // 1. motivo.txt
+    std::string mo = fmt("RELATÓRIO DE DESEMPENHO DO OCARINA ENGINE %s\n", OCARINA_VERSION);
+    mo += fmt("Feito em %04d-%02d-%02d %02d:%02d:%02d, sozinho, %s (o %dº de desempenho desta sessão; no máximo %d, com %lld s no mínimo "
+              "entre eles, fora o resumo do fim)\n",
+              t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond,
+              at_end ? "no fim da sessão (o jogo fechado normalmente)"
+                     : fmt("depois de %lld s de jogo com problema", (long long)(perf_window_ns() / 1'000'000'000)).c_str(),
+              nth, kMaxPerfPerSession, (long long)(perf_gap_ns() / 1'000'000'000));
+    if (perf_test()) mo += "MODO DE TESTE (OCARINA_PERF_TEST=1): janelas de 60 s, 60 s entre relatórios, toda janela conta como problema\n";
+    if (baseline)
+        mo += fmt("Referência da versão: o primeiro relatório de desempenho da %s nesta instalação, mesmo sem problema, para saber como "
+                  "ela roda nesta placa.\n", OCARINA_VERSION);
+    bool session_problem = false;
+    for (const PerfWin& h : session) session_problem |= !h.why.empty();
+    mo += "\nO QUE DISPAROU\n";
+    if (!w.why.empty()) mo += w.why;
+    else if (at_end && session_problem) mo += "- nada na última janela; a sessão teve janelas com problema (janelas.csv)\n";
+    else mo += "- nenhum limite (só a referência da versão)\n";
+    mo += fmt("\n%s (%d), de %s a %s\n", w.last ? "A ÚLTIMA JANELA, INCOMPLETA" : "A JANELA", w.index, hour_of(w.start_ns).c_str(),
+              hour_of(w.end_ns).c_str());
+    mo += fmt("  Tempo de jogo: %.0f s (sem o menu Insert aberto e sem a janela minimizada; um quadro conta no máximo %.0f s)\n",
+              w.play_ms / 1000, kCountMaxMs / 1000);
+    mo += fmt("  Quadros: %llu, FPS médio %.1f\n", (unsigned long long)w.frames, w.fps());
+    mo += fmt("  Quadros acima de %.0f ms: %d; o maior: %.0f ms\n", kSlowFrameMs, w.slow_frames, w.longest_ms);
+    mo += fmt("  slow submit no log: o maior %.0f ms; acima de %.0f ms: %d\n", w.longest_submit_ms, kSlowSubmitMs, w.slow_submits);
+    mo += flicker_on() ? fmt("  Piscadas da cena: %d\n", w.flickers) : "  Piscadas da cena: detector desligado (RX_VK_FLICKER=0)\n";
+    mo += w.ram_level >= 0 ? fmt("  RAM guard: nível %d (o maior da janela)\n", w.ram_level) : "  RAM guard: nenhuma linha na janela\n";
+    mo += w.vram_used_mb >= 0 ? fmt("  VRAM: %lld MB em uso de %lld MB permitidos (a linha mais apertada)\n", (long long)w.vram_used_mb,
+                                    (long long)w.vram_allowed_mb)
+                              : "  VRAM: nenhuma linha na janela\n";
+    int bad = 0;
+    double play = 0;
+    for (const PerfWin& h : session) bad += !h.why.empty(), play += h.play_ms;
+    mo += fmt("\nA SESSÃO\n  %zu janelas, %.1f min de jogo, %d com problema (cada uma em janelas.csv)\n", session.size(), play / 60000, bad);
+    mo += fmt("\nLIMITES (constantes em gpu/vk/ocarina_report.cpp)\n  janela: %lld s de jogo; mais de %d quadros acima de %.0f ms; FPS médio "
+              "abaixo de %.0f; slow submit acima de %.0f ms; mais de %d piscadas; RAM guard nível %d; VRAM em uso acima da permitida\n",
+              (long long)(perf_window_ns() / 1'000'000'000), kSlowFramesMax, kSlowFrameMs, kFpsMin, kSlowSubmitMs, kFlickerMax,
+              kRamGuardLevel);
+    mo += fmt("\nARQUIVOS\n  hookshot_log.txt: as últimas %zu linhas do log\n  quadros.csv: cada quadro %s\n  janelas.csv: cada janela de "
+              "5 min da sessão\n  sistema.txt, hookshot_options.ini, hookshot_env.txt: o PC e as opções\n",
+              kPerfLogLines, at_end ? "dos últimos 5 minutos" : "da janela");
+    z.add("motivo.txt", scrub(crlf(mo)), true);
+    // 2. the log's last lines, the frames, the windows
+    const std::string log = scrub(log_tail_text());
+    if (!log.empty()) z.add("hookshot_log.txt", log, true);
+    uint64_t from = w.first_seq, to = w.last_seq;
+    if (at_end) {   // (the last 5 minutes, whatever window they were in)
+        std::lock_guard lk(ring_mu);
+        to = ring_n ? ring_n - 1 : 0, from = to;
+        const int64_t newest = ring_n ? ring[(ring_n - 1) % kRing].at_ns : 0;
+        while (from > 0 && ring_n - from < kRing && newest - ring[(from - 1) % kRing].at_ns <= perf_window_ns()) from--;
+    }
+    const std::string frames = light_frames_csv(from, to, at_end ? "os últimos 5 minutos" : "a janela");
+    if (!frames.empty()) z.add("quadros.csv", frames, true);
+    z.add("janelas.csv", windows_csv(session), true);
+    // 3. the settings, sistema.txt
+    for (const wchar_t* file : {L"hookshot_options.ini", L"hookshot_env.txt"}) {
+        std::string body;
+        if (read_file(in_dir(file), &body)) z.add(utf8(file), scrub(body), true);
+    }
+    std::string s = "RELATÓRIO DO OCARINA ENGINE\r\n";
+    s += fmt("Gerado em %04d-%02d-%02d %02d:%02d:%02d, sozinho: relatório de desempenho (travadas/FPS), o motivo em motivo.txt\r\n",
+             t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    s += "Este arquivo é enviado ao Ocarina Engine (Enviar relatórios automaticamente, no menu). Nome de usuário, pasta pessoal, nome do "
+         "computador, endereços IP e e-mails foram retirados.\r\n\r\n";
+    s += "Sem foto: o relatório de desempenho é leve\r\n";
+    s += fmt("Ocarina Engine %s (hookshot_vk.dll), API do renderizador %d, o jogo pede a API %u\r\n", OCARINA_VERSION, MKWVK_API_VERSION,
+             host ? host->version : 0u);
+    const LogFacts lf = log_facts(log);
+    if (!lf.first.empty()) s += "1ª linha do trecho do log: " + lf.first + "\r\n";
+    std::string body = system_body(lf, false, scrub);
+    for (size_t k; (k = body.find("; a série está em brilho.csv")) != std::string::npos;) body.erase(k, strlen("; a série está em brilho.csv"));
+    s += crlf(body);
+    z.add("sistema.txt", scrub(s), true);
+    if (!z.close()) {
+        DeleteFileW(tmp.c_str());
+        m.error = "o arquivo não pôde ser gravado inteiro (disco cheio?)";
+        return m;
+    }
+    if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileW(tmp.c_str());
+        m.error = fmt("o arquivo não pôde ser renomeado (erro %lu)", (unsigned long)GetLastError());
+        return m;
+    }
+    m.ok = true, m.path = path, m.name = utf8(name);
+    return m;
+}
+
+/// The light reports beyond the newest kPerfKeep removed
+void prune_perf() {
+    std::vector<std::wstring> names;
+    WIN32_FIND_DATAW fd;
+    const HANDLE h = FindFirstFileW(in_dir(L"ocarina-relatorio-desempenho-*.zip").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do names.push_back(fd.cFileName);
+    while (FindNextFileW(h, &fd));
+    FindClose(h);
+    std::sort(names.begin(), names.end());
+    for (size_t i = 0; i + kPerfKeep < names.size(); i++) DeleteFileW(in_dir(names[i].c_str()).c_str());
+}
+
+/// Judges a window, keeps it in the session's list, and makes and sends its light report when the limits allow one
+std::string perf_judge(PerfWin w) {
+    {   // (its flickers)
+        std::lock_guard lk(lum_mu);
+        for (const FlickerEvent& e : flickers) w.flickers += e.at_ns >= w.start_ns && e.at_ns <= w.end_ns;
+    }
+    const bool problem = judge(w);
+    // (asked before perf_mu: the sending's lock is held while it writes to the log, and the log comes to log_line)
+    const bool sending = perf_sending();
+    const bool ref_done = !sending || ocarina_upload::reference_done(OCARINA_VERSION);
+    bool want = problem, baseline = false, made = false, full = false, soon = false;
+    int nth = 0;
+    std::vector<PerfWin> session;
+    const int64_t now = steady_ns();
+    {
+        std::lock_guard lk(perf_mu);
+        if (w.last) {
+            double play = w.play_ms;
+            bool any = problem;
+            for (const PerfWin& h : perf_done) play += h.play_ms, any |= !h.why.empty();
+            baseline = !ref_done && play * 1e6 >= (double)perf_baseline_ns();
+            want = any || baseline;
+        }
+        // (the summary at the end may follow the last window's report sooner, when what came after it is worth one: at least
+        // kEndMinPlayNs of play; a 30-minute session sends its 6 windows and the summary)
+        full = perf_made >= kMaxPerfPerSession;
+        soon = perf_last_ns && now - perf_last_ns < perf_gap_ns() && !(w.last && w.play_ms * 1e6 >= (double)perf_end_min_ns());
+        made = want && sending && !full && !soon;
+        if (made) perf_made++, perf_last_ns = now, nth = perf_made;
+        if (w.frames || !w.last) perf_done.push_back(w);
+        session = perf_done;
+    }
+    const char* fate = !want     ? "sem relatório"
+                       : !sending ? "sem relatório (envio desligado, ou o aviso dos relatórios de desempenho ainda não apareceu)"
+                       : full     ? "sem relatório (já foram os desta sessão)"
+                       : soon     ? "sem relatório (o último foi há pouco)"
+                                  : "relatório de desempenho";
+    logf("ocarina: desempenho, %s%s%s: %s", window_line(w).c_str(), w.why_short.empty() ? "" : "; passou: ", w.why_short.c_str(), fate);
+    if (!made) return "";
+    const Made m = make_perf_report(w, session, w.last, baseline, nth);
+    if (!m.ok) {
+        logf("ocarina: o relatório de desempenho não pôde ser salvo: %s", m.error.c_str());
+        return "";
+    }
+    {
+        std::lock_guard lk(perf_mu);
+        for (PerfWin& h : perf_done)
+            if (h.index == w.index) h.report = m.name;
+    }
+    WIN32_FILE_ATTRIBUTE_DATA fa{};
+    GetFileAttributesExW(m.path.c_str(), GetFileExInfoStandard, &fa);
+    logf("ocarina: relatório de desempenho salvo: %s (%lu KB)", m.name.c_str(), (unsigned long)(fa.nFileSizeLow >> 10));
+    std::string reason = w.why_short.empty() ? std::string(baseline ? "referencia da versao" : "fim da sessao") : w.why_short;
+    if (w.last) reason = "fim da sessao: " + reason;
+    if (baseline && !w.why_short.empty()) reason += "; referencia da versao";
+    ocarina_upload::queue(widen(m.name), ocarina_upload::Kind::kPerf, reason);
+    ocarina_upload::reference_mark(OCARINA_VERSION);
+    prune_perf();
+    return m.name;
+}
+
+// ---- the session's end: the game's window closed (the X, Alt+F4, the menu's Quit or Restart) ----
+WNDPROC game_proc = nullptr;
+std::atomic<bool> session_over{false};
+void session_end() {
+    if (perf_off()) return;
+    PerfWin last;
+    {
+        std::lock_guard lk(ring_mu);
+        last = std::move(perf_cur), perf_cur = PerfWin{};
+    }
+    const int64_t t0 = steady_ns();
+    const std::string name = perf_closed(std::move(last), true);
+    if (name.empty()) return;
+    const bool sent = ocarina_upload::wait_sent(name, 2500);   // (the window waits a moment; what does not go now goes next start)
+    logf("ocarina: o jogo fecha; o resumo de desempenho %s (%.1f s)", sent ? "foi enviado" : "fica para o próximo início",
+         (steady_ns() - t0) / 1e9);
+    if (host && host->log_flush) host->log_flush();
+}
+LRESULT CALLBACK close_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    if ((msg == WM_CLOSE || msg == WM_APP + 9) && !session_over.exchange(true)) session_end();   // (WM_APP + 9: host/display.c's Restart)
+    return CallWindowProcA(game_proc, h, msg, wp, lp);
+}
+/// The game's window's procedure wrapped (host/display.c: an ANSI window; its WM_CLOSE ends the process at once)
+void watch_close() {
+    const HWND w = app_window();
+    if (!w || game_proc) return;
+    game_proc = (WNDPROC)GetWindowLongPtrA(w, GWLP_WNDPROC);
+    if (!game_proc || !SetWindowLongPtrA(w, GWLP_WNDPROC, (LONG_PTR)close_proc)) game_proc = nullptr;
+}
 #endif   // _WIN32
+
+#ifdef _WIN32
+std::string perf_closed(PerfWin w, bool last) {
+    {   // (the log's part of the window)
+        std::lock_guard lk(perf_mu);
+        w.longest_submit_ms = perf_log.longest_submit_ms, w.slow_submits = perf_log.slow_submits, w.ram_level = perf_log.ram_level;
+        w.vram_used_mb = perf_log.vram_used_mb, w.vram_allowed_mb = perf_log.vram_allowed_mb;
+        perf_log = PerfWin{};
+        w.index = ++perf_windows;
+    }
+    w.last = last;
+    if (last) return perf_judge(std::move(w));
+    std::thread([w = std::move(w)]() mutable {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        perf_judge(std::move(w));
+    }).detach();
+    return "";
+}
+#else
+std::string perf_closed(PerfWin, bool) { return ""; }
+#endif
 
 } // namespace
 
 void frame(Frame f) {
-    bool save = false;
+    bool save = false, window_closed = false;
+    PerfWin closed;
     {
         std::lock_guard lk(ring_mu);
 #ifdef _WIN32
@@ -1129,6 +1582,23 @@ void frame(Frame f) {
         }
         ring[seq % kRing] = f;
         ring_n++;
+        // (the performance window: frames of play only, the start-up's first frames, a minimized window and the open menu not)
+        if (seq >= kWarmup && !perf_off()) {
+#ifdef _WIN32
+            const HWND w = app_window();
+            const bool away = (w && IsIconic(w)) || menu_is_open();
+#else
+            const bool away = menu_is_open();
+#endif
+            if (!away) {
+                PerfWin& c = perf_cur;
+                if (!c.frames) c.start_ns = f.at_ns - (int64_t)(std::min(f.ms, kCountMaxMs) * 1e6), c.first_seq = seq;
+                c.frames++, c.play_ms += std::min(f.ms, kCountMaxMs), c.end_ns = f.at_ns, c.last_seq = seq;
+                if (f.ms > kSlowFrameMs) c.slow_frames++;
+                c.longest_ms = std::max(c.longest_ms, f.ms);
+                if (c.play_ms * 1e6 >= (double)perf_window_ns()) closed = std::move(c), c = PerfWin{}, window_closed = true;
+            }
+        }
         if (f.flags & (kStallBig | kStallMany)) {
             const Stall s{seq, f.at_ns, f.ms, f.flags};
             stalls.push_back(s);
@@ -1151,6 +1621,27 @@ void frame(Frame f) {
 #else
     (void)save;
 #endif
+    if (window_closed) perf_closed(std::move(closed), false);   // (judged and reported on a thread of its own)
+}
+
+void log_line(const char* line) {
+    if (line[0] != 'v' || line[1] != 'k' || line[2] != ':' || line[3] != ' ') return;
+    const char* l = line + 4;
+    float ms = 0;
+    int level = 0;
+    unsigned long long used = 0, allowed = 0;
+    if (!strncmp(l, "slow submit: ", 13) && sscanf(l + 13, "%f", &ms) == 1) {
+        std::lock_guard lk(perf_mu);
+        perf_log.longest_submit_ms = std::max(perf_log.longest_submit_ms, ms);
+        if (ms > kSlowSubmitMs) perf_log.slow_submits++;
+    } else if (!strncmp(l, "RAM guard: level ", 17) && sscanf(l + 17, "%d", &level) == 1) {
+        std::lock_guard lk(perf_mu);
+        perf_log.ram_level = std::max(perf_log.ram_level, level);
+    } else if (!strncmp(l, "VRAM: ", 6) && sscanf(l + 6, "%llu MB used of %llu MB allowed", &used, &allowed) == 2) {
+        std::lock_guard lk(perf_mu);
+        const int64_t over = (int64_t)used - (int64_t)allowed, worst = perf_log.vram_used_mb - perf_log.vram_allowed_mb;
+        if (perf_log.vram_used_mb < 0 || over > worst) perf_log.vram_used_mb = (int64_t)used, perf_log.vram_allowed_mb = (int64_t)allowed;
+    }
 }
 
 bool flicker_on() {
@@ -1230,6 +1721,9 @@ void begin() {
     // (the sending: what an earlier start left pending goes once the notice about sending was shown, now or at an earlier start)
     ocarina_upload::start(game_dir(), menu_allows_upload);
     if (menu_report_notice_seen(2)) ocarina_upload::allow();
+    if (menu_report_notice_seen(3)) perf_consent.store(true);   // (the notice that names the performance reports: level 3)
+    if (!perf_off()) watch_close();   // (the session's summary when the window closes)
+    if (perf_test()) logf("ocarina: OCARINA_PERF_TEST=1: janelas de desempenho de 60 s, toda janela conta como problema");
     if (auto_off()) return;
     busy.store(true);
     std::thread([] {
@@ -1322,22 +1816,25 @@ bool toast(std::string* text, std::string* sub) {
             return true;
         }
     }
-    // (the first start with the reports sent: once, ~12 s, one line, saved as shown in hookshot_options.ini by the menu; nothing
-    // is sent before it. With the automatic reports only saved, not sent: the notice of that, once, as before)
+    // (the first start with the reports sent: once, ~12 s, saved as shown in hookshot_options.ini by the menu; nothing is sent
+    // before it. Level 3 names the performance reports too: shown again to whoever saw only level 2's, and no light report goes
+    // before it. With the automatic reports only saved, not sent: the notice of that, once, as before)
     static int64_t notice_from = 0;
-    static const int level = upload_on() ? 2 : auto_off() ? 0 : 1;
+    static const int level = upload_on() ? 3 : auto_off() ? 0 : 1;
     static const bool notice = level && !menu_report_notice_seen(level);
     if (!notice || (notice_from && now - notice_from > 12'000'000'000)) return false;
     if (!notice_from) {
         notice_from = now, menu_report_notice_done(level);
-        if (level == 2) ocarina_upload::allow();
+        if (level == 3) ocarina_upload::allow(), perf_consent.store(true);
     }
-    if (level == 2) {
-        *text = game_pt() ? "Os relatórios de erro vão para o Ocarina Engine, sem dados pessoais. Para desligar: Insert/F1 > Gameplay > "
-                            "Enviar relatórios automaticamente."
-                          : "Error reports are sent to Ocarina Engine, with no personal data. To turn this off: Insert/F1 > Gameplay > "
-                            "Enviar relatórios automaticamente.";
-        sub->clear();
+    if (level == 3) {
+        if (game_pt()) {
+            *text = "Os relatórios de erro e de desempenho (travadas e FPS) vão para o Ocarina Engine, leves e sem dados pessoais.";
+            *sub = "Para desligar: Insert/F1 > Gameplay > Enviar relatórios automaticamente.";
+        } else {
+            *text = "Error and performance reports (stutters and FPS) are sent to Ocarina Engine: small, with no personal data.";
+            *sub = "To turn this off: Insert/F1 > Gameplay > Enviar relatórios automaticamente.";
+        }
         return true;
     }
     if (game_pt()) {

@@ -18,6 +18,7 @@
 #include <deque>
 #include <exception>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -760,6 +761,15 @@ std::atomic<int64_t> pcache_built_since_save{0};
 // size: data the cache took in since. The pipeline creation feedback cannot tell the new ones apart: NVIDIA's driver reports
 // most precompiled pipelines as not found in the app's cache (~460 of ~12,900 here), which it then serves from its own.
 std::atomic<size_t> pcache_saved_size{0};
+// (Ocarina Engine v0.5, RX_VK_PCACHE_RELEASE) as play begins pcache, the file as the start read it (~1.3 GB here; the process's private
+// bytes 1.5 GB lower in the Burgo without it, v5rel), is let go for an empty one: play's pipelines come from the play generations and the
+// driver's own cache ("from the start's cache" was 0 in every play file), the start had built the noted ones from it already. Its
+// handle is taken under pcache_mu shared by whoever hands it to the driver in play; the swap takes it exclusive. From then on the
+// file is never written (an empty cache saved over it would cost the next start everything)
+std::shared_mutex pcache_mu;
+std::atomic<bool> pcache_released{false};
+std::atomic<bool> bg_prepare_active{false};   // (prepare_background's translation in play: pcache is kept until it ends)
+
 /// A pipeline cache file's data, or nothing when it cannot be read or was made by another device or driver
 std::vector<uint8_t> pcache_file_read(const std::string& path) {
     std::vector<uint8_t> data;
@@ -918,7 +928,10 @@ void play_cache_save() {
 template <class CI>
 VkResult create_cached(VkResult (*create)(VkPipelineCache, const CI*, VkPipeline*), const CI* ci, VkPipeline* pl) {
     PlayCache* g = play_cache.load();
-    if (!g) return create(pcache, ci, pl);
+    if (!g) {
+        std::shared_lock lk(pcache_mu);
+        return create(pcache, ci, pl);
+    }
     const bool ask_only = (ci->flags & VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT) != 0;
     // (counted in before it is used: a save takes the generation away only once its count is back to 0)
     for (;;) {
@@ -934,7 +947,10 @@ VkResult create_cached(VkResult (*create)(VkPipelineCache, const CI*, VkPipeline
         g->built.fetch_add(1), g->from_driver.fetch_add(1);
     } else if (r == VK_PIPELINE_COMPILE_REQUIRED) {
         *pl = VK_NULL_HANDLE;
-        r = create(pcache, &ask, pl);
+        {
+            std::shared_lock lk(pcache_mu);
+            r = create(pcache, &ask, pl);
+        }
         if (r == VK_SUCCESS) {
             g->from_start.fetch_add(1);
         } else if (r == VK_PIPELINE_COMPILE_REQUIRED && !ask_only) {
@@ -2153,14 +2169,17 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
     // (measured: 21 of 21). gpl_libs_cached: RX_VK_GPL_NO_CACHE=1 keeps them out, as before. With our cache: through
     // graphics_with, so in play one compiled goes into the play generation, and an ask under the flag still goes to pcache)
     const bool lib_cached = (part == 1 || part == 2) && gpl_libs_cached();
-    const VkPipelineCache cache = lib_cached || (part < 0 && !driver_cache_only) ? pcache : VK_NULL_HANDLE;
-    VkResult r = graphics_with(cache, &ci, &pl);
+    // (ours: pcache through the play caches, create_cached, which takes pcache's handle itself under pcache_mu: read here it could be
+    // let go before the driver had it, RX_VK_PCACHE_RELEASE. Before pcache exists, none: as graphics_with did)
+    const bool ours = (lib_cached || (part < 0 && !driver_cache_only)) && pcache;
+    const auto graphics_ours = [&](VkPipeline* out) { return ours ? cached_graphics(&ci, out) : guarded_graphics(VK_NULL_HANDLE, &ci, out); };
+    VkResult r = graphics_ours(&pl);
     // The AMD Windows compiler can reject ordinary graphics pipelines with its optimizer on.
     if (dev.props.vendorID == 0x1002 && dev.task_mesh_fallback && !p.mesh && part < 0 && r == VK_ERROR_UNKNOWN &&
         !(ci.flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT)) {
         ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
         pl = VK_NULL_HANDLE;
-        r = graphics_with(cache, &ci, &pl);
+        r = graphics_ours(&pl);
         if (r == VK_SUCCESS)
             logf("vk: graphics pipeline for %016llx recovered with optimization disabled", (unsigned long long)p.key);
     }
@@ -7923,11 +7942,13 @@ void state_list_run() {
     if (!getenv("RX_VK_SEED_CHECK")) seed_close();
 }
 void prepare_background() {
+    bg_prepare_active = true;
     std::thread([] {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);
         Sleep(20000);   // (past the title screen's own loading)
         logf("vk: an update: the shaders not met yet are translated in play, behind the game");
         prepare_run(nullptr, true);
+        bg_prepare_active = false;
     }).detach();
 }
 
@@ -8721,8 +8742,45 @@ int64_t draw_slotgen_saves() {   // (RX_VK_DESC_SLOTGEN: of those, what the glob
     return st_desc_slotgen_saves;
 }
 
+/// pcache let go for an empty one (pcache_mu held exclusive only for the swap). vkDestroyPipelineCache took 0.8-3.1 s in NVIDIA's
+/// driver and held up the replay meanwhile: an image took 49-199 ms to make right after it, when it ran 60 s into play
+void pcache_release_now() {
+    VkPipelineCache empty = VK_NULL_HANDLE, old = VK_NULL_HANDLE;
+    VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+    if (vkCreatePipelineCache(dev.device, &ci, nullptr, &empty) != VK_SUCCESS) return;
+    const auto t0 = std::chrono::steady_clock::now();
+    {
+        std::unique_lock lk(pcache_mu);
+        pcache_released = true;   // (first: a save that starts now leaves the file alone)
+        old = pcache;
+        pcache = empty;
+    }
+    vkDestroyPipelineCache(dev.device, old, nullptr);
+    logf("vk: pipeline cache: the start's cache let go before play (%.1f ms; the file stays as it is, play's pipelines go on into "
+         "play files; RX_VK_PCACHE_RELEASE=0: kept)",
+         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    mem_map_log_async();   // (what it gave back)
+}
+/// (Ocarina Engine v0.5, RX_VK_PCACHE_RELEASE, on by default: =0 keeps it) pcache let go as play begins, on the start-up's thread
+/// before the game's first frame, the time it takes added to the start (no frame waits behind it); with a translation in the
+/// background (prepare_background), on a thread of its own once that ends
+void pcache_release_start() {
+    static const bool on = !getenv("RX_VK_PCACHE_RELEASE") || atoi(getenv("RX_VK_PCACHE_RELEASE")) != 0;
+    static std::atomic<bool> started{false};
+    if (!on || !pcache || !play_cache.load() || started.exchange(true)) return;
+    if (!bg_prepare_active.load()) return pcache_release_now();
+    try {
+        std::thread([] {
+            SetThreadDescription(GetCurrentThread(), L"mkw_vk pipeline cache release");
+            while (bg_prepare_active.load()) Sleep(5000);
+            pcache_release_now();
+        }).detach();
+    } catch (...) {
+    }
+}
 void pipeline_cache_play() {
     play_cache_begin();
+    pcache_release_start();
 }
 void pipeline_cache_close() {
     try {
@@ -8746,11 +8804,14 @@ void pipeline_cache_save(bool force) {
     auto save = [] {
         struct Done { ~Done() { busy = false; } } done;
         try {
+            std::shared_lock lk(pcache_mu);
             size_t n = 0;
+            // (RX_VK_PCACHE_RELEASE: once let go, the file stays as the start read it)
             // (the size last read or written: nothing new, not fetched nor written again; see pcache_saved_size)
-            if (vkGetPipelineCacheData(dev.device, pcache, &n, nullptr) == VK_SUCCESS && n && n != pcache_saved_size) {
+            if (!pcache_released.load() && vkGetPipelineCacheData(dev.device, pcache, &n, nullptr) == VK_SUCCESS && n && n != pcache_saved_size) {
                 std::vector<uint8_t> data(n);
                 if (vkGetPipelineCacheData(dev.device, pcache, &n, data.data()) == VK_SUCCESS) {
+                    lk.unlock();   // (the data in hand: the file is written without holding pcache)
                     const std::string tmp = pcache_path + ".tmp";
                     if (FILE* f = fopen(tmp.c_str(), "wb")) {
                         bool ok = fwrite(data.data(), 1, n, f) == n;

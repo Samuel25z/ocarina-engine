@@ -63,17 +63,26 @@ std::wstring widen(const std::string& s) {
 }
 
 // ---- the book: ocarina-envio.txt ----
-struct Book {
-    std::string id;                                   // (instalacao=: 16 hex digits, random, made at the first send)
-    std::vector<std::pair<std::string, bool>> pending;   // (pendente=auto|manual <name>: oldest first)
-    std::vector<std::string> sent;                    // (enviado=<name>: the newest kMaxSent)
+const char* kind_word(Kind k) { return k == Kind::kAuto ? "auto" : k == Kind::kPerf ? "desempenho" : "manual"; }
+const wchar_t* kind_header(Kind k) { return k == Kind::kAuto ? L"automatico" : k == Kind::kPerf ? L"desempenho" : L"manual"; }
+
+struct Pending {
+    std::string name;
+    Kind kind;
 };
-constexpr size_t kMaxSent = 200;
+struct Book {
+    std::string id;                  // (instalacao=: 16 hex digits, random, made at the first send)
+    std::vector<Pending> pending;    // (pendente=auto|manual|desempenho <name>: oldest first)
+    std::vector<std::string> sent;   // (enviado=<name>: the newest kMaxSent)
+    std::vector<std::string> refs;   // (referencia=<version>: the versions whose reference performance report was made)
+};
+constexpr size_t kMaxSent = 200, kMaxRefs = 20;
 std::wstring dir;
 bool (*menu_ok)() = nullptr;
 bool started = false, allowed = false, blocked = false;   // (blocked: a send failed; the next queue() tries again)
-std::condition_variable cv;
+std::condition_variable cv, done_cv;   // (done_cv: a report's sending ended, wait_sent)
 Book book;
+std::map<std::string, std::string> reasons;   // (a performance report's X-Ocarina-Motivo, this session's)
 
 std::wstring book_path() { return dir + L"\\ocarina-envio.txt"; }
 void book_load() {
@@ -90,9 +99,11 @@ void book_load() {
         const std::string k = s.substr(0, eq), v = s.substr(eq + 1);
         if (k == "instalacao" && v.size() == 16 && v.find_first_not_of("0123456789abcdef") == std::string::npos) book.id = v;
         else if (k == "pendente" && v.find(' ') != std::string::npos) {
-            const std::string name = v.substr(v.find(' ') + 1);
-            if (name.find_first_of("\\/:") == std::string::npos) book.pending.push_back({name, v.compare(0, 5, "auto ") == 0});
+            const std::string name = v.substr(v.find(' ') + 1), word = v.substr(0, v.find(' '));
+            const Kind kind = word == "auto" ? Kind::kAuto : word == "desempenho" ? Kind::kPerf : Kind::kManual;
+            if (name.find_first_of("\\/:") == std::string::npos) book.pending.push_back({name, kind});
         } else if (k == "enviado" && !v.empty()) book.sent.push_back(v);
+        else if (k == "referencia" && !v.empty() && v.size() <= 32) book.refs.push_back(v);
     }
     fclose(f);
 }
@@ -100,8 +111,9 @@ void book_save() {
     std::string t = "# Ocarina Engine: os relatórios de erro enviados e os que esperam a internet (Insert ou F1 > Gameplay > Enviar "
                     "relatórios automaticamente desliga o envio). instalacao é um número sorteado, sem nada do seu PC.\n";
     if (!book.id.empty()) t += "instalacao=" + book.id + "\n";
-    for (const auto& [name, automatic] : book.pending) t += std::string("pendente=") + (automatic ? "auto " : "manual ") + name + "\n";
+    for (const Pending& p : book.pending) t += std::string("pendente=") + kind_word(p.kind) + " " + p.name + "\n";
     for (size_t i = book.sent.size() > kMaxSent ? book.sent.size() - kMaxSent : 0; i < book.sent.size(); i++) t += "enviado=" + book.sent[i] + "\n";
+    for (size_t i = book.refs.size() > kMaxRefs ? book.refs.size() - kMaxRefs : 0; i < book.refs.size(); i++) t += "referencia=" + book.refs[i] + "\n";
     const std::wstring p = book_path(), tmp = p + L".tmp";
     if (FILE* f = _wfopen(tmp.c_str(), L"wb")) {
         const bool ok = fwrite(t.data(), 1, t.size(), f) == t.size();
@@ -339,7 +351,9 @@ Answer post(const std::string& to, const std::string& body, const std::wstring& 
 
 // ---- one report ----
 enum class Out { kOk, kRetry, kRefused, kGone };
-Out send_one(const std::string& name, bool automatic, const std::string& id, std::string* said) {
+Out send_one(const std::string& name, Kind kind, const std::string& id, const std::string& reason, std::string* said,
+             DWORD* status) {
+    const bool automatic = kind == Kind::kAuto;
     const std::wstring path = dir + L"\\" + widen(name);
     WIN32_FILE_ATTRIBUTE_DATA fa;
     if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fa)) return Out::kGone;
@@ -360,10 +374,17 @@ Out send_one(const std::string& name, bool automatic, const std::string& id, std
         return Out::kRefused;
     }
     std::wstring headers = L"Content-Type: application/zip\r\nX-Ocarina-Versao: " + widen(OCARINA_VERSION) +
-                           L"\r\nX-Ocarina-Tipo: " + (automatic ? L"automatico" : L"manual") + L"\r\nX-Ocarina-Instalacao: " +
+                           L"\r\nX-Ocarina-Tipo: " + kind_header(kind) + L"\r\nX-Ocarina-Instalacao: " +
                            widen(id) + L"\r\nX-Ocarina-Arquivo: " + widen(name) + L"\r\n";
     if (slimmed) headers += L"X-Ocarina-Reduzido: 1\r\n";
+    if (!reason.empty()) {   // (printable ASCII only: a header)
+        std::wstring r;
+        for (char ch : reason)
+            if (ch >= 0x20 && ch < 0x7F && r.size() < 200) r += (wchar_t)ch;
+        headers += L"X-Ocarina-Motivo: " + r + L"\r\n";
+    }
     const Answer a = post(url(), body, headers);
+    *status = a.reached ? a.status : 0;
     *said = a.reached ? fmt("resposta %lu, %llu KB%s", (unsigned long)a.status, (unsigned long long)(body.size() >> 10),
                             slimmed ? ", sem as partes maiores" : "")
                       : a.error ? fmt("sem resposta (erro %lu)", (unsigned long)a.error)
@@ -377,12 +398,12 @@ Out send_one(const std::string& name, bool automatic, const std::string& id, std
 void worker() {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     for (;;) {
-        std::string name, id;
-        bool automatic = false;
+        std::string name, id, reason;
+        Kind kind = Kind::kManual;
         {
             std::unique_lock lk(mu);
             cv.wait(lk, [] { return allowed && !blocked && !book.pending.empty(); });
-            name = book.pending.front().first, automatic = book.pending.front().second;
+            name = book.pending.front().name, kind = book.pending.front().kind;
             if (was_sent(name)) {   // (sent by another start meanwhile)
                 book.pending.erase(book.pending.begin());
                 book_save();
@@ -390,17 +411,24 @@ void worker() {
             }
             if (!(menu_ok && menu_ok()) || !env_allows()) {   // (turned off since: it waits for a start with sending on)
                 blocked = true;
+                done_cv.notify_all();
                 continue;
             }
             if (book.id.empty()) book.id = new_id(), book_save();
             id = book.id;
             fates[name] = Fate::kSending;
+            if (const auto it = reasons.find(name); it != reasons.end()) reason = it->second;
         }
         std::string said;
-        const Out out = send_one(name, automatic, id, &said);
+        DWORD status = 0;
+        Out out = send_one(name, kind, id, reason, &said, &status);
+        if (out == Out::kRetry && kind == Kind::kPerf && status == 429) {   // (the receiver's limit: a newer one will say the same)
+            out = Out::kRefused;
+            said += ", o limite do receptor: este de desempenho fica só na pasta do jogo";
+        }
         std::lock_guard lk(mu);
         if (out != Out::kRetry) {
-            book.pending.erase(std::remove_if(book.pending.begin(), book.pending.end(), [&](const auto& p) { return p.first == name; }),
+            book.pending.erase(std::remove_if(book.pending.begin(), book.pending.end(), [&](const Pending& p) { return p.name == name; }),
                                book.pending.end());
             if (out == Out::kOk) book.sent.push_back(name);
             book_save();
@@ -423,6 +451,7 @@ void worker() {
                 logf("ocarina: o relatório %s não está mais na pasta do jogo: saiu da fila de envio", name.c_str());
                 break;
         }
+        done_cv.notify_all();
     }
 }
 #endif   // _WIN32
@@ -450,7 +479,7 @@ void start(const std::wstring& game_dir, bool (*menu_allows)()) {
     started = true, dir = game_dir, menu_ok = menu_allows;
     book_load();
     while ((int)book.pending.size() > kMaxPending) book.pending.erase(book.pending.begin());
-    for (const auto& p : book.pending) fates[p.first] = Fate::kWaiting;
+    for (const Pending& p : book.pending) fates[p.name] = Fate::kWaiting;
     if (!book.pending.empty())
         logf("ocarina: %zu relatório(s) esperando envio de um início anterior; vão para %s", book.pending.size(), url().c_str());
     std::thread(worker).detach();
@@ -461,22 +490,55 @@ void allow() {
     if (!allowed) allowed = true, cv.notify_all();
 }
 
-void queue(const std::wstring& zip_name, bool automatic) {
+void queue(const std::wstring& zip_name, Kind kind, const std::string& reason) {
     const std::string name = utf8(zip_name);
     std::lock_guard lk(mu);
     if (!started || name.empty() || was_sent(name)) return;
-    book.pending.erase(std::remove_if(book.pending.begin(), book.pending.end(), [&](const auto& p) { return p.first == name; }),
+    book.pending.erase(std::remove_if(book.pending.begin(), book.pending.end(), [&](const Pending& p) { return p.name == name; }),
                        book.pending.end());
-    book.pending.push_back({name, automatic});
-    while ((int)book.pending.size() > kMaxPending) {
-        logf("ocarina: fila de envio cheia: %s fica só na pasta do jogo", book.pending.front().first.c_str());
-        fates.erase(book.pending.front().first);
-        book.pending.erase(book.pending.begin());
+    book.pending.push_back({name, kind});
+    if (!reason.empty()) reasons[name] = reason;
+    // (over the limits: the oldest performance report leaves first, so an error report is never pushed out by them)
+    const auto perf_count = [] {
+        return (int)std::count_if(book.pending.begin(), book.pending.end(), [](const Pending& p) { return p.kind == Kind::kPerf; });
+    };
+    while ((int)book.pending.size() > kMaxPending || perf_count() > kMaxPendingPerf) {
+        auto out = std::find_if(book.pending.begin(), book.pending.end(), [](const Pending& p) { return p.kind == Kind::kPerf; });
+        if (out == book.pending.end()) out = book.pending.begin();
+        logf("ocarina: fila de envio cheia: %s fica só na pasta do jogo", out->name.c_str());
+        fates.erase(out->name), reasons.erase(out->name);
+        book.pending.erase(out);
     }
     book_save();
-    fates[name] = Fate::kWaiting;
+    if (std::find_if(book.pending.begin(), book.pending.end(), [&](const Pending& p) { return p.name == name; }) != book.pending.end())
+        fates[name] = Fate::kWaiting;
     blocked = false;   // (a new report: worth trying again)
     cv.notify_all();
+}
+
+bool wait_sent(const std::string& zip_name, int timeout_ms) {
+    std::unique_lock lk(mu);
+    if (!started) return false;
+    const auto ended = [&] {
+        const auto it = fates.find(zip_name);
+        return it == fates.end() || it->second == Fate::kSent || it->second == Fate::kRefused || it->second == Fate::kRetry ||
+               (blocked && it->second == Fate::kWaiting) || !allowed;
+    };
+    done_cv.wait_for(lk, std::chrono::milliseconds(timeout_ms), ended);
+    const auto it = fates.find(zip_name);
+    return it != fates.end() && it->second == Fate::kSent;
+}
+
+bool reference_done(const std::string& version) {
+    std::lock_guard lk(mu);
+    return std::find(book.refs.begin(), book.refs.end(), version) != book.refs.end();
+}
+
+void reference_mark(const std::string& version) {
+    std::lock_guard lk(mu);
+    if (!started || std::find(book.refs.begin(), book.refs.end(), version) != book.refs.end()) return;
+    book.refs.push_back(version);
+    book_save();
 }
 #endif
 

@@ -8,6 +8,11 @@ Zelda: Ocarina of Time (Switch 2) no PC, em placas comuns, não só nas topo de 
 O Ocarina Engine não traz o jogo. Você monta o jogo com o HookshotBuilder a partir da sua própria cópia, e o Ocarina Engine
 troca só o renderizador (`hookshot_vk.dll`).
 
+## v0.4.4: menos RAM e relatório de travadas automático
+
+- **Menos RAM:** o cache de pipelines do driver da abertura é solto quando o jogo começa: 1,4 a 2,0 GB a menos no Burgo. `RX_VK_PCACHE_RELEASE=0` desliga.
+- **Relatório de travadas automático:** a cada 5 minutos, se houve travadas, FPS baixo, piscada ou memória no limite, um relatório leve sai sozinho (sem foto, sem dados pessoais, no máximo 7 por sessão). Desliga no menu (Enviar relatórios automaticamente) ou com `OCARINA_PERF_REPORT=0`.
+
 ## v0.4.3: o Burgo mais leve em placas de 8 GB ou mais
 
 - Em PCs de 16 GB de RAM, o teto de 1,5 GB dos espelhos agora vale só para placas de até 6,5 GB. Numa de 8 GB ele fazia o Burgo cair para 19-26 fps trocando espelhos; nas maiores os espelhos usam até um quarto da placa. `RX_VK_MIRROR_RAM_CAP=0` tira o teto em qualquer placa.
