@@ -2428,10 +2428,10 @@ uint64_t mirror_budget_uncut() {
         // card kept 2 GB of mirrors, and the VRAM is commit too (WDDM), there where it ran out. RX_VK_MIRROR_RAM_CAP=0: as before
         if (!getenv("RX_VK_MIRROR_RAM_CAP") || atoi(getenv("RX_VK_MIRROR_RAM_CAP")) != 0) {
             uint64_t pt = 0, pa = 0, cl = 0, ca = 0;
-            // (v0.4.3: on cards of 6.5 GB or less, where it was measured. An RTX 3060 Ti of 8 GB on a 16 GB PC filled the 1536 MB in
-            // the Burgo and swapped mirrors all the time: ~1300 copies and 60 MB written back a frame, the memory sync at 20 ms a
-            // frame, 19-26 fps there against 45-60 elsewhere, with 2.4 GB of the card free. There a quarter of the card, 2 GB)
-            if (sys_memory(pt, pa, cl, ca) && pt && pt <= (17ull << 30) && (!vram || vram <= (6656ull << 20))) most = 1536ull << 20;
+            // (v0.4.5: back to 1536 MB on every card of a 16 GB PC. v0.4.3 gave 8 GB cards 2 GB: the mirrors' extra VRAM squeezed the
+            // textures from 3.3 to 2.3 GB on an RTX 3060 Ti (textures flickering, more frames over 100 ms) while the swapping they
+            // were to end went on; the share between mirrors and textures there waits for the performance reports)
+            if (sys_memory(pt, pa, cl, ca) && pt && pt <= (17ull << 30)) most = 1536ull << 20;
         }
         return vram ? std::min<uint64_t>(vram / 4, most) : most;
     }();

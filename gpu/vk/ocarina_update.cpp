@@ -28,6 +28,7 @@
 namespace mkwvk {
 void logf(const char* fmt, ...);   // (vk_main.cpp)
 extern const MkwVkHost* host;      // (vk_main.cpp: the game's, its API version)
+bool menu_portuguese();            // (vk_menu.cpp: the Insert menu's language; these texts are shown in it)
 }
 
 #ifdef _WIN32
@@ -108,27 +109,49 @@ void set_phase(Phase p, const std::string& detail) {
     st.phase = p, st.detail = detail;
 }
 
-const char* const kHelpIdle = "A busca no início está desligada (HOOKSHOT_NO_UPDATE_CHECK=1). Procurar atualização pergunta ao GitHub agora.";
+// (the details are kept in both languages, made once, and shown in the menu's language as it is when they are shown: two, pick)
+constexpr char kSep = '\x1f';
+std::string two(const std::string& pt, const std::string& en) { return pt + kSep + en; }
+/// One language's half of a text made by two (a text of one language: itself)
+std::string half(const std::string& s, bool pt) {
+    const size_t k = s.find(kSep);
+    return k == std::string::npos ? s : pt ? s.substr(0, k) : s.substr(k + 1);
+}
+std::string pick(const std::string& s) { return half(s, menu_portuguese()); }
+
+std::string help_idle() {
+    return two("A busca no início está desligada (HOOKSHOT_NO_UPDATE_CHECK=1). Procurar atualização pergunta ao GitHub agora.",
+               "The check at start is off (HOOKSHOT_NO_UPDATE_CHECK=1). Check for updates asks GitHub now.");
+}
 
 } // namespace
 
 const char* sample(int k) {
-    // (the longest each detail can be, with a long tag in it: the help box keeps that height)
-    static std::string t[8];
+    // (the longest each detail can be, with a long tag in it, in the menu's language: the help box keeps that height)
+    static std::string t[2][5];
     static bool made = false;
     if (!made) {
         made = true;
         const char* x = "v00.00.00-rc00";
-        t[0] = fmt("Saiu a %s do Ocarina Engine (esta é a %s). Atualizar baixa a hookshot_vk.dll nova, confere se ela serve para este "
-                   "jogo e a coloca no lugar; a atual fica guardada até o próximo início.", x, x);
-        t[1] = fmt("A %s precisa de outro HookshotBuilder (ela é da API 00; este jogo é da 00). Nada foi trocado: monte o jogo de novo "
-                   "com o HookshotBuilder novo e depois atualize.", x);
-        t[2] = fmt("Reinicie o jogo para usar a %s. A versão anterior ficou guardada como hookshot_vk.dll.old e é apagada no próximo "
-                   "início. Seu hookshot_env.txt foi mantido; o da %s ficou ao lado, como hookshot_env.txt.novo.", x, x);
-        t[3] = fmt("A %s não diz para qual HookshotBuilder foi feita. Nada foi trocado; instale-a à mão, pela página %s.", x, kReleasesPage);
-        t[4] = kHelpIdle;
+        t[1][0] = fmt("Saiu a %s do Ocarina Engine (esta é a %s). Atualizar baixa a hookshot_vk.dll nova, confere se ela serve para este "
+                      "jogo e a coloca no lugar; a atual fica guardada até o próximo início.", x, x);
+        t[1][1] = fmt("A %s precisa de outro HookshotBuilder (ela é da API 00; este jogo é da 00). Nada foi trocado: monte o jogo de novo "
+                      "com o HookshotBuilder novo e depois atualize.", x);
+        t[1][2] = fmt("Reinicie o jogo para usar a %s. A versão anterior ficou guardada como hookshot_vk.dll.old e é apagada no próximo "
+                      "início. Seu hookshot_env.txt foi mantido; o da %s ficou ao lado, como hookshot_env.txt.novo.", x, x);
+        t[1][3] = fmt("A %s não diz para qual HookshotBuilder foi feita. Nada foi trocado; instale-a à mão, pela página %s.", x, kReleasesPage);
+        t[1][4] = half(help_idle(), true);
+        t[0][0] = fmt("Ocarina Engine %s is out (this is %s). Update now downloads the new hookshot_vk.dll, checks that it fits this game "
+                      "and puts it in place; the current one is kept until the next start.", x, x);
+        t[0][1] = fmt("%s needs another HookshotBuilder (it is API 00; this game is 00). Nothing was changed: build the game again with "
+                      "the new HookshotBuilder, then update.", x);
+        t[0][2] = fmt("Restart the game to use %s. The previous version is kept as hookshot_vk.dll.old and is deleted at the next start. "
+                      "Your hookshot_env.txt was kept; the one of %s is beside it, as hookshot_env.txt.novo.", x, x);
+        t[0][3] = fmt("%s does not say which HookshotBuilder it was made for. Nothing was changed; install it by hand from %s.", x,
+                      kReleasesPage);
+        t[0][4] = half(help_idle(), false);
     }
-    return k >= 0 && k < 5 ? t[k].c_str() : nullptr;
+    return k >= 0 && k < 5 ? t[menu_portuguese() ? 1 : 0][k].c_str() : nullptr;
 }
 
 #ifdef _WIN32
@@ -453,30 +476,41 @@ std::string normal_text(std::string t) {
 }
 
 // ---- the work, on a thread of its own ----
-std::string net_error(const Got& g, const char* what) {
+/// (what_en lowercase: a sentence that starts with it gets its capital)
+std::string net_error(const Got& g, const char* what_pt, const char* what_en) {
+    std::string cap = what_en;
+    if (!cap.empty() && cap[0] >= 'a' && cap[0] <= 'z') cap[0] = (char)(cap[0] - 32);
     if (g.net == kNetStatus && (g.status == 403 || g.status == 429))
-        return "O GitHub limitou as consultas por agora. Tente de novo daqui a alguns minutos.";
-    if (g.net == kNetStatus && g.status == 404) return fmt("%s não foi encontrado no GitHub (resposta 404).", what);
-    if (g.net == kNetStatus) return fmt("O GitHub respondeu com o erro %lu ao pedir %s. Tente de novo mais tarde.", (unsigned long)g.status, what);
-    if (g.net == kNetTooBig) return fmt("%s veio maior do que o esperado e foi recusado.", what);
-    return "Não deu para falar com o GitHub (sem internet?). O jogo segue normal; tente de novo mais tarde.";
+        return two("O GitHub limitou as consultas por agora. Tente de novo daqui a alguns minutos.",
+                   "GitHub is limiting requests for now. Try again in a few minutes.");
+    if (g.net == kNetStatus && g.status == 404)
+        return two(fmt("%s não foi encontrado no GitHub (resposta 404).", what_pt), fmt("%s was not found on GitHub (answer 404).", cap.c_str()));
+    if (g.net == kNetStatus)
+        return two(fmt("O GitHub respondeu com o erro %lu ao pedir %s. Tente de novo mais tarde.", (unsigned long)g.status, what_pt),
+                   fmt("GitHub answered with error %lu when asked for %s. Try again later.", (unsigned long)g.status, what_en));
+    if (g.net == kNetTooBig)
+        return two(fmt("%s veio maior do que o esperado e foi recusado.", what_pt), fmt("%s came bigger than expected and was refused.", cap.c_str()));
+    return two("Não deu para falar com o GitHub (sem internet?). O jogo segue normal; tente de novo mais tarde.",
+               "Could not reach GitHub (no internet?). The game goes on as usual; try again later.");
 }
 
 void check_now() {
-    set_phase(kChecking, "Perguntando ao GitHub qual é a versão mais nova...");
+    set_phase(kChecking, two("Perguntando ao GitHub qual é a versão mais nova...", "Asking GitHub for the newest version..."));
     const Got g = http_get(kApiUrl, true, 1u << 20);
     if (g.net != kNetOk) {
         if (g.net == kNetStatus && g.status == 404) {
-            set_phase(kError, "Ainda não há uma versão do Ocarina Engine publicada no GitHub.");
+            set_phase(kError, two("Ainda não há uma versão do Ocarina Engine publicada no GitHub.",
+                                  "There is no Ocarina Engine version published on GitHub yet."));
         } else {
-            set_phase(kError, net_error(g, "A versão mais nova"));
+            set_phase(kError, net_error(g, "A versão mais nova", "the newest version"));
         }
         logf("ocarina: update check failed (net %d, HTTP %lu)", (int)g.net, (unsigned long)g.status);
         return;
     }
     Release rel;
     if (!parse_release(g.body, &rel)) {
-        set_phase(kError, "A resposta do GitHub veio num formato inesperado. Tente de novo mais tarde.");
+        set_phase(kError, two("A resposta do GitHub veio num formato inesperado. Tente de novo mais tarde.",
+                              "GitHub's answer came in an unexpected format. Try again later."));
         logf("ocarina: update check: no usable tag_name in GitHub's answer");
         return;
     }
@@ -484,18 +518,23 @@ void check_now() {
     logf("ocarina: this is %s, the latest release is %s%s", kOurs, rel.tag.c_str(), rel.dll_url.empty() ? " (no hookshot_vk.dll in it)" : "");
     std::lock_guard<std::mutex> lock(mu);
     st.tag = rel.tag, st.dll_url = rel.dll_url, st.env_url = rel.env_url, st.dll_size = rel.dll_size;
+    const std::string shown = shown_tag(rel.tag);
     if (!latest.ok || cmp_ver(latest, ours) <= 0) {
         st.phase = kUpToDate;
-        st.detail = fmt("Esta é a versão mais nova (a última no GitHub é a %s).", shown_tag(rel.tag).c_str());
+        st.detail = two(fmt("Esta é a versão mais nova (a última no GitHub é a %s).", shown.c_str()),
+                        fmt("This is the newest version (the latest on GitHub is %s).", shown.c_str()));
     } else if (rel.dll_url.empty()) {
         st.phase = kError;
-        st.detail = fmt("A %s saiu, mas sem o arquivo hookshot_vk.dll para baixar. Baixe-a à mão pela página %s.",
-                        shown_tag(rel.tag).c_str(), kReleasesPage);
+        st.detail = two(fmt("A %s saiu, mas sem o arquivo hookshot_vk.dll para baixar. Baixe-a à mão pela página %s.", shown.c_str(),
+                            kReleasesPage),
+                        fmt("%s is out, but without a hookshot_vk.dll file to download. Download it by hand from %s.", shown.c_str(),
+                            kReleasesPage));
     } else {
         st.phase = kAvailable;
-        st.detail = fmt("Saiu a %s do Ocarina Engine (esta é a %s). Atualizar baixa a hookshot_vk.dll nova, confere se ela serve para "
-                        "este jogo e a coloca no lugar; a atual fica guardada até o próximo início.",
-                        shown_tag(rel.tag).c_str(), kOurs);
+        st.detail = two(fmt("Saiu a %s do Ocarina Engine (esta é a %s). Atualizar baixa a hookshot_vk.dll nova, confere se ela serve para "
+                            "este jogo e a coloca no lugar; a atual fica guardada até o próximo início.", shown.c_str(), kOurs),
+                        fmt("Ocarina Engine %s is out (this is %s). Update now downloads the new hookshot_vk.dll, checks that it fits "
+                            "this game and puts it in place; the current one is kept until the next start.", shown.c_str(), kOurs));
     }
 }
 
@@ -506,16 +545,21 @@ void install_now() {
         std::lock_guard<std::mutex> lock(mu);
         tag = st.tag, dll_url = st.dll_url, env_url = st.env_url, dll_size = st.dll_size;
         st.phase = kDownloading, st.percent = 0;
-        st.detail = fmt("Baixando a %s. Pode continuar jogando: a versão atual só é trocada no fim, depois de conferida.",
-                        shown_tag(tag).c_str());
+        st.detail = two(fmt("Baixando a %s. Pode continuar jogando: a versão atual só é trocada no fim, depois de conferida.",
+                            shown_tag(tag).c_str()),
+                        fmt("Downloading %s. You can keep playing: the current version is only replaced at the end, after it is "
+                            "checked.", shown_tag(tag).c_str()));
     }
     const std::string v = shown_tag(tag);
+    const char* vc = v.c_str();
     const auto fail = [&](const std::string& why) {
         set_phase(kError, why);
-        logf("ocarina: update to %s not made: %s", tag.c_str(), why.c_str());
+        logf("ocarina: update to %s not made: %s", tag.c_str(), half(why, false).c_str());
     };
     const std::wstring self = own_path();
-    if (self.empty()) return fail("Não deu para achar o arquivo hookshot_vk.dll em uso. Nada foi trocado.");
+    if (self.empty())
+        return fail(two("Não deu para achar o arquivo hookshot_vk.dll em uso. Nada foi trocado.",
+                        "Could not find the hookshot_vk.dll in use. Nothing was changed."));
 
     // 1. the DLL, whole, into memory
     const Got dll = http_get(widen(dll_url), false, kDllMax, [&](uint64_t have, uint64_t total) {
@@ -525,34 +569,52 @@ void install_now() {
         st.percent = pc;
     });
     if (dll.net != kNetOk) {
-        return fail(dll.net == kNetOffline ? fmt("O download da %s não terminou (a internet caiu?). Nada foi trocado; tente de novo.", v.c_str())
-                                           : net_error(dll, "O arquivo hookshot_vk.dll") + " Nada foi trocado.");
+        if (dll.net == kNetOffline)
+            return fail(two(fmt("O download da %s não terminou (a internet caiu?). Nada foi trocado; tente de novo.", vc),
+                            fmt("The download of %s did not finish (did the internet drop?). Nothing was changed; try again.", vc)));
+        const std::string why = net_error(dll, "O arquivo hookshot_vk.dll", "the hookshot_vk.dll file");
+        return fail(two(half(why, true) + " Nada foi trocado.", half(why, false) + " Nothing was changed."));
     }
     if ((dll_size && dll.body.size() != dll_size) || dll.body.size() < kDllMin)
-        return fail(fmt("O arquivo da %s veio incompleto ou com tamanho estranho (%llu bytes). Nada foi trocado; tente de novo.", v.c_str(),
-                        (unsigned long long)dll.body.size()));
+        return fail(two(fmt("O arquivo da %s veio incompleto ou com tamanho estranho (%llu bytes). Nada foi trocado; tente de novo.", vc,
+                            (unsigned long long)dll.body.size()),
+                        fmt("The file for %s came incomplete or with an odd size (%llu bytes). Nothing was changed; try again.", vc,
+                            (unsigned long long)dll.body.size())));
 
     // 2. checked: a DLL for this machine, the export the game calls, and the same API as this game's (MKWVK_API_VERSION)
     std::string info;
     switch (verify_dll(dll.body, &info)) {
-    case kCheckNotDll: return fail(fmt("O arquivo da %s não é uma DLL do Windows para este PC. Nada foi trocado.", v.c_str()));
-    case kCheckNoInit: return fail(fmt("O arquivo da %s não tem a entrada mkwvk_init: não é um Ocarina Engine. Nada foi trocado.", v.c_str()));
+    case kCheckNotDll:
+        return fail(two(fmt("O arquivo da %s não é uma DLL do Windows para este PC. Nada foi trocado.", vc),
+                        fmt("The file for %s is not a Windows DLL for this PC. Nothing was changed.", vc)));
+    case kCheckNoInit:
+        return fail(two(fmt("O arquivo da %s não tem a entrada mkwvk_init: não é um Ocarina Engine. Nada foi trocado.", vc),
+                        fmt("The file for %s has no mkwvk_init entry: it is not an Ocarina Engine. Nothing was changed.", vc)));
     case kCheckNoInfo:
-        return fail(fmt("A %s não diz para qual HookshotBuilder foi feita. Nada foi trocado; instale-a à mão, pela página %s.", v.c_str(),
-                        kReleasesPage));
+        return fail(two(fmt("A %s não diz para qual HookshotBuilder foi feita. Nada foi trocado; instale-a à mão, pela página %s.", vc,
+                            kReleasesPage),
+                        fmt("%s does not say which HookshotBuilder it was made for. Nothing was changed; install it by hand from %s.",
+                            vc, kReleasesPage)));
     case kCheckOk: break;
     }
     unsigned api = 0;
     char their[64] = "";
-    if (sscanf(info.c_str(), "ocarina-engine api=%u version=%63s", &api, their) != 2)
-        return fail(fmt("A %s se identifica de um jeito que esta versão não entende (\"%s\"). Nada foi trocado; instale-a à mão, pela "
-                        "página %s.", v.c_str(), info.substr(0, 60).c_str(), kReleasesPage));
+    if (sscanf(info.c_str(), "ocarina-engine api=%u version=%63s", &api, their) != 2) {
+        const std::string said = info.substr(0, 60);
+        return fail(two(fmt("A %s se identifica de um jeito que esta versão não entende (\"%s\"). Nada foi trocado; instale-a à mão, pela "
+                            "página %s.", vc, said.c_str(), kReleasesPage),
+                        fmt("%s identifies itself in a way this version does not understand (\"%s\"). Nothing was changed; install it "
+                            "by hand from %s.", vc, said.c_str(), kReleasesPage)));
+    }
     const unsigned game_api = host ? host->version : (unsigned)MKWVK_API_VERSION;
     if (api != game_api)
-        return fail(fmt("A %s precisa de outro HookshotBuilder (ela é da API %u; este jogo é da %u). Nada foi trocado: monte o jogo de novo "
-                        "com o HookshotBuilder novo e depois atualize.", v.c_str(), api, game_api));
+        return fail(two(fmt("A %s precisa de outro HookshotBuilder (ela é da API %u; este jogo é da %u). Nada foi trocado: monte o jogo de "
+                            "novo com o HookshotBuilder novo e depois atualize.", vc, api, game_api),
+                        fmt("%s needs another HookshotBuilder (it is API %u; this game is %u). Nothing was changed: build the game "
+                            "again with the new HookshotBuilder, then update.", vc, api, game_api)));
     if (cmp_ver(parse_ver(their), parse_ver(tag)) != 0)   // (else the next start would offer it again, and again)
-        return fail(fmt("O arquivo da %s diz ser a v%s. Nada foi trocado; avise o autor.", v.c_str(), their));
+        return fail(two(fmt("O arquivo da %s diz ser a v%s. Nada foi trocado; avise o autor.", vc, their),
+                        fmt("The file for %s says it is v%s. Nothing was changed; tell the author.", vc, their)));
 
     // 3. hookshot_env.txt of the release, if it has one (before anything is changed: a failure here only skips it)
     std::string env_new;
@@ -568,7 +630,8 @@ void install_now() {
     // to its name; any failure puts the old one back
     const std::wstring fresh = self + L".new", old = self + L".old";
     if (!write_file(fresh, dll.body))
-        return fail("Não deu para gravar na pasta do jogo (sem permissão ou disco cheio?). Nada foi trocado.");
+        return fail(two("Não deu para gravar na pasta do jogo (sem permissão ou disco cheio?). Nada foi trocado.",
+                        "Could not write in the game folder (no permission or disk full?). Nothing was changed."));
     if (exists(old) && !DeleteFileW(old.c_str())) {   // (a .old still in use: by another copy of the game)
         wchar_t aside[32];
         _snwprintf(aside, 32, L".%llu", (unsigned long long)GetTickCount64());
@@ -577,23 +640,28 @@ void install_now() {
     if (!MoveFileExW(self.c_str(), old.c_str(), MOVEFILE_REPLACE_EXISTING)) {
         const DWORD e = GetLastError();
         DeleteFileW(fresh.c_str());
-        return fail(fmt("Não deu para trocar a hookshot_vk.dll (erro %lu: arquivo em uso ou sem permissão). A versão atual continua.",
-                        (unsigned long)e));
+        return fail(two(fmt("Não deu para trocar a hookshot_vk.dll (erro %lu: arquivo em uso ou sem permissão). A versão atual continua.",
+                            (unsigned long)e),
+                        fmt("Could not replace hookshot_vk.dll (error %lu: file in use or no permission). The current version stays.",
+                            (unsigned long)e)));
     }
     if (!MoveFileExW(fresh.c_str(), self.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
         const DWORD e = GetLastError();
         const bool back = MoveFileExW(old.c_str(), self.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
         DeleteFileW(fresh.c_str());
         logf("ocarina: update: the new DLL could not take the old one's name (%lu); old one put back: %d", (unsigned long)e, (int)back);
-        return fail(back ? fmt("Não deu para colocar a %s no lugar (erro %lu). A versão atual continua.", v.c_str(), (unsigned long)e)
-                         : fmt("Não deu para colocar a %s no lugar (erro %lu). Renomeie hookshot_vk.dll.old para hookshot_vk.dll "
-                               "na pasta do jogo antes de abri-lo de novo.", v.c_str(), (unsigned long)e));
+        return fail(back ? two(fmt("Não deu para colocar a %s no lugar (erro %lu). A versão atual continua.", vc, (unsigned long)e),
+                               fmt("Could not put %s in place (error %lu). The current version stays.", vc, (unsigned long)e))
+                         : two(fmt("Não deu para colocar a %s no lugar (erro %lu). Renomeie hookshot_vk.dll.old para hookshot_vk.dll "
+                                   "na pasta do jogo antes de abri-lo de novo.", vc, (unsigned long)e),
+                               fmt("Could not put %s in place (error %lu). Rename hookshot_vk.dll.old to hookshot_vk.dll in the game "
+                                   "folder before opening it again.", vc, (unsigned long)e)));
     }
     logf("ocarina: hookshot_vk.dll %s in place (the running one is hookshot_vk.dll.old until the next start)", tag.c_str());
 
     // 5. hookshot_env.txt: the new release's when the player has none, or theirs is still this release's own (unchanged); else
     // theirs is kept and the new one put beside it
-    std::string env_note;
+    std::string env_pt, env_en;
     if (!env_new.empty()) {
         const std::wstring dir = game_dir(), env = dir + L"\\hookshot_env.txt";
         std::string mine;
@@ -610,18 +678,23 @@ void install_now() {
         } else if (replace) {
             const std::wstring tmp = env + L".tmp";
             if (write_file(tmp, env_new) && MoveFileExW(tmp.c_str(), env.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
-                env_note = " O hookshot_env.txt também foi atualizado.";
+                env_pt = " O hookshot_env.txt também foi atualizado.", env_en = " hookshot_env.txt was updated too.";
             else
-                DeleteFileW(tmp.c_str()), env_note = " O hookshot_env.txt novo não pôde ser gravado; o seu ficou como estava.";
+                DeleteFileW(tmp.c_str()), env_pt = " O hookshot_env.txt novo não pôde ser gravado; o seu ficou como estava.",
+                                          env_en = " The new hookshot_env.txt could not be written; yours stayed as it was.";
         } else if (have && normal_text(mine) != normal_text(env_new)) {
-            if (write_file(env + L".novo", env_new))
-                env_note = fmt(" Seu hookshot_env.txt foi mantido; o da %s ficou ao lado, como hookshot_env.txt.novo.", v.c_str());
+            if (write_file(env + L".novo", env_new)) {
+                env_pt = fmt(" Seu hookshot_env.txt foi mantido; o da %s ficou ao lado, como hookshot_env.txt.novo.", vc);
+                env_en = fmt(" Your hookshot_env.txt was kept; the one of %s is beside it, as hookshot_env.txt.novo.", vc);
+            }
         }
     }
     std::lock_guard<std::mutex> lock(mu);
     st.phase = kInstalled, st.installed = tag, st.percent = 100;
-    st.detail = fmt("Reinicie o jogo para usar a %s. A versão anterior ficou guardada como hookshot_vk.dll.old e é apagada no próximo "
-                    "início.", v.c_str()) + env_note;
+    st.detail = two(fmt("Reinicie o jogo para usar a %s. A versão anterior ficou guardada como hookshot_vk.dll.old e é apagada no próximo "
+                        "início.", vc) + env_pt,
+                    fmt("Restart the game to use %s. The previous version is kept as hookshot_vk.dll.old and is deleted at the next "
+                        "start.", vc) + env_en);
 }
 
 void run(bool install) {
@@ -644,12 +717,13 @@ void begin() {
         DeleteFileW((self + L".new").c_str());
     }
     if (env_set("OCARINA_NO_UPDATE_CHECK")) {
-        set_phase(kOff, "OCARINA_NO_UPDATE_CHECK=1: a atualização pelo menu está desligada.");
+        set_phase(kOff, two("OCARINA_NO_UPDATE_CHECK=1: a atualização pelo menu está desligada.",
+                            "OCARINA_NO_UPDATE_CHECK=1: the update from the menu is off."));
         logf("ocarina: OCARINA_NO_UPDATE_CHECK=1: no update check");
         return;
     }
     if (env_set("HOOKSHOT_NO_UPDATE_CHECK")) {   // (the launchers set it for their own check: the button still asks)
-        set_phase(kIdle, kHelpIdle);
+        set_phase(kIdle, help_idle());
         return;
     }
     run(false);
@@ -677,22 +751,34 @@ View view() {
         s = st;
     }
     View v;
-    v.phase = s.phase, v.detail = s.detail;
+    const bool pt = menu_portuguese();   // (the menu's language now; the detail was kept in both)
+    v.phase = s.phase, v.detail = pick(s.detail);
 #ifndef _WIN32
-    v.detail = fmt("A atualização pelo menu é só no Windows. Baixe a versão nova pela página %s.", kReleasesPage);
+    v.detail = pt ? fmt("A atualização pelo menu é só no Windows. Baixe a versão nova pela página %s.", kReleasesPage)
+                  : fmt("The update from the menu is Windows only. Download the new version from %s.", kReleasesPage);
 #endif
     const std::string t = shown_tag(s.tag);
+    const char* check = pt ? "Procurar atualização" : "Check for updates";
     switch (s.phase) {
-    case kOff: v.status = kOurs, v.button = "Desligado"; break;
-    case kIdle: v.status = kOurs, v.button = "Procurar atualização", v.can_press = true; break;
-    case kChecking: v.status = fmt("%s - procurando...", kOurs), v.button = "Procurando..."; break;
-    case kUpToDate: v.status = fmt("%s - em dia", kOurs), v.button = "Procurar atualização", v.can_press = true; break;
-    case kAvailable: v.status = fmt("Nova versão %s disponível", t.c_str()), v.button = "Atualizar", v.can_press = true; break;
-    case kDownloading:
-        v.status = fmt("Baixando a %s... %d%%", t.c_str(), s.percent), v.button = fmt("Baixando... %d%%", s.percent);
+    case kOff: v.status = kOurs, v.button = pt ? "Desligado" : "Off"; break;
+    case kIdle: v.status = kOurs, v.button = check, v.can_press = true; break;
+    case kChecking:
+        v.status = fmt(pt ? "%s - procurando..." : "%s - checking...", kOurs), v.button = pt ? "Procurando..." : "Checking...";
         break;
-    case kInstalled: v.status = fmt("Reinicie o jogo para usar a %s", shown_tag(s.installed).c_str()), v.button = "Reinicie o jogo"; break;
-    case kError: v.status = fmt("%s - não deu certo", kOurs), v.button = "Procurar atualização", v.can_press = true; break;
+    case kUpToDate: v.status = fmt(pt ? "%s - em dia" : "%s - up to date", kOurs), v.button = check, v.can_press = true; break;
+    case kAvailable:
+        v.status = fmt(pt ? "Nova versão %s disponível" : "New version %s available", t.c_str());
+        v.button = pt ? "Atualizar" : "Update now", v.can_press = true;
+        break;
+    case kDownloading:
+        v.status = fmt(pt ? "Baixando a %s... %d%%" : "Downloading %s... %d%%", t.c_str(), s.percent);
+        v.button = fmt(pt ? "Baixando... %d%%" : "Downloading... %d%%", s.percent);
+        break;
+    case kInstalled:
+        v.status = fmt(pt ? "Reinicie o jogo para usar a %s" : "Restart the game to use %s", shown_tag(s.installed).c_str());
+        v.button = pt ? "Reinicie o jogo" : "Restart the game";
+        break;
+    case kError: v.status = fmt(pt ? "%s - não deu certo" : "%s - did not work", kOurs), v.button = check, v.can_press = true; break;
     }
     return v;
 }

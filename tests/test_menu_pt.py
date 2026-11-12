@@ -27,8 +27,7 @@ VALUE_MAX = 26   # (a value: the value cell's room, 18-point type)
 KEEP = {
     "Idioma / Language", "Português", "English", "Catmull-Rom", "Lanczos", "Switch", "Xbox", "PlayStation 4",
     "PlayStation 5", "Steam Deck", "Xbox / PC", "Transformer (K)", "Transformer 2 (M)", "Transformer 2 (L)", "NVIDIA DLSS",
-    "NVIDIA DLAA", "AMD FSR 3.1", "AMD FSR 4", "Ligado", "Desligado", "Relatórios automáticos",
-    "Enviar relatórios automaticamente", "Descriptor reuse", "Sampler cache",
+    "NVIDIA DLAA", "AMD FSR 3.1", "AMD FSR 4", "Descriptor reuse", "Sampler cache",
     " (not connected)", " (native)", " (game's)", "One made frame", "Two made frames", "Three made frames",
     "Four made frames", "Five made frames", "Six made frames", "Seven made frames",
     "Del",   # (a key's name on its cap)
@@ -130,10 +129,15 @@ def collect(src):
         texts = literal_runs(entry)
         if not texts:
             continue   # (the update's and the report's rows: their names are constants, in Portuguese)
-        if not entry.lstrip().startswith('"') or texts[0] in KEEP:
-            continue   # (a row already in Portuguese, the Developer rows: its help as it is)
+        if not entry.lstrip().startswith('"'):   # (the update's and the report's rows: their names are constants, below)
+            found += [("text", t) for t in texts]
+            continue
+        if texts[0] in KEEP:
+            continue   # (the Developer rows: its help as it is)
         found.append(("name", texts[0]))
         found += [("text", t) for t in texts[1:]]
+    for name in re.findall(r'\nconst char k(?:Update|Report)\w*Row\[\] = "([^"]+)";', src):
+        found.append(("name", name))
     for m in re.finditer(r'\nconst char\* (tx_\w+|hn_\w+)\(int v[^)]*\) \{', src):
         kind = "value" if m.group(1).startswith("tx_") else "text"
         found += [(kind, t) for t in literal_runs(block(src, m.group(0).lstrip("\n")))]
@@ -211,6 +215,20 @@ def main():
             if kind in ("name", "control", "value"):
                 ok, pt = answers[en]
                 print("%-6s %4d %4d  %-40s %s" % (kind, len(en), len(pt), en, pt))
+    # (the update's and the report's own texts, ocarina_update.cpp and ocarina_report.cpp: in the menu's language, English with
+    # Portuguese beside it; the Auto language: the game's or Windows')
+    if not re.search(r"bool menu_pt\(\) \{[^}]*game_pt\(\) \|\| windows_pt\(\)", src):
+        fails.append("menu_pt: Auto is not the game's or Windows' language")
+    if "GetUserDefaultUILanguage" not in src:
+        fails.append("windows_pt does not ask Windows' display language")
+    for module, words in (("ocarina_update.cpp", ("Check for updates", "Procurar atualização", "Update now", "Atualizar")),
+                          ("ocarina_report.cpp", ("Make report", "Gerar relatório", "Open folder", "Abrir pasta"))):
+        text = (ROOT / "gpu/vk" / module).read_text(encoding="utf-8")
+        for w in words:
+            if '"%s"' % w not in text:
+                fails.append("%s has no %r" % (module, w))
+        if "game_pt()" in text:
+            fails.append("%s speaks the game's language, not the menu's (menu_portuguese)" % module)
     if fails:
         raise SystemExit("FAIL:\n  " + "\n  ".join(fails))
     names = sum(1 for k, _ in texts if k == "name")

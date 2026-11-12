@@ -88,6 +88,9 @@ extern Options opts;
 /// (saved by the next menu_tick)
 bool menu_report_notice_seen(int level);
 void menu_report_notice_done(int level);
+/// (ocarina) The Insert menu's language is Portuguese (its Language row; Auto: the game's or Windows' language): what the update's
+/// and the report's texts (ocarina_update.cpp, ocarina_report.cpp) are written in
+bool menu_portuguese();
 /// (vk_memory.cpp) true when the quality preset's memory budgets (vram_mb, mirror_mb) are to be used: the card has no more
 /// video memory than the preset is for. A 4GB preset on an 8 GB card kept 256 MB of mirrors and 2.2 GB of textures: the
 /// game's memory was read over PCIe and the textures made again every frame, 5 fps with the CPU idle (Discord, 11-08)

@@ -53,6 +53,17 @@ std::string fmt(const char* f, ...) {
     return b;
 }
 
+// (ocarina) What the menu and the notes say is kept in both languages where it is made (two: Portuguese, then English) and
+// shown in the Insert menu's language as it is when it is shown (pick, vk_menu.cpp menu_portuguese)
+constexpr char kSep = '\x1f';
+std::string two(const std::string& pt, const std::string& en) { return pt + kSep + en; }
+/// One language's half of a text made by two (a text of one language: itself)
+std::string half(const std::string& s, bool pt) {
+    const size_t k = s.find(kSep);
+    return k == std::string::npos ? s : pt ? s.substr(0, k) : s.substr(k + 1);
+}
+std::string pick(const std::string& s) { return half(s, menu_portuguese()); }
+
 int64_t steady_ns() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
@@ -964,7 +975,7 @@ std::string system_body(const LogFacts& lf, bool at_start, const Scrub& scrub) {
 Made make_report(bool automatic, const std::string& why) {
     Made m;
     if (game_dir().empty()) {
-        m.error = "a pasta do jogo não foi encontrada";
+        m.error = two("a pasta do jogo não foi encontrada", "the game folder was not found");
         return m;
     }
     const Scrub scrub;
@@ -981,7 +992,8 @@ Made make_report(bool automatic, const std::string& why) {
     const std::wstring name = report_name(automatic), path = in_dir(name.c_str()), tmp = path + L".tmp";
     Zip z;
     if (!z.open(tmp)) {
-        m.error = fmt("a pasta do jogo não aceitou o arquivo (erro %lu)", (unsigned long)GetLastError());
+        m.error = two(fmt("a pasta do jogo não aceitou o arquivo (erro %lu)", (unsigned long)GetLastError()),
+                      fmt("the game folder did not take the file (error %lu)", (unsigned long)GetLastError()));
         return m;
     }
     // 1. the logs: this session's and the four before
@@ -1058,12 +1070,13 @@ Made make_report(bool automatic, const std::string& why) {
     z.add("sistema.txt", scrub(s));
     if (!z.close()) {
         DeleteFileW(tmp.c_str());
-        m.error = "o arquivo não pôde ser gravado inteiro (disco cheio?)";
+        m.error = two("o arquivo não pôde ser gravado inteiro (disco cheio?)", "the file could not be written whole (disk full?)");
         return m;
     }
     if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
         DeleteFileW(tmp.c_str());
-        m.error = fmt("o arquivo não pôde ser renomeado (erro %lu)", (unsigned long)GetLastError());
+        m.error = two(fmt("o arquivo não pôde ser renomeado (erro %lu)", (unsigned long)GetLastError()),
+                      fmt("the file could not be renamed (error %lu)", (unsigned long)GetLastError()));
         return m;
     }
     m.ok = true, m.path = path, m.name = utf8(name);
@@ -1128,32 +1141,6 @@ void open_in_explorer(const std::wstring& path) {
     PROCESS_INFORMATION pi{};
     if (CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi))
         CloseHandle(pi.hThread), CloseHandle(pi.hProcess);
-}
-
-/// The game in Portuguese: HOS_LANGUAGE, or language.txt's first code (host/nn_applet.c desired_language's sources)
-bool game_pt() {
-    static const bool pt = [] {
-        std::string code = env_utf8(L"HOS_LANGUAGE");
-        if (code.empty()) {
-            std::string file;
-            if (read_file(in_dir(L"language.txt"), &file, 4096, 0)) {
-                size_t at = 0;
-                while (at < file.size()) {
-                    size_t e = file.find('\n', at);
-                    if (e == std::string::npos) e = file.size();
-                    std::string line = file.substr(at, e - at);
-                    at = e + 1;
-                    if (line.size() >= 3 && (unsigned char)line[0] == 0xEF) line.erase(0, 3);
-                    const size_t s = line.find_first_not_of(" \t\r");
-                    if (s == std::string::npos || line[s] == '#') continue;
-                    code = line.substr(s);
-                    break;
-                }
-            }
-        }
-        return code.size() >= 2 && low(code[0]) == 'p' && low(code[1]) == 't';
-    }();
-    return pt;
 }
 
 /// Sending on: the menu's Enviar relatórios automaticamente row, and not OCARINA_REPORT_UPLOAD=0 / RX_VK_REPORT_UPLOAD=0, and a
@@ -1321,7 +1308,7 @@ std::string log_tail_text() {
 Made make_perf_report(const PerfWin& w, const std::vector<PerfWin>& session, bool at_end, bool baseline, int nth) {
     Made m;
     if (game_dir().empty()) {
-        m.error = "a pasta do jogo não foi encontrada";
+        m.error = two("a pasta do jogo não foi encontrada", "the game folder was not found");
         return m;
     }
     const Scrub scrub;
@@ -1334,7 +1321,8 @@ Made make_perf_report(const PerfWin& w, const std::vector<PerfWin>& session, boo
     const std::wstring path = in_dir(name.c_str()), tmp = path + L".tmp";
     Zip z;
     if (!z.open(tmp)) {
-        m.error = fmt("a pasta do jogo não aceitou o arquivo (erro %lu)", (unsigned long)GetLastError());
+        m.error = two(fmt("a pasta do jogo não aceitou o arquivo (erro %lu)", (unsigned long)GetLastError()),
+                      fmt("the game folder did not take the file (error %lu)", (unsigned long)GetLastError()));
         return m;
     }
     // 1. motivo.txt
@@ -1413,12 +1401,13 @@ Made make_perf_report(const PerfWin& w, const std::vector<PerfWin>& session, boo
     z.add("sistema.txt", scrub(s), true);
     if (!z.close()) {
         DeleteFileW(tmp.c_str());
-        m.error = "o arquivo não pôde ser gravado inteiro (disco cheio?)";
+        m.error = two("o arquivo não pôde ser gravado inteiro (disco cheio?)", "the file could not be written whole (disk full?)");
         return m;
     }
     if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
         DeleteFileW(tmp.c_str());
-        m.error = fmt("o arquivo não pôde ser renomeado (erro %lu)", (unsigned long)GetLastError());
+        m.error = two(fmt("o arquivo não pôde ser renomeado (erro %lu)", (unsigned long)GetLastError()),
+                      fmt("the file could not be renamed (error %lu)", (unsigned long)GetLastError()));
         return m;
     }
     m.ok = true, m.path = path, m.name = utf8(name);
@@ -1479,7 +1468,7 @@ std::string perf_judge(PerfWin w) {
     if (!made) return "";
     const Made m = make_perf_report(w, session, w.last, baseline, nth);
     if (!m.ok) {
-        logf("ocarina: o relatório de desempenho não pôde ser salvo: %s", m.error.c_str());
+        logf("ocarina: o relatório de desempenho não pôde ser salvo: %s", half(m.error, true).c_str());
         return "";
     }
     {
@@ -1737,9 +1726,12 @@ void begin() {
             std::lock_guard lk(st_mu);
             if (m.ok) {
                 st.last = m.path, st.auto_note = true;
-                st.detail = "O jogo fechou com erro na última vez. Relatório salvo: " + m.name;
+                st.detail = two("O jogo fechou com erro na última vez. Relatório salvo: " + m.name,
+                                "The game closed with an error last time. Report saved: " + m.name);
             } else {
-                st.detail = "O jogo fechou com erro na última vez, mas o relatório não pôde ser salvo: " + m.error + ".";
+                st.detail = two("O jogo fechou com erro na última vez, mas o relatório não pôde ser salvo: " + half(m.error, true) + ".",
+                                "The game closed with an error last time, but the report could not be saved: " + half(m.error, false) +
+                                    ".");
             }
         }
         busy.store(false);
@@ -1750,7 +1742,7 @@ void press() {
     if (busy.exchange(true)) return;
     {
         std::lock_guard lk(st_mu);
-        st.detail = "Juntando os arquivos do relatório...";
+        st.detail = two("Juntando os arquivos do relatório...", "Gathering the report's files...");
     }
     std::thread([] {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
@@ -1759,9 +1751,11 @@ void press() {
             std::lock_guard lk(st_mu);
             if (m.ok) {
                 st.last = m.path, st.auto_note = false;
-                st.detail = "Relatório salvo: " + m.name + (upload_on() ? "." : ". Ele está na pasta do jogo; anexe-o ao pedir ajuda.");
+                st.detail = two("Relatório salvo: " + m.name + (upload_on() ? "." : ". Ele está na pasta do jogo; anexe-o ao pedir ajuda."),
+                                "Report saved: " + m.name + (upload_on() ? "." : ". It is in the game folder; attach it when asking for help."));
             } else {
-                st.detail = "Não deu para gerar o relatório: " + m.error + ".";
+                st.detail = two("Não deu para gerar o relatório: " + half(m.error, true) + ".",
+                                "Could not make the report: " + half(m.error, false) + ".");
             }
         }
         if (m.ok) open_in_explorer(m.path), deliver(m, false);
@@ -1781,21 +1775,27 @@ void open_folder() {
 
 View view() {
     View v;
-    const bool b = busy.load();
+    const bool b = busy.load(), pt = menu_portuguese();   // (the menu's language now: the detail was kept in both)
     std::lock_guard lk(st_mu);
-    v.button = b ? "Gerando..." : "Gerar relatório";
+    v.button = b ? (pt ? "Gerando..." : "Making...") : (pt ? "Gerar relatório" : "Make report");
     v.can_press = !b;
-    v.folder = "Abrir pasta";
+    v.folder = pt ? "Abrir pasta" : "Open folder";
     v.can_open = !game_dir().empty();
-    v.detail = st.detail;
-    if (!st.last.empty() && v.detail.find("Relatório salvo") != std::string::npos) {   // (what became of its sending: ocarina_upload.h)
+    v.detail = half(st.detail, pt);
+    if (!st.last.empty() && half(st.detail, true).find("Relatório salvo") != std::string::npos) {   // (what became of its sending: ocarina_upload.h)
         const std::wstring& p = st.last;
         switch (ocarina_upload::fate(utf8(p.substr(p.find_last_of(L"\\/") + 1)))) {
             case ocarina_upload::Fate::kWaiting:
-            case ocarina_upload::Fate::kSending: v.detail += " Enviando para o Ocarina Engine..."; break;
-            case ocarina_upload::Fate::kSent: v.detail += " Enviado para o Ocarina Engine."; break;
-            case ocarina_upload::Fate::kRetry: v.detail += " Sem conexão com o Ocarina Engine agora: vai no próximo início."; break;
-            case ocarina_upload::Fate::kRefused: v.detail += " O Ocarina Engine não aceitou o envio; anexe o arquivo ao pedir ajuda."; break;
+            case ocarina_upload::Fate::kSending: v.detail += pt ? " Enviando para o Ocarina Engine..." : " Sending to Ocarina Engine..."; break;
+            case ocarina_upload::Fate::kSent: v.detail += pt ? " Enviado para o Ocarina Engine." : " Sent to Ocarina Engine."; break;
+            case ocarina_upload::Fate::kRetry:
+                v.detail += pt ? " Sem conexão com o Ocarina Engine agora: vai no próximo início."
+                               : " No connection to Ocarina Engine now: it goes at the next start.";
+                break;
+            case ocarina_upload::Fate::kRefused:
+                v.detail += pt ? " O Ocarina Engine não aceitou o envio; anexe o arquivo ao pedir ajuda."
+                               : " Ocarina Engine did not accept it; attach the file when asking for help.";
+                break;
             case ocarina_upload::Fate::kNone: break;
         }
     }
@@ -1806,13 +1806,17 @@ bool toast(std::string* text, std::string* sub) {
     std::lock_guard lk(st_mu);
     const int64_t now = steady_ns();
     if (mark_note_from && now - mark_note_from < 2'500'000'000) {
-        *text = mark_note, *sub = "Foto e log guardados em ocarina-marcas; vão no próximo relatório.";
+        *text = pick(mark_note);
+        *sub = menu_portuguese() ? "Foto e log guardados em ocarina-marcas; vão no próximo relatório."
+                                 : "Picture and log saved in ocarina-marcas; they go in the next report.";
         return true;
     }
     if (st.auto_note) {
         if (!toast_from) toast_from = now;
         if (now - toast_from <= 10'000'000'000) {
-            *text = st.detail, *sub = "Insert ou F1 > Gameplay > Ocarina Engine > Pasta do relatório abre a pasta.";
+            *text = pick(st.detail);
+            *sub = menu_portuguese() ? "Insert ou F1 > Jogo > Ocarina Engine > Pasta do relatório abre a pasta."
+                                     : "Insert or F1 > Gameplay > Ocarina Engine > Report folder opens the folder.";
             return true;
         }
     }
@@ -1828,22 +1832,22 @@ bool toast(std::string* text, std::string* sub) {
         if (level == 3) ocarina_upload::allow(), perf_consent.store(true);
     }
     if (level == 3) {
-        if (game_pt()) {
+        if (menu_portuguese()) {   // (the menu's language: the game's or Windows', or the Language row's)
             *text = "Os relatórios de erro e de desempenho (travadas e FPS) vão para o Ocarina Engine, leves e sem dados pessoais.";
-            *sub = "Para desligar: Insert/F1 > Gameplay > Enviar relatórios automaticamente.";
+            *sub = "Para desligar: Insert/F1 > Jogo > Envio automático.";
         } else {
             *text = "Error and performance reports (stutters and FPS) are sent to Ocarina Engine: small, with no personal data.";
-            *sub = "To turn this off: Insert/F1 > Gameplay > Enviar relatórios automaticamente.";
+            *sub = "To turn this off: Insert/F1 > Gameplay > Send reports automatically.";
         }
         return true;
     }
-    if (game_pt()) {
-        *text = "O Ocarina Engine gera relatórios de erro automaticamente para melhorar o jogo. Para desligar: Insert/F1 > Gameplay > "
+    if (menu_portuguese()) {
+        *text = "O Ocarina Engine gera relatórios de erro automaticamente para melhorar o jogo. Para desligar: Insert/F1 > Jogo > "
                 "Relatórios automáticos.";
         *sub = "Eles ficam só na pasta do jogo; nada é enviado pela internet.";
     } else {
         *text = "Ocarina Engine saves error reports automatically to help improve the game. To turn this off: Insert/F1 > Gameplay > "
-                "Relatórios automáticos.";
+                "Automatic reports.";
         *sub = "They stay in the game folder; nothing is sent over the internet.";
     }
     return true;
@@ -1881,7 +1885,7 @@ void mark_bug() {
     {
         std::lock_guard lk(st_mu);
         n = ++marks_made;
-        mark_note = fmt("Bug marcado (%d)", n), mark_note_from = steady_ns();
+        mark_note = two(fmt("Bug marcado (%d)", n), fmt("Bug marked (%d)", n)), mark_note_from = steady_ns();
     }
     logf("ocarina: bug marcado (%d), quadro %llu", n, (unsigned long long)frame_no);
     std::thread([t, frame_no, n] {
@@ -1925,9 +1929,10 @@ void press() {}
 void open_folder() {}
 View view() {
     View v;
-    v.button = "Gerar relatório";
-    v.folder = "Abrir pasta";
-    v.detail = "O relatório pelo menu é só no Windows.";
+    const bool pt = menu_portuguese();
+    v.button = pt ? "Gerar relatório" : "Make report";
+    v.folder = pt ? "Abrir pasta" : "Open folder";
+    v.detail = pt ? "O relatório pelo menu é só no Windows." : "The report from the menu is Windows only.";
     return v;
 }
 bool toast(std::string*, std::string*) { return false; }
@@ -1938,15 +1943,23 @@ void shot_taken(std::vector<uint8_t>, uint32_t, uint32_t) {}
 #endif
 
 const char* sample(int k) {
-    static const char* const t[] = {
+    // (in the menu's language: the help box keeps the height of the longest)
+    static const char* const t[2][5] = {{
+        "The game closed with an error last time. Report saved: ocarina-relatorio-auto-20261111-235959-2.zip",
+        "The game closed with an error last time, but the report could not be saved: the file could not be written whole (disk full?).",
+        "Report saved: ocarina-relatorio-20261111-235959-2.zip. It is in the game folder; attach it when asking for help.",
+        "Report saved: ocarina-relatorio-20261111-235959-2.zip. Ocarina Engine did not accept it; attach the file when asking for help.",
+        "The game closed with an error last time. Report saved: ocarina-relatorio-auto-20261111-235959-2.zip No connection to Ocarina "
+        "Engine now: it goes at the next start.",
+    }, {
         "O jogo fechou com erro na última vez. Relatório salvo: ocarina-relatorio-auto-20261111-235959-2.zip",
         "O jogo fechou com erro na última vez, mas o relatório não pôde ser salvo: o arquivo não pôde ser gravado inteiro (disco cheio?).",
         "Relatório salvo: ocarina-relatorio-20261111-235959-2.zip. Ele está na pasta do jogo; anexe-o ao pedir ajuda.",
         "Relatório salvo: ocarina-relatorio-20261111-235959-2.zip. O Ocarina Engine não aceitou o envio; anexe o arquivo ao pedir ajuda.",
         "O jogo fechou com erro na última vez. Relatório salvo: ocarina-relatorio-auto-20261111-235959-2.zip Sem conexão com o Ocarina "
         "Engine agora: vai no próximo início.",
-    };
-    return k >= 0 && k < (int)(sizeof t / sizeof t[0]) ? t[k] : nullptr;
+    }};
+    return k >= 0 && k < 5 ? t[menu_portuguese() ? 1 : 0][k] : nullptr;
 }
 
 } // namespace mkwvk::ocarina_report

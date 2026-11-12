@@ -105,12 +105,11 @@ const char* tx_framegen(int v) {
     return t[v];
 }
 const char* tx_onoff(int v) { return v ? "On" : "Off"; }
-const char* tx_ligado(int v) { return v ? "Ligado" : "Desligado"; }   // (ocarina: the Portuguese rows)
 // (ocarina) The Gameplay tab's update rows (ocarina_update.h): no value of their own; told apart by their names' addresses.
 // Their hint, under the help, is what the update says now (variant -1), or its longest lines (measure_help)
 const char kUpdateHeading[] = "Ocarina Engine v" OCARINA_VERSION;
-const char kUpdateVersionRow[] = "Versão";
-const char kUpdateButtonRow[] = "Atualização";
+const char kUpdateVersionRow[] = "Version";   // (ocarina: shown through T, Versão and Atualização in Portuguese)
+const char kUpdateButtonRow[] = "Update";
 const char* update_hint(int, int variant) {
     if (variant >= 0) return ocarina_update::sample(variant);
     static std::string now;
@@ -118,8 +117,8 @@ const char* update_hint(int, int variant) {
     return now.empty() ? nullptr : now.c_str();
 }
 // (ocarina) The report's rows (ocarina_report.h), told apart the same way; their hint is the report's line now, or its longest
-const char kReportRow[] = "Relatório";
-const char kReportFolderRow[] = "Pasta do relatório";
+const char kReportRow[] = "Report";   // (ocarina: Relatório and Pasta do relatório in Portuguese, through T)
+const char kReportFolderRow[] = "Report folder";
 const char* report_hint(int, int variant) {
     if (variant >= 0) return ocarina_report::sample(variant);
     static std::string now;
@@ -684,7 +683,7 @@ const char* tx_menu_language(int v) {
     static const char* const t[] = {"Auto", "Português", "English"};
     return t[std::clamp(v, 0, 2)];
 }
-MENU_HINTS(hn_menu_language, 0, "The game's language: Portuguese when the game is in Portuguese, else English.", nullptr, nullptr)
+MENU_HINTS(hn_menu_language, 0, "Portuguese when the game or Windows is in Portuguese, else English.", nullptr, nullptr)
 MENU_HINTS(hn_robust, 0, "On, on every card.", "Can be faster on some NVIDIA cards.", "Always on.")
 MENU_HINTS(hn_mesh_mode, 0, "The GPU's own mesh shaders where it has them, the compute path where it has not.",
            "The GPU's own mesh shaders for every draw. A GPU without them still uses the compute path.",
@@ -900,31 +899,30 @@ Row rows[] = {
     // (ocarina) the update: a heading, the version and what GitHub has, the button (vk_menu.cpp is_update_row)
     {TAB_GAMEPLAY, kUpdateHeading, nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},
     {TAB_GAMEPLAY, kUpdateVersionRow, nullptr, 0, 0, 0, nullptr,
-     "A versão do Ocarina Engine deste jogo e a mais nova publicada no GitHub. O jogo pergunta uma vez a cada início, sem atrasar "
-     "nada, e não manda nenhum dado seu.", update_hint, false, true},
+     "This game's Ocarina Engine version and the newest one on GitHub. The game asks once at each start, without slowing "
+     "anything down, and sends none of your data.", update_hint, false, true},
     {TAB_GAMEPLAY, kUpdateButtonRow, nullptr, 0, 0, 0, nullptr,
-     "Procurar atualização pergunta ao GitHub agora. Com uma versão nova, Atualizar baixa a hookshot_vk.dll, confere se ela serve "
-     "para este jogo e a coloca no lugar; ela vale a partir do próximo início.", update_hint, false, true},
+     "Check for updates asks GitHub now. With a newer version, Update now downloads hookshot_vk.dll, checks that it fits this "
+     "game and puts it in place; it takes effect from the next start.", update_hint, false, true},
     // (ocarina) the problem report: the button, then the folder (vk_menu.cpp is_report_row)
     {TAB_GAMEPLAY, kReportRow, nullptr, 0, 0, 0, nullptr,
-     "Gerar relatório junta num arquivo .zip, na pasta do jogo, o que precisamos para entender um problema: os logs do jogo, uma "
-     "foto da tela, o tempo de cada quadro dos últimos 3 minutos e das travadas, os bugs marcados com F9, suas opções, o "
-     "hookshot_env.txt, a placa de vídeo, o processador, a memória e o Windows. Com Enviar relatórios automaticamente ligado, ele "
-     "também vai sozinho para o Ocarina Engine; desligado, é você quem anexa o arquivo. Seu nome de usuário e suas pastas pessoais "
-     "ficam de fora.",
+     "Make report puts in a .zip file, in the game folder, what we need to understand a problem: the game's logs, a picture of "
+     "the screen, each frame's time over the last 3 minutes and around the stutters, the bugs marked with F9, your settings, "
+     "hookshot_env.txt, the graphics card, the processor, the memory and Windows. With Send reports automatically on, it also "
+     "goes to Ocarina Engine by itself; off, you attach the file yourself. Your user name and personal folders are left out.",
      report_hint, false, true},
     {TAB_GAMEPLAY, kReportFolderRow, nullptr, 0, 0, 0, nullptr,
-     "Abre a pasta do jogo no Explorador com o último relatório selecionado. Viu um bug na tela? Aperte F9 na hora: a foto e o "
-     "momento vão no próximo relatório (RX_VK_BUG_KEY troca a tecla; 0 desliga).",
+     "Opens the game folder in Explorer with the last report selected. Saw a bug on screen? Press F9 right then: the picture and "
+     "the moment go in the next report (RX_VK_BUG_KEY changes the key; 0 turns it off).",
      report_hint, false, true},
-    {TAB_GAMEPLAY, "Relatórios automáticos", &opts.auto_report, 0, 1, 1, tx_ligado,
+    {TAB_GAMEPLAY, "Automatic reports", &opts.auto_report, 0, 1, 1, tx_onoff,   // (its ini key: ini_key, auto_report)
      // (ocarina: the hint in English, its Portuguese in vk_menu_pt.h)
      "On: when the game closes with an error (it froze, the graphics card stopped or it was forced closed), the next start saves a "
      ".zip report in the game folder and says so on screen; at most 5 are kept. With sending on, stutters and low FPS also make "
-     "small performance reports, with no picture. Off: no automatic reports; Gerar relatório still works.", nullptr, false, true},
-    {TAB_GAMEPLAY, "Enviar relatórios automaticamente", &opts.report_upload, 0, 1, 1, tx_ligado,
+     "small performance reports, with no picture. Off: no automatic reports; Make report still works.", nullptr, false, true},
+    {TAB_GAMEPLAY, "Send reports automatically", &opts.report_upload, 0, 1, 1, tx_onoff,
      "On: each report goes over the internet to Ocarina Engine, so the problem reaches whoever fixes it without you attaching "
-     "anything: the automatic one after an error, the Gerar relatório one, and small performance reports when the game stutters or "
+     "anything: the automatic one after an error, the Make report one, and small performance reports when the game stutters or "
      "the FPS drops (at most 7 a session). Only the report's files go, without your user name, the computer's name or your "
      "personal folders. With no internet, it goes at the next start. Off: nothing is sent; the reports stay in the game folder only.",
      nullptr, false, true},
@@ -1635,8 +1633,18 @@ bool game_pt() {
     }();
     return pt;
 }
-/// (ocarina) The menu in Portuguese: the Language row's Português, or its Auto with the game in Portuguese
-bool menu_pt() { return opts.menu_language == 1 || (opts.menu_language != 2 && game_pt()); }
+/// (ocarina) Windows' own display language is Portuguese (GetUserDefaultUILanguage: pt-BR or pt-PT). Read once
+bool windows_pt() {
+#ifdef _WIN32
+    static const bool pt = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_PORTUGUESE;
+    return pt;
+#else
+    return false;
+#endif
+}
+/// (ocarina) The menu in Portuguese: the Language row's Português, or its Auto with the game or Windows in Portuguese (a tester
+/// whose game and Windows are in any other language gets English)
+bool menu_pt() { return opts.menu_language == 1 || (opts.menu_language != 2 && (game_pt() || windows_pt())); }
 /// (ocarina) A text of the menu's own, as shown: in Portuguese its translation (vk_menu_pt.h: whole, or part by part), else
 /// as it is. A text the table cannot translate (a GPU's or a microphone's name, a text already in Portuguese) as it is too.
 /// What it returns lasts: each text is translated once and kept (a few hundred at most)
@@ -3301,6 +3309,7 @@ void cheat_press(int i, const bool* press, bool& changed) {
 }
 
 bool menu_report_notice_seen(int level) { return report_notice.load() >= level; }
+bool menu_portuguese() { return menu_pt(); }
 void menu_report_notice_done(int level) { report_notice_now.store(level); }
 
 void menu_tick() {

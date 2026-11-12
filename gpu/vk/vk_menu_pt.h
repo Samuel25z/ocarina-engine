@@ -321,8 +321,8 @@ inline constexpr Pair kPairs[] = {
 
     // ---- Gameplay ----
     {"The language of this menu.", "O idioma deste menu."},
-    {"The game's language: Portuguese when the game is in Portuguese, else English.",
-     "O idioma do jogo: português quando o jogo está em português; senão, inglês."},
+    {"Portuguese when the game or Windows is in Portuguese, else English.",
+     "Português quando o jogo ou o Windows está em português; senão, inglês."},
     {"FPS counter", "Contador de FPS"},
     {"Frames per second in the top right corner.", "Quadros por segundo no canto de cima, à direita."},
     {"With frame generation on, the game's own rate too.", "Com a Geração de quadros ligada, mostra também o FPS do próprio jogo."},
@@ -363,15 +363,38 @@ inline constexpr Pair kPairs[] = {
     {"Quit", "Sair"},
     {"Save your progress first. Press Enter or A twice to quit. Esc or B cancels.",
      "Salve o seu progresso antes. Aperte Enter ou A duas vezes para sair. Esc ou B cancela."},
-    // (ocarina: the reports' rows, their names in Portuguese in both languages)
+    // (ocarina: the update's and the reports' rows)
+    {"Version", "Versão"}, {"Update", "Atualização"}, {"Report", "Relatório"}, {"Report folder", "Pasta do relatório"},
+    {"Automatic reports", "Relatórios automáticos"}, {"Send reports automatically", "Envio automático"},
+    {"This game's Ocarina Engine version and the newest one on GitHub. The game asks once at each start, without slowing "
+     "anything down, and sends none of your data.",
+     "A versão do Ocarina Engine deste jogo e a mais nova publicada no GitHub. O jogo pergunta uma vez a cada início, sem atrasar "
+     "nada, e não manda nenhum dado seu."},
+    {"Check for updates asks GitHub now. With a newer version, Update now downloads hookshot_vk.dll, checks that it fits this "
+     "game and puts it in place; it takes effect from the next start.",
+     "Procurar atualização pergunta ao GitHub agora. Com uma versão nova, Atualizar baixa a hookshot_vk.dll, confere se ela serve "
+     "para este jogo e a coloca no lugar; ela vale a partir do próximo início."},
+    {"Make report puts in a .zip file, in the game folder, what we need to understand a problem: the game's logs, a picture of "
+     "the screen, each frame's time over the last 3 minutes and around the stutters, the bugs marked with F9, your settings, "
+     "hookshot_env.txt, the graphics card, the processor, the memory and Windows. With Send reports automatically on, it also "
+     "goes to Ocarina Engine by itself; off, you attach the file yourself. Your user name and personal folders are left out.",
+     "Gerar relatório junta num arquivo .zip, na pasta do jogo, o que precisamos para entender um problema: os logs do jogo, uma "
+     "foto da tela, o tempo de cada quadro dos últimos 3 minutos e das travadas, os bugs marcados com F9, suas opções, o "
+     "hookshot_env.txt, a placa de vídeo, o processador, a memória e o Windows. Com o Envio automático ligado, ele "
+     "também vai sozinho para o Ocarina Engine; desligado, é você quem anexa o arquivo. Seu nome de usuário e suas pastas pessoais "
+     "ficam de fora."},
+    {"Opens the game folder in Explorer with the last report selected. Saw a bug on screen? Press F9 right then: the picture and "
+     "the moment go in the next report (RX_VK_BUG_KEY changes the key; 0 turns it off).",
+     "Abre a pasta do jogo no Explorador com o último relatório selecionado. Viu um bug na tela? Aperte F9 na hora: a foto e o "
+     "momento vão no próximo relatório (RX_VK_BUG_KEY troca a tecla; 0 desliga)."},
     {"On: when the game closes with an error (it froze, the graphics card stopped or it was forced closed), the next start saves a "
      ".zip report in the game folder and says so on screen; at most 5 are kept. With sending on, stutters and low FPS also make "
-     "small performance reports, with no picture. Off: no automatic reports; Gerar relatório still works.",
+     "small performance reports, with no picture. Off: no automatic reports; Make report still works.",
      "Ligado: quando o jogo fecha com erro (travou, a placa de vídeo parou ou foi fechado à força), o próximo início salva um "
      "relatório .zip na pasta do jogo e avisa na tela; ficam no máximo 5. Com o envio ligado, travadas e FPS baixo também geram "
      "relatórios de desempenho leves, sem foto. Desligado: nenhum relatório automático; Gerar relatório continua funcionando."},
     {"On: each report goes over the internet to Ocarina Engine, so the problem reaches whoever fixes it without you attaching "
-     "anything: the automatic one after an error, the Gerar relatório one, and small performance reports when the game stutters or "
+     "anything: the automatic one after an error, the Make report one, and small performance reports when the game stutters or "
      "the FPS drops (at most 7 a session). Only the report's files go, without your user name, the computer's name or your "
      "personal folders. With no internet, it goes at the next start. Off: nothing is sent; the reports stay in the game folder only.",
      "Ligado: cada relatório vai pela internet para o Ocarina Engine, para o problema chegar a quem corrige sem você precisar anexar "

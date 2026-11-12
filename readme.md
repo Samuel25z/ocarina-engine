@@ -8,6 +8,11 @@ Zelda: Ocarina of Time (Switch 2) no PC, em placas comuns, não só nas topo de 
 O Ocarina Engine não traz o jogo. Você monta o jogo com o HookshotBuilder a partir da sua própria cópia, e o Ocarina Engine
 troca só o renderizador (`hookshot_vk.dll`).
 
+## v0.4.5: menu em inglês para quem não usa português
+
+- O idioma Automático fica em português quando o jogo ou o Windows estão em português; nos outros casos, em inglês (Idioma / Language escolhe à mão). As linhas de atualização e de relatório e os avisos agora têm as duas línguas.
+- Placas de 8 GB: os espelhos voltam ao teto de 1,5 GB em PCs de 16 GB (os 2 GB da v0.4.3 espremiam as texturas).
+
 ## v0.4.4: menos RAM e relatório de travadas automático
 
 - **Menos RAM:** o cache de pipelines do driver da abertura é solto quando o jogo começa: 1,4 a 2,0 GB a menos no Burgo. `RX_VK_PCACHE_RELEASE=0` desliga.
