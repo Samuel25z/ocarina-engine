@@ -8,6 +8,11 @@ Zelda: Ocarina of Time (Switch 2) no PC, em placas comuns, não só nas topo de 
 O Ocarina Engine não traz o jogo. Você monta o jogo com o HookshotBuilder a partir da sua própria cópia, e o Ocarina Engine
 troca só o renderizador (`hookshot_vk.dll`).
 
+## v0.4.1: correção da v0.4.0
+
+- **Menos travadas em placas de 8 GB ou mais:** o teto de 1,5 GB de texturas vale só para placas de até 6,5 GB, onde foi medido.
+- **AMD RX 6000 (RX 6400 a 6950 XT):** caminho seguro dos efeitos de malha, mesmo com Mesh shaders em Nativo (a RX 6600 perdia a placa, e às vezes travava o PC, logo depois de carregar o save).
+
 ## Novo na v0.4: replay mais leve, sem a névoa de um quadro e relatório de problema
 
 - **Compilação guiada pelo próprio jogo (PGO):** o renderizador foi otimizado pelo caminho que o jogo realmente usa. No notebook com RTX 4050, praça do Burgo: o replay (a parte que transforma os comandos do jogo em Vulkan) ficou ~30% mais rápido e o FPS subiu 5 a 7%.
