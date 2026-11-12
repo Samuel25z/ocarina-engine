@@ -58,7 +58,7 @@ O Ocarina Engine troca só o renderizador (`hookshot_vk.dll`) do jogo montado pe
 2. Feche o jogo.
 3. Na pasta do jogo, ache o `hookshot_vk.dll` (nos builders novos ele fica na subpasta `bin`). Guarde uma cópia dele, se quiser voltar.
 4. Baixe o `hookshot_vk.dll` da [última release](https://github.com/Samuel25z/ocarina-engine/releases/latest) e coloque por cima.
-5. Baixe o `hookshot_env.txt` e coloque ao lado do `hookshot.exe`.
+5. Baixe o `hookshot_env.txt` e coloque **na mesma pasta do `hookshot_vk.dll`** (nos builders novos, dentro da `bin`: o `hookshot.exe` da raiz é só o lançador; o jogo de verdade é o `bin\hookshot.exe`, e é ele que lê o arquivo).
 6. Abra o jogo. Na primeira vez ele prepara os shaders de novo (alguns minutos). Seus saves e suas opções continuam os mesmos.
 
 ### Começando do zero (nunca usei o Hookshot)
@@ -72,7 +72,7 @@ O Ocarina Engine troca só o renderizador (`hookshot_vk.dll`) do jogo montado pe
 - Se o jogo não abrir depois da troca, a versão do builder não casa com a da DLL: use o builder indicado na release.
 
 ### English (short)
-**Already on Hookshot:** HookshotBuilder **v2.1.0** required. Close the game, replace `hookshot_vk.dll` (game folder or its `bin` subfolder) with the one from the [latest release](https://github.com/Samuel25z/ocarina-engine/releases/latest), put `hookshot_env.txt` next to `hookshot.exe`, start the game (it prepares shaders once). Saves and settings are kept.
+**Already on Hookshot:** HookshotBuilder **v2.1.0** required. Close the game, replace `hookshot_vk.dll` (game folder or its `bin` subfolder) with the one from the [latest release](https://github.com/Samuel25z/ocarina-engine/releases/latest), put `hookshot_env.txt` in the same folder as `hookshot_vk.dll` (the `bin` subfolder on newer builders: the root `hookshot.exe` is only the launcher), start the game (it prepares shaders once). Saves and settings are kept.
 **From scratch:** build the game from your own `.nup` with [HookshotBuilder v2.1.0](https://github.com/NotRexed/Hookshot/releases/tag/v2.1.0), then do the above.
 **Updates:** from v0.3 on, the game offers new versions in **Insert/F1 > Gameplay**. Updating Hookshot through its builder puts the original DLL back; just replace it again.
 
