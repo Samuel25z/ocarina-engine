@@ -4495,7 +4495,11 @@ void texture_frame(uint64_t completed) {
         // can. 1500 MB of textures on a GTX 1660 Super (6 GB) measured the same FPS and stutters as ~2000 MB, with no blur, in the Burgo
         // and in Hyrule Field (bench 2, PEDIDO-19), and 1400 = 1900 MB on the RTX 4050 laptop. RX_VK_TEX_CEIL_MB=<MB> another
         // ceiling, 0 none; RX_VK_VRAM_MB is not capped
-        static const uint64_t ceil_mb = getenv("RX_VK_TEX_CEIL_MB") ? (uint64_t)atoll(getenv("RX_VK_TEX_CEIL_MB")) : 1536;
+        // (v0.4.1: only on cards of 6.5 GB or less, where it was measured. On an 8 GB card the share it replaced was ~3.3 GB, and a
+        // tester's RX/RTX 8 GB had many more stutters with 1536 MB: textures the game still used dropped and made again. Bigger
+        // cards keep the share until a ceiling is measured there)
+        static const uint64_t ceil_mb = getenv("RX_VK_TEX_CEIL_MB") ? (uint64_t)atoll(getenv("RX_VK_TEX_CEIL_MB"))
+                                      : known && allowed <= (6656ull << 20) ? 1536 : 0;
         static bool told_ceil;
         if (!getenv("RX_VK_VRAM_MB") && ceil_mb && own > (ceil_mb << 20)) {
             if (!told_ceil) told_ceil = true, logf("vk: textures at most %llu MB, what the game needs (RX_VK_TEX_CEIL_MB=<MB>: other, 0: none)", (unsigned long long)ceil_mb);
