@@ -2304,17 +2304,47 @@ std::atomic<int64_t> st_cap_given_n{0}, st_cap_given_bytes{0};
 std::atomic<unsigned> prep_allowed_now{0}, prep_allowed_least{UINT32_MAX}, prep_of{0};
 }   // namespace
 
+/// (Ocarina Engine) the system's memory: physical total and free, the commit's limit and what is left of it (Windows:
+/// GlobalMemoryStatusEx; Linux: /proc/meminfo, MemTotal / MemAvailable / CommitLimit - Committed_AS). False when unknown
+bool sys_memory(uint64_t& phys_total, uint64_t& phys_avail, uint64_t& commit_limit, uint64_t& commit_avail) {
+#ifdef _WIN32
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof ms;
+    if (!GlobalMemoryStatusEx(&ms)) return false;
+    phys_total = ms.ullTotalPhys, phys_avail = ms.ullAvailPhys;
+    commit_limit = ms.ullTotalPageFile, commit_avail = ms.ullAvailPageFile;   // (the "page file" figures are the commit's)
+    return true;
+#else
+    FILE* f = fopen("/proc/meminfo", "r");
+    if (!f) return false;
+    uint64_t total = 0, avail = 0, limit = 0, used = 0;
+    char line[256];
+    while (fgets(line, sizeof line, f)) {
+        unsigned long long kb = 0;
+        if (sscanf(line, "MemTotal: %llu", &kb) == 1) total = kb << 10;
+        else if (sscanf(line, "MemAvailable: %llu", &kb) == 1) avail = kb << 10;
+        else if (sscanf(line, "CommitLimit: %llu", &kb) == 1) limit = kb << 10;
+        else if (sscanf(line, "Committed_AS: %llu", &kb) == 1) used = kb << 10;
+    }
+    fclose(f);
+    if (!total) return false;
+    phys_total = total, phys_avail = avail;
+    // (Linux overcommits by default: the commit limit is advice there, not a wall; the RAM free plus the swap stands in for it)
+    commit_limit = limit ? limit : total;
+    commit_avail = limit > used ? limit - used : avail;
+    return true;
+#endif
+}
+
 RamState ram_state() {
     std::lock_guard lk(ram_mu);
     const int64_t now = ram_now_ms();
     if (now - ram_read_ms < 250) return ram_cached;
     ram_read_ms = now;
-    MEMORYSTATUSEX ms{};
-    ms.dwLength = sizeof ms;
     RamState s;
-    if (GlobalMemoryStatusEx(&ms)) {
-        s.phys_total = ms.ullTotalPhys, s.phys_avail = ms.ullAvailPhys;
-        s.commit_limit = ms.ullTotalPageFile, s.commit_avail = ms.ullAvailPageFile;   // (the "page file" figures are the commit's)
+    {
+        uint64_t pt = 0, pa = 0, cl = 0, ca = 0;
+        if (sys_memory(pt, pa, cl, ca)) s.phys_total = pt, s.phys_avail = pa, s.commit_limit = cl, s.commit_avail = ca;
     }
     PROCESS_MEMORY_COUNTERS_EX pm{};
     pm.cb = sizeof pm;
@@ -2397,9 +2427,8 @@ uint64_t mirror_budget_uncut() {
         // (Ocarina Engine) on PCs of 16 GB of RAM or less, 1536 MB at most (what took the 6 GB laptop from 22 to 34 fps): an 8 GB
         // card kept 2 GB of mirrors, and the VRAM is commit too (WDDM), there where it ran out. RX_VK_MIRROR_RAM_CAP=0: as before
         if (!getenv("RX_VK_MIRROR_RAM_CAP") || atoi(getenv("RX_VK_MIRROR_RAM_CAP")) != 0) {
-            MEMORYSTATUSEX ms{};
-            ms.dwLength = sizeof ms;
-            if (GlobalMemoryStatusEx(&ms) && ms.ullTotalPhys && ms.ullTotalPhys <= (17ull << 30)) most = 1536ull << 20;
+            uint64_t pt = 0, pa = 0, cl = 0, ca = 0;
+            if (sys_memory(pt, pa, cl, ca) && pt && pt <= (17ull << 30)) most = 1536ull << 20;
         }
         return vram ? std::min<uint64_t>(vram / 4, most) : most;
     }();
