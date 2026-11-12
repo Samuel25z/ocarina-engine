@@ -459,7 +459,8 @@ bool create_device() {
     dev.mesh_fallback = !dev.mesh_shader && f12.bufferDeviceAddress && !getenv("RX_VK_NO_MESH_FALLBACK");
     if (dev.mesh_fallback) logf("vk: no mesh shaders: task and mesh programs run as compute shaders (issue 640 fallback)");
     bool task_mesh_fallback = false;
-#ifdef _WIN32
+    // (Ocarina Engine: on Linux too, not only Windows: an RX 6600M on RADV lost the device, and the desktop session with it, on the
+    // first DrawMeshTasks, 2026-11-12)
     // Navi 22 can time out on task + mesh draws in the AMD Windows driver (issue 996). (Ocarina Engine) the whole RDNA2 family with
     // it: Navi 21 lost the device at Hyrule Castle's entrance and Navi 23 (RX 6600) on its first task + mesh draws (reports from the
     // Mako fork, 2026-11-12), the same mesh path. Navi 21 0x73a0-0x73bf, Navi 22 0x73c0-0x73df, Navi 23 0x73e0-0x73ff, Navi 24
@@ -468,7 +469,6 @@ bool create_device() {
         const uint32_t id = dev.props.deviceID;
         task_mesh_fallback = dev.props.vendorID == 0x1002 && ((id >= 0x73a0 && id <= 0x73ff) || (id >= 0x7420 && id <= 0x743f));
     }
-#endif
     // (Native: the card's own mesh shaders for every draw. Ocarina Engine: not on RDNA2, where the native task + mesh draws take the
     // whole PC down (an RX 6600 with Native chosen hung the machine on its first DrawMeshTasks, 2026-11-12, a hard reset);
     // RX_VK_TASK_MESH_FALLBACK=0 still forces native there)
