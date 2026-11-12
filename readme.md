@@ -10,7 +10,6 @@ troca só o renderizador (`hookshot_vk.dll`).
 
 ## v0.4.1: correção da v0.4.0
 
-- **Menos travadas em placas de 8 GB ou mais:** o teto de 1,5 GB de texturas vale só para placas de até 6,5 GB, onde foi medido.
 - **AMD RX 6000 (RX 6400 a 6950 XT):** caminho seguro dos efeitos de malha, mesmo com Mesh shaders em Nativo (a RX 6600 perdia a placa, e às vezes travava o PC, logo depois de carregar o save).
 
 ## Novo na v0.4: replay mais leve, sem a névoa de um quadro e relatório de problema
