@@ -10,6 +10,8 @@ troca só o renderizador (`hookshot_vk.dll`).
 
 ## Novo na v0.3: menos travadas ainda, e atualização pelo menu
 
+**v0.3.1:** a trava de VRAM da v0.3.0 deixava o jogo mais lento em algumas placas e agora vem desligada (`RX_VK_VRAM_GOV=1` liga). A VRAM cai pelo **detalhe de textura**: em placas de até 6,5 GB, as texturas ASTC grandes sobem sem o nível de detalhe maior (`RX_VK_TEX_DETAIL=0` desliga). Na GTX 1660 Super, no Burgo: ~740 MB a menos de VRAM, abaixo do limite da placa, e 38% menos quadros acima de 50 ms. Saíram também as correções trazidas do Hookshot oficial e do Mako, que custavam FPS.
+
 Medido na GTX 1660 Super (Burgo de Hyrule, mesmo caminho repetido, 3 pares alternados de 200 s): a v0.3 contra a mesma DLL com as correções desligadas (= v0.2):
 **quadros acima de 50 ms 174 contra 292 (-40%), acima de 100 ms 15 contra 19 (-22%), 28,9 contra 27,3 fps.** As travadas de 110 ms por sincronismo de memória sumiram.
 

@@ -51,6 +51,7 @@
 #include "astc_bc_policy.h"
 #include "vram_compact.h"
 #include "vram_gov.h"
+#include "tex_detail.h"
 #include "keep_rendered.h"
 #include "target_overlap.h"
 #include "host_shaders/block_linear_unswizzle_2d_comp_spv.h"
@@ -1711,76 +1712,6 @@ bool upload(Texture& tex, const Ranges* dirty) {
     }
     return ok;
 }
-/// (hookshot) A big texture whose whole storage is zero: the image cleared to zero on the GPU, not unswizzled on the CPU. All-zero
-/// bits are 0 in every format this path takes (not ASTC or BC, not one widened on the way), so the clear is what the unswizzle
-/// would have made. The game's shadow map (12288 x 12288 D16, 288 MB, its storage fresh and zero) took 73 ms of the replay
-/// thread at a scene change; the check reads the storage once, on several threads, and stops at the first byte that is not 0.
-/// RX_VK_ZERO_UPLOAD=0: off
-bool upload_all_zero(Texture& tex, uint64_t total, const Ranges* dirty, bool widened_format) {
-    static const bool off = getenv("RX_VK_ZERO_UPLOAD") && atoi(getenv("RX_VK_ZERO_UPLOAD")) == 0;
-    if (off || total < (32ull << 20) || tex.astc || tex.bc || tex.sparse || widened_format || !tex.image ||
-        tex.type == VK_IMAGE_TYPE_3D || is_bc(tex.format) || is_astc(tex.format))
-        return false;
-    if (dirty) {   // (only an upload of the whole storage: a part of it says nothing of the rest)
-        uint64_t covered = 0;
-        for (const auto& r : *dirty) covered += std::min(r.second, total) - std::min(r.first, total);
-        if (covered < total) return false;
-    }
-    // (live memory, as the GPU unswizzle reads it: not a storage the capture kept as it was at its submit, which the CPU path reads)
-    if (tex.gpu >= (1ull << 40) || memory_has_shadow(tex.gpu, total)) return false;
-    uint64_t avail = 0;
-    const uint8_t* p = host->gpu_ptr(tex.gpu, &avail);
-    if (!p || avail < total) return false;
-    const auto t0 = std::chrono::steady_clock::now();
-    std::atomic<bool> found{false};
-    const uint32_t nthreads = std::clamp(std::thread::hardware_concurrency() / 2, 1u, 8u);
-    const uint64_t per = ((total / nthreads) + 4095) & ~4095ull;
-    auto part = [&](uint32_t t) {
-        const uint64_t a = std::min<uint64_t>(total, (uint64_t)t * per), b = std::min<uint64_t>(total, a + per);
-        for (uint64_t at = a; at < b && !found.load(std::memory_order_relaxed); at += 65536) {
-            const uint64_t end = std::min<uint64_t>(b, at + 65536);
-            uint64_t acc = 0;
-            uint64_t k = at;
-            for (; k + 8 <= end; k += 8) {
-                uint64_t w;
-                std::memcpy(&w, p + k, 8);
-                acc |= w;
-            }
-            for (; k < end; k++) acc |= p[k];
-            if (acc) found.store(true, std::memory_order_relaxed);
-        }
-    };
-    if (nthreads > 1) {
-        std::vector<std::thread> th;
-        for (uint32_t t = 1; t < nthreads; t++) th.emplace_back(part, t);
-        part(0);
-        for (auto& x : th) x.join();
-    } else {
-        part(0);
-    }
-    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    static std::atomic<int> told{0};
-    if (found.load()) {
-        if (told.fetch_add(1) < 4)
-            logf("vk: upload: %ux%u NVN %#x (%llu MB) is not all zero (checked in %.1f ms): unswizzled as before", tex.width,
-                 tex.height, tex.nvn_format, (unsigned long long)(total >> 20), ms);
-        return false;
-    }
-    texture_resident_flush(&tex);
-    checkpoint_mark(upload_cmd(), tex.gpu, 'u');
-    const VkImageSubresourceRange range{tex.aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
-    if (tex.aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {
-        const VkClearDepthStencilValue z{0.0f, 0};
-        vkCmdClearDepthStencilImage(upload_cmd(), tex.image, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &range);
-    } else {
-        const VkClearColorValue z{};
-        vkCmdClearColorImage(upload_cmd(), tex.image, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &range);
-    }
-    if (told.fetch_add(1) < 4)
-        logf("vk: upload: %ux%u NVN %#x (%llu MB) is all zero: cleared on the GPU (checked in %.1f ms)", tex.width, tex.height,
-             tex.nvn_format, (unsigned long long)(total >> 20), ms);
-    return true;
-}
 bool upload_inner(Texture& tex, const Ranges* dirty) {
     PROF(PROF_UPLOAD);
     if (!tex.gpu || tex.samples != VK_SAMPLE_COUNT_1_BIT) return false;
@@ -1814,7 +1745,6 @@ bool upload_inner(Texture& tex, const Ranges* dirty) {
     const bool linear = nvn_tex_is_linear(&tex.d);
     int widen_from = 0;
     widened(tex.d.format ? vk_format(tex.nvn_format).format : tex.format, &widen_from);
-    if (upload_all_zero(tex, total, dirty, widen_from != 0)) return true;
     const int src_bpb = tex.bpb;
     const int out_bpb = tex.astc ? 4 : widen_from ? (widen_from == 3 ? 4 : widen_from == 6 ? 8 : 16) : src_bpb;
     const uint32_t copy_layers = tex.type == VK_IMAGE_TYPE_3D ? 1 : tex.layers;
@@ -2147,8 +2077,10 @@ VkImageCreateInfo image_info_of(const Texture& t) {
     return ci;
 }
 
+void detail_forget(const Texture& t);   // (below: RX_VK_TEX_DETAIL's count of the textures alive)
 void destroy_later(Texture& tex) {
     gone_note(&tex);
+    detail_forget(tex);
     Dead d{tex.last_value, tex.image, tex.allocation, {}, {}};
     if (tex.pool_key && tex.allocation && tex.sparse_chunks.empty() && pool_cap()) {   // (a render target's: to the pool, its views too)
         d.pool_key = tex.pool_key, d.view_map = std::move(tex.views), d.bytes = tex.bytes + tex.pad;
@@ -2160,8 +2092,6 @@ void destroy_later(Texture& tex) {
     }
     d.memory = tex.sparse_chunks;
     dead.push_back(std::move(d));
-    for (const auto& attachment : tex.block_attachments)
-        dead.push_back(Dead{tex.last_value, attachment.image, attachment.allocation, {}, {}});
     total_bytes -= std::min(total_bytes, tex.bytes + tex.pad);
 }
 
@@ -2192,6 +2122,57 @@ void new_image_timed(std::chrono::steady_clock::time_point t0, bool ok, const Vk
                  target_blocks ? "the render targets' blocks" : "the textures' blocks",
                  pooled ? ", none of its shape in the target pool" : "", ok ? "" : ", not made", k + 1);
     }
+}
+
+// (Ocarina Engine, RX_VK_TEX_DETAIL: tex_detail.h) the top levels a small card leaves out of the textures that may lose them
+std::atomic<bool> detail_squeeze{false};   // (gov_look: the VRAM governor squeezing; the textures made meanwhile lose one more)
+std::atomic<int64_t> detail_n1{0}, detail_n2{0}, detail_bytes{0};   // (alive: with 1 and 2 levels off, and what that saved)
+std::atomic<int64_t> detail_made{0}, detail_made_bytes{0}, detail_refused_n{0};   // (since the last line)
+std::mutex detail_mu;
+std::unordered_set<uint64_t> detail_denied;   // (storage a copy reached a left-out level of: its textures keep every level)
+int detail_mode() {
+    static const int m = tex_detail::parse(getenv("RX_VK_TEX_DETAIL"));
+    return m;
+}
+uint64_t detail_allowed() {   // (what the driver allowed when the first texture was made)
+    static const uint64_t a = [] {
+        uint64_t used = 0, allowed = 0;
+        return vram_usage(&used, &allowed) ? allowed : 0;
+    }();
+    return a;
+}
+bool detail_arrays() {   // (RX_VK_TEX_DETAIL_ARRAYS=0: 2D arrays (the terrain's material arrays) keep every level)
+    static const bool on = !getenv("RX_VK_TEX_DETAIL_ARRAYS") || atoi(getenv("RX_VK_TEX_DETAIL_ARRAYS")) != 0;
+    return on;
+}
+bool detail_is_denied(uint64_t gpu) {
+    std::lock_guard lk(detail_mu);
+    return detail_denied.count(gpu) != 0;
+}
+void detail_forget(const Texture& t) {   // (destroy_later: a texture that left levels out goes)
+    if (!t.detail) return;
+    (t.detail == 1 ? detail_n1 : detail_n2).fetch_sub(1, std::memory_order_relaxed);
+    detail_bytes.fetch_sub((int64_t)t.detail_saved, std::memory_order_relaxed);
+}
+/// (texture_frame, every 600 presents) the line
+void detail_log() {
+    const int mode = detail_mode();
+    const uint64_t allowed = detail_allowed();
+    const int64_t made = detail_made.exchange(0, std::memory_order_relaxed);
+    const int64_t made_b = detail_made_bytes.exchange(0, std::memory_order_relaxed);
+    const int64_t refused = detail_refused_n.exchange(0, std::memory_order_relaxed);
+    if (mode == 0) return;
+    char what[160];
+    if (mode == tex_detail::kAuto)
+        snprintf(what, sizeof what, "auto, %s (%llu MB allowed)%s", tex_detail::tier_name(allowed),
+                 (unsigned long long)(allowed >> 20), detail_squeeze.load(std::memory_order_relaxed) ? ", the governor squeezing" : "");
+    else
+        snprintf(what, sizeof what, "RX_VK_TEX_DETAIL=%d", mode);
+    logf("vk: texture detail: %s; %lld textures cut by 1 level, %lld by 2, %lld MB saved (%lld made since the last line, %lld MB "
+         "saved by them; %lld copies into a level left out)", what, (long long)detail_n1.load(std::memory_order_relaxed),
+         (long long)detail_n2.load(std::memory_order_relaxed),
+         (long long)(std::max<int64_t>(0, detail_bytes.load(std::memory_order_relaxed)) >> 20), (long long)made,
+         (long long)(made_b >> 20), (long long)refused);
 }
 
 /// (as_target: texture_get's for a render target or a copy's destination, not for sampling: its image goes to the render targets'
@@ -2278,9 +2259,41 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
                (std::max(x.width, x.height) >> x.skip) > max_dim)
             x.skip++;
         while (!x.sparse && x.skip + 1 < x.levels && bytes_at(x.skip) > max_bytes) x.skip++;
+        {   // (Ocarina Engine, RX_VK_TEX_DETAIL: tex_detail.h) on a small card, the top levels of the textures that may lose them:
+            // decoded ASTC from the game's memory, 2D or a 2D array (not 6 square layers: a cube map's storage). (as_target too: the
+            // GPU renders into no ASTC image, and copy_b2t's texture_get for its log makes the ones a buffer's blocks are copied into
+            // that way, the copy itself going into the storage)
+            const bool shape = d.target == NVN_TEXTURE_TARGET_2D ||
+                               (d.target == NVN_TEXTURE_TARGET_2D_ARRAY && detail_arrays() && !(x.layers == 6 && x.width == x.height));
+            if (astc && !depth && shape && x.type == VK_IMAGE_TYPE_2D && d.samples <= 1 && !x.sparse &&
+                !nvn_tex_is_linear(&d)) {
+                static bool told = false;
+                if (!told) {
+                    told = true;
+                    const int m = detail_mode();
+                    const uint64_t a = detail_allowed();
+                    if (m == tex_detail::kAuto)
+                        logf("vk: texture detail: auto, %s (%llu MB allowed): %s", tex_detail::tier_name(a),
+                             (unsigned long long)(a >> 20),
+                             !a || a > tex_detail::kMidCard ? "every level kept"
+                             : a <= tex_detail::kSmallCard
+                                 ? "1 top level off the ASTC textures 512+ texels wide with 4+ levels (2 off the world's, 6x6 "
+                                   "blocks and up, made while the VRAM governor squeezes); RX_VK_TEX_DETAIL=0 keeps them all"
+                                 : "1 top level off the ASTC textures 2048+ texels wide with 4+ levels (and off the world's "
+                                   "512+ ones made while the VRAM governor squeezes); RX_VK_TEX_DETAIL=0 keeps them all");
+                    else if (m)
+                        logf("vk: texture detail: RX_VK_TEX_DETAIL=%d: %d top level(s) off the ASTC textures 512+ texels wide "
+                             "with 4+ levels", m, m);
+                }
+                const uint32_t k = tex_detail::levels_off(detail_mode(), detail_allowed(),
+                                                          detail_squeeze.load(std::memory_order_relaxed), x.width, x.height,
+                                                          x.levels, (uint32_t)(bw * bh));
+                if (k > x.skip && !detail_is_denied(t->gpu)) x.detail = k - x.skip, x.skip = k;
+            }
+        }
         if (x.skip) {
             static int logged;
-            if (logged++ < 40)
+            if (x.skip > x.detail && logged++ < 40)
                 logf("vk: texture %#llx %ux%ux%u x%u (NVN %#x, %llu MB): its %u top level(s) left out (%llu MB)",
                      (unsigned long long)t->gpu, x.width, x.height, x.depth, x.layers, d.format,
                      (unsigned long long)(bytes_at(0) >> 20), x.skip, (unsigned long long)(bytes_at(x.skip) >> 20));
@@ -2338,7 +2351,10 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
             return false;
         }();
         static const bool rgba8_instead = getenv("RX_VK_UNEVEN_RGBA8") != nullptr;
-        const bool bc_candidate = astc && !(x.skip && x.layers == 1) && x.type == VK_IMAGE_TYPE_2D &&
+        // (Ocarina Engine: one that left levels out on a small card alone (RX_VK_TEX_DETAIL) is BC3 all the same: the CPU's copies
+        // of ASTC blocks go into its storage, uploaded again; a texture copy into a level it left out is not made, and its memory's
+        // textures keep every level from then on (texture_detail_refused))
+        const bool bc_candidate = astc && !(x.skip > x.detail && x.layers == 1) && x.type == VK_IMAGE_TYPE_2D &&
                                   x.samples == VK_SAMPLE_COUNT_1_BIT && x.width <= kBcDim && x.height <= kBcDim &&
                                   px * x.layers * 4 >= min_bytes;
         if (bc_candidate && uneven && amd_fix) {
@@ -2400,15 +2416,22 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
             vkGetPhysicalDeviceImageFormatProperties(dev.physical, x.format, x.type, VK_IMAGE_TILING_OPTIMAL,
                 x.usage, flags, &limits) == VK_SUCCESS)
             x.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
-        // Render to raw block views of 2D images. A 3D image's attachments use a separate uncompressed mip
-        if (x.type != VK_IMAGE_TYPE_3D && (format_props(raw).optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) {
+        // (and colour attachment views, raw too: OoT renders the slices of two 64^3 BC4 noise volumes as RGBA16UI targets, one
+        // texel a block (53509044401d78d2, while an area loads). Without the usage those views were not made, the volumes
+        // stayed zero, and the foliage's dithered LOD crossfade, which reads them, left trees bare at mid distance, #1151.
+        // 3D images take the usage on the driver's word for the 2D one: the query does not cover 2D_ARRAY_COMPATIBLE's
+        // per-slice attachment views)
+        if (format_props(raw).optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) {
+            // (asked with the flags a 3D image is made with below; a refused image is made again without the usage)
+            const VkImageCreateFlags asked = flags | (x.type != VK_IMAGE_TYPE_3D ? 0u
+                : VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT | (dev.view_2d_of_3d ? VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT : 0u));
             const VkResult r = vkGetPhysicalDeviceImageFormatProperties(dev.physical, x.format, x.type, VK_IMAGE_TILING_OPTIMAL,
-                x.usage | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, flags, &limits);
-            if (r == VK_SUCCESS) x.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+                x.usage | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, asked, &limits);
+            if (r == VK_SUCCESS || x.type == VK_IMAGE_TYPE_3D) x.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
             static int told;
             if (r != VK_SUCCESS && told++ < 4)
-                logf("vk: BC image %ux%u (vk %d) as a raw colour attachment: the driver says %d", x.width, x.height,
-                     (int)x.format, (int)r);
+                logf("vk: BC image %ux%ux%u (vk %d) as a raw colour attachment: the driver says %d%s", x.width, x.height, x.depth,
+                     (int)x.format, (int)r, x.type == VK_IMAGE_TYPE_3D ? " (3D: taken)" : "");
         }
     }
     if (x.type == VK_IMAGE_TYPE_2D && x.layers >= 6 && x.width == x.height && x.samples == VK_SAMPLE_COUNT_1_BIT)
@@ -2505,6 +2528,16 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
     static const bool by_estimate = getenv("RX_VK_COUNT_BY_ESTIMATE") != nullptr;
     if (!x.sparse && !by_estimate) x.pad = std::max(x.bytes, allocation_size(x.allocation)) - x.bytes;
     total_bytes += x.bytes + x.pad;
+    if (x.detail) {   // (Ocarina Engine, RX_VK_TEX_DETAIL: what the levels it left out on a small card would have taken)
+        const uint32_t w0 = std::max(1u, d.width), h0 = std::max(1u, d.height);
+        uint64_t lpx = 0;
+        for (uint32_t l = x.skip - x.detail; l < x.skip; l++) lpx += (uint64_t)std::max(1u, w0 >> l) * std::max(1u, h0 >> l);
+        x.detail_saved = lpx * x.layers * texel;
+        (x.detail == 1 ? detail_n1 : detail_n2).fetch_add(1, std::memory_order_relaxed);
+        detail_bytes.fetch_add((int64_t)x.detail_saved, std::memory_order_relaxed);
+        detail_made.fetch_add(1, std::memory_order_relaxed);
+        detail_made_bytes.fetch_add((int64_t)x.detail_saved, std::memory_order_relaxed);
+    }
     if (in_textures) st_sb_made_bytes.fetch_add(x.bytes + x.pad, std::memory_order_relaxed);   // (compact_step: what refills the blocks)
     InitRedirect redirect;   // (a parallel replay's worker: into the earliest open segment's init command buffer)
     // into GENERAL, and cleared (a target the game renders into before writing it all reads zeros, not garbage)
@@ -2769,17 +2802,10 @@ namespace {
 /// ones can be data (height maps, look-up tables) that a frame without would get wrong. RX_VK_UPLOAD_BUDGET_MS=<n>: the
 /// budget (40: only an area load's burst; at 8 the ground's streamed textures waited a frame in ordinary play and the ground
 /// flickered, Discord 2026-11-09), 0: no deferral, as before
-/// (Mako) Left for later once only: the frames after it upload it whatever their budget. Before, a texture could be left frame
-/// after frame while other uploads (textures made again after eviction, near the VRAM budget) took each frame's 40 ms first:
-/// the ground came in flat on arriving somewhere and stayed so until the pause menu's light frames let it through.
-/// RX_VK_DEFER_AGAIN=1: as before
-bool upload_defer(Texture& tex) {
+bool upload_defer(const Texture& tex) {
     static const int64_t budget_ns = (int64_t)(getenv("RX_VK_UPLOAD_BUDGET_MS") ? atof(getenv("RX_VK_UPLOAD_BUDGET_MS")) : 40.0) * 1000000;
     if (!budget_ns || !upload_defer_ok || tex.uploaded || !tex.astc || tex.gpu_written) return false;
     if (frame_upload_ns.load(std::memory_order_relaxed) < budget_ns) return false;
-    static const bool again = getenv("RX_VK_DEFER_AGAIN") != nullptr;
-    if (!again && tex.deferred_at && tex.deferred_at != frame_no && frame_no - tex.deferred_at <= 8) return false;   // (left last time)
-    if (tex.deferred_at != frame_no) tex.deferred_at = frame_no;
     st_deferred.fetch_add(1, std::memory_order_relaxed), st_deferred_frame.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
@@ -2874,20 +2900,7 @@ Texture* texture_touch(Texture* tex, bool for_sampling) {
     // was unswizzled from that memory: 55 MB for the 3072 x 3072 x 3 shadow map, frame after frame. Not "storage
     // the write watch never saw written": the game fills memory before it makes a pool of it.)
     static const bool upload_all = getenv("RX_VK_UPLOAD_ALL") != nullptr;   // (A/B: such storage uploaded too)
-    // (Mako) never for a block-compressed texture (ASTC, BC): the GPU cannot render into one, so its texels come from memory
-    // whatever render targets used that storage before. Skipped, a boss or a new enemy met for the first time (its textures
-    // loaded into the transient heaps' memory) was drawn with an empty texture, all blue, for the whole cutscene.
-    // RX_VK_SKIP_COMPRESSED_OVER_RT=1: as before
-    static const bool skip_compressed = getenv("RX_VK_SKIP_COMPRESSED_OVER_RT") != nullptr;
-    const bool compressed = tex->astc || tex->bc || (tex->format >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && tex->format <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK);
-    uint32_t owned = !tex->uploaded && !upload_all && (skip_compressed || !compressed) ? gpu_owned_since(tex->gpu, tex->guest_size) : 0;
-    if (!tex->uploaded && !upload_all && !skip_compressed && compressed) {
-        static std::atomic<int> told{0};
-        if (told.load(std::memory_order_relaxed) < 30 && gpu_owned_since(tex->gpu, tex->guest_size) && told++ < 30)
-            logf("vk: texture #%u %#llx %ux%u x%u NVN %#x (compressed) over storage render targets took: uploaded from the game's "
-                 "memory all the same (Mako)", tex->id, (unsigned long long)tex->gpu, tex->width, tex->height, tex->layers,
-                 tex->nvn_format);
-    }
+    uint32_t owned = !tex->uploaded && !upload_all ? gpu_owned_since(tex->gpu, tex->guest_size) : 0;
     if (owned && !remade_skip_old()) {   // (one evicted that came from memory: uploaded from it again. Above)
         std::lock_guard lk(from_memory_mu);
         auto e = evicted_from_memory.find(evicted_key(tex->gpu, tex->width, tex->height, tex->nvn_format));
@@ -3144,105 +3157,6 @@ VkImageView texture_view(Texture* tex, const nvn_tex* t, const nvn_view* v, VkIm
         }
         return view;
     });
-}
-
-TextureAttachment texture_attachment(Texture* tex, const nvn_tex* t, const nvn_view* v) {
-    TextureAttachment out;
-    if (tex->type != VK_IMAGE_TYPE_3D || !is_bc(tex->format)) {
-        out.view = texture_view(tex, t, v, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Attachment, &out.format);
-        return out;
-    }
-
-    // NVIDIA's Pascal driver reports support for attaching a 2D raw view of a BC volume, then loses the device
-    // even on a clear. Render the encoded blocks into an uncompressed mip and copy them to the sampled volume.
-    const int nf = view_nvn_format(t, v);
-    const VkFormat format = view_format_of(tex->format, tex->astc, tex->bc, nf, ViewUse::Attachment, VK_FORMAT_UNDEFINED);
-    int bw, bh, widened_from;
-    int bytes = nvn_block_size(nf, &bw, &bh);
-    widened(vk_format(nf).format, &widened_from);
-    if (widened_from) bytes = widened_from * 4 / 3;
-    if (format == VK_FORMAT_UNDEFINED || bw != 1 || bh != 1 || bytes != tex->bpb ||
-        !(format_props(format).optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT))
-        return out;
-
-    const uint32_t level = image_level(tex, view_level(v));
-    const uint32_t depth = std::max(1u, tex->depth >> level);
-    const uint32_t slice = std::min(view_layer(v), depth - 1);
-    const uint64_t key = mix(mix(0xbc3d, format), (uint64_t)level << 32 | slice);
-    auto attachment = std::find_if(tex->block_attachments.begin(), tex->block_attachments.end(), [&](const auto& a) {
-        return a.level == level && a.format == format;
-    });
-    if (attachment == tex->block_attachments.end()) {
-        if (tex->view_failed_frame == frame_no) return out;
-        // Each compressed mip can round up to a different block extent, so it has its own uncompressed image
-        VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-        ci.flags = VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
-        ci.imageType = VK_IMAGE_TYPE_3D;
-        ci.format = format;
-        ci.extent = {(std::max(1u, tex->width >> level) + 3) / 4, (std::max(1u, tex->height >> level) + 3) / 4, depth};
-        ci.mipLevels = ci.arrayLayers = 1;
-        ci.samples = VK_SAMPLE_COUNT_1_BIT;
-        ci.tiling = VK_IMAGE_TILING_OPTIMAL;
-        ci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-        ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        Texture::BlockAttachment made{VK_NULL_HANDLE, nullptr, format, level};
-        if (!create_image(ci, made.image, made.allocation)) {
-            tex->view_failed_frame = frame_no;
-            return out;
-        }
-        try {
-            tex->block_attachments.push_back(made);
-        } catch (const std::exception&) {
-            destroy_image(made.image, made.allocation);
-            tex->view_failed_frame = frame_no;
-            return out;
-        }
-        attachment = std::prev(tex->block_attachments.end());
-        const uint64_t bytes = allocation_size(made.allocation);
-        tex->pad += bytes;
-        total_bytes += bytes;
-
-        InitRedirect redirect;
-        VkImageMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
-        barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
-        barrier.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-        barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barrier.image = made.image;
-        barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, VK_REMAINING_ARRAY_LAYERS};
-        VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
-        dependency.imageMemoryBarrierCount = 1;
-        dependency.pImageMemoryBarriers = &barrier;
-        vkCmdPipelineBarrier2(upload_cmd(), &dependency);
-    }
-
-    out.view = cached_image_view(tex, key, [&](VkResult* result) {
-        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-        vi.image = attachment->image;
-        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        vi.format = format;
-        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, slice, 1};
-        VkImageView view = VK_NULL_HANDLE;
-        *result = vkCreateImageView(dev.device, &vi, nullptr, &view);
-        return *result == VK_SUCCESS ? view : VK_NULL_HANDLE;
-    });
-    out.format = format;
-    out.blocks = attachment->image;
-    return out;
-}
-
-void copy_block_attachment(VkCommandBuffer cmd, const Texture& tex, VkImage blocks, uint32_t level, uint32_t slice,
-                           bool to_attachment) {
-    const uint32_t width = std::max(1u, tex.width >> level), height = std::max(1u, tex.height >> level);
-    const VkImageSubresourceLayers compressed{VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1};
-    const VkImageSubresourceLayers raw{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    const VkOffset3D offset{0, 0, (int32_t)std::min(slice, std::max(1u, tex.depth >> level) - 1)};
-    // Vulkan takes the extent in source texels, which are blocks in the uncompressed attachment
-    const VkImageCopy region{to_attachment ? compressed : raw, offset, to_attachment ? raw : compressed, offset,
-                             to_attachment ? VkExtent3D{width, height, 1} : VkExtent3D{(width + 3) / 4, (height + 3) / 4, 1}};
-    vkCmdCopyImage(cmd, to_attachment ? tex.image : blocks, VK_IMAGE_LAYOUT_GENERAL,
-                   to_attachment ? blocks : tex.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
 }
 
 bool texture_copy_into_bc(VkCommandBuffer cmd, Texture* src, uint32_t src_level, uint32_t src_layer, int sx, int sy,
@@ -3901,6 +3815,21 @@ void texture_rendered(Texture* tex) {
         if (gpu_owned.size() > 65536) gpu_owned.erase(gpu_owned.begin());   // (bounded; the oldest addresses go)
     }
 }
+void texture_detail_refused(const Texture* tex) {
+    if (!tex || !tex->detail) return;
+    detail_refused_n.fetch_add(1, std::memory_order_relaxed);
+    bool first = false;
+    {
+        std::lock_guard lk(detail_mu);
+        first = detail_denied.insert(tex->gpu).second;
+    }
+    static std::atomic<int> told{0};
+    if (first && told.fetch_add(1, std::memory_order_relaxed) < 20)
+        logf("vk: texture detail: a copy reached a level texture #%u %#llx (%ux%u x%u, NVN %#x) left out: the textures made at its "
+             "memory from now on keep every level", tex->id, (unsigned long long)tex->gpu, tex->d.width, tex->d.height, tex->layers,
+             tex->nvn_format);
+}
+
 uint64_t texture_frame_no() {
     return frame_no;
 }
@@ -4024,7 +3953,9 @@ struct Compact {
 // Every 600 presents the "vk: VRAM governor:" line says where it stands and what each lever gave back since the line before.
 namespace {
 bool gov_env() {
-    static const bool on = !(getenv("RX_VK_VRAM_GOV") && !atoi(getenv("RX_VK_VRAM_GOV")));
+    // (Ocarina Engine v0.3.1) off by default: on a GTX 1660 Super it did not lower the count (5611 against 5576 MB) and made
+    // 38% more frames over 50 ms; the texture detail (RX_VK_TEX_DETAIL) lowers VRAM there instead. RX_VK_VRAM_GOV=1: on
+    static const bool on = getenv("RX_VK_VRAM_GOV") && atoi(getenv("RX_VK_VRAM_GOV")) != 0;
     return on;
 }
 uint64_t gov_pct() {
@@ -4087,6 +4018,7 @@ void gov_look(bool known, uint64_t used, uint64_t allowed, uint64_t block_free, 
     gov.off_why = why ? why : "";
     if (!gov.on) {
         gov.h.reset();
+        detail_squeeze.store(false, std::memory_order_relaxed);
         if (gov.mirror_cut) gov.w_cut += (int64_t)gov.mirror_cut, gov_set_mirror_cut(0);
         gov.mirror_over = gov.mirror_under = 0;
         return;
@@ -4095,6 +4027,7 @@ void gov_look(bool known, uint64_t used, uint64_t allowed, uint64_t block_free, 
     gov.looks++;
     if (used > gov.target) gov.looks_over++;
     gov.h.look(used, allowed, gov.target);
+    detail_squeeze.store(gov.h.squeeze, std::memory_order_relaxed);   // (RX_VK_TEX_DETAIL: the textures made meanwhile)
 }
 /// (texture_frame, after the texture budget) the last lever: the mirrors. (The first measure, b47gov1-K2 on a 6 GB RTX 4050 in
 /// Hyrule Market: 60 of 60 looks over the target and never a cut, as it waited for "nothing else left", and the compaction, under
@@ -4683,6 +4616,7 @@ void texture_frame(uint64_t completed) {
     }
     gov_look_end();   // (Ocarina Engine, RX_VK_VRAM_GOV: the mirrors, the last lever)
     if (frame_no % 600 == 0) gov_log(total_bytes, budget, budget_floor);
+    if (frame_no % 600 == 0) detail_log();   // (Ocarina Engine, RX_VK_TEX_DETAIL)
     if (frame_no % 600 == 0) {
         vma_log_heaps();
         vma_log_image_blocks();

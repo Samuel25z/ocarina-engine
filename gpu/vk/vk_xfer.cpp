@@ -73,6 +73,7 @@ bool resolve(const nvn_tex* t, const nvn_view* v, bool has_v, const NVNcopyRegio
         if (r.width > 0) r.width = std::max(1, r.width >> s.down);
         if (r.height > 0) r.height = std::max(1, r.height >> s.down);
     } else if (view_level(view) < s.tex->skip) {   // (a level the image left out)
+        texture_detail_refused(s.tex);   // (Ocarina Engine: left out on a small card, RX_VK_TEX_DETAIL: not from then on)
         static int logged;
         if (logged++ < 40)
             logf("vk: copy into level %u layer %u of texture %#llx %ux%u x%u NVN %#x%s (its top %u level(s) left out): "
@@ -327,9 +328,7 @@ void clear_tex(VkCommandBuffer cmd, NvnState& st, const nvn_p_clear_tex& p) {
     end_pass(cmd);
     GprofSpan gp(cmd, "xfer clear texture (with its barriers)");
     full_barrier(cmd);
-    const bool volume = s.tex->type == VK_IMAGE_TYPE_3D;
-    const bool raw = s.tex->format >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && s.tex->format <= VK_FORMAT_BC7_SRGB_BLOCK;
-    if (whole && !volume && !raw) {
+    if (whole && s.tex->type != VK_IMAGE_TYPE_3D) {
         VkImageSubresourceRange rng{s.tex->aspect, s.level, 1, s.layer, s.layers};
         if (s.tex->aspect & VK_IMAGE_ASPECT_COLOR_BIT) {
             VkClearColorValue cv{};
@@ -343,29 +342,23 @@ void clear_tex(VkCommandBuffer cmd, NvnState& st, const nvn_p_clear_tex& p) {
         }
     } else {   // (a region: a pass over that level and layer, and vkCmdClearAttachments)
         const nvn_view* v = p.has_view ? &p.view : nullptr;
-        const uint32_t slices = volume ? s.d : s.layers;
-        for (uint32_t k = 0; k < slices; k++) {
-            const uint32_t slice = (volume ? (uint32_t)s.z : s.layer) + k;
+        for (uint32_t k = 0; k < s.layers; k++) {
             nvn_view lv = v ? *v : nvn_view{};
             // texture_view takes a guest mip level and subtracts skip itself.
             lv.set_levels = 1, lv.base_level = (uint8_t)(s.level + s.tex->skip), lv.nlevels = 1;
-            lv.set_layers = 1, lv.min_layer = (uint16_t)slice, lv.nlayers = 1;
-            const TextureAttachment attachment = texture_attachment(s.tex, p.tex, &lv);
-            if (!attachment.view) continue;
+            lv.set_layers = 1, lv.min_layer = (uint16_t)(s.layer + k), lv.nlayers = 1;
+            const VkImageView view = texture_view(s.tex, p.tex, &lv, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Attachment);
+            if (!view) continue;
             // (an attachment view of a compressed image is a raw one, one texel a block: its area and the rect in blocks, as
             // targets() sizes a pass over it)
+            const bool raw = s.tex->format >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && s.tex->format <= VK_FORMAT_BC7_SRGB_BLOCK;
             const uint32_t aw = raw ? (lw + 3) / 4 : lw, ah = raw ? (lh + 3) / 4 : lh;
             const int32_t rx = raw ? s.x / 4 : s.x, ry = raw ? s.y / 4 : s.y;
             const uint32_t rw = std::min<uint32_t>(raw ? (s.x + s.w + 3) / 4 - rx : s.w, aw - std::min<uint32_t>(aw, (uint32_t)rx));
             const uint32_t rh = std::min<uint32_t>(raw ? (s.y + s.h + 3) / 4 - ry : s.h, ah - std::min<uint32_t>(ah, (uint32_t)ry));
             if (!rw || !rh) continue;
-            if (attachment.blocks) {
-                full_barrier(cmd);
-                copy_block_attachment(cmd, *s.tex, attachment.blocks, s.level, slice, true);
-                full_barrier(cmd);
-            }
             VkRenderingAttachmentInfo a{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-            a.imageView = attachment.view;
+            a.imageView = view;
             a.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
             a.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
             a.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -384,10 +377,6 @@ void clear_tex(VkCommandBuffer cmd, NvnState& st, const nvn_p_clear_tex& p) {
             const VkClearRect rect{{{rx, ry}, {rw, rh}}, 0, 1};
             vkCmdClearAttachments(cmd, 1, &ca, 1, &rect);
             vkCmdEndRendering(cmd);
-            if (attachment.blocks) {
-                full_barrier(cmd);
-                copy_block_attachment(cmd, *s.tex, attachment.blocks, s.level, slice, false);
-            }
         }
     }
     full_barrier(cmd);

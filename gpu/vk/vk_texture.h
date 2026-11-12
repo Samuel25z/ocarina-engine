@@ -29,6 +29,8 @@ struct Texture {
     VkImageCreateFlags create_flags = 0;   // (hookshot: as its image was made, for the compaction's copy of it)
     uint32_t width = 1, height = 1, depth = 1, levels = 1, layers = 1;   // the image's (after skip)
     uint32_t skip = 0;        // top levels of the texture left out (huge textures: RX_VK_TEX_MAX_DIM, _MAX_MB)
+    uint32_t detail = 0;      // (Ocarina Engine, RX_VK_TEX_DETAIL) of them, those left out on a small card (tex_detail.h)
+    uint64_t detail_saved = 0;   // (and what that saved: the bytes those levels would have taken)
     // (a huge array kept whole as a sparse resident image instead: each layer gets device memory when it is first
     // written, so only what the game streams in costs VRAM. MKW's terrain arrays, 8192 x 8192 x 68 BC6H: 5.8 GB
     // each, written by the GPU's copies into level 0, which a texture with its top level left out lost)
@@ -43,7 +45,6 @@ struct Texture {
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
     bool cube = false;        // CUBE_COMPATIBLE
     bool astc = false;        // ASTC blocks decoded into RGBA8 (block_w x block_h)
-    uint64_t deferred_at = 0; // (Mako) the frame its upload was last left for later (upload_defer: once, not again the next frame)
     bool bc = false;          // (and kept as BC3: big ones, re-encoded on the GPU after decoding; vk_texture.cpp)
     bool bc_resized = false;  // (hookshot-amd: its BC3 image is a resized copy, uneven block levels on AMD; vk_texture.cpp)
     int block_w = 1, block_h = 1, bpb = 0;   // the storage's blocks
@@ -86,13 +87,6 @@ struct Texture {
     uint64_t pool_key = 0;    // (a render target's image: its create info's key in the pool it goes to when the texture does)
     std::unordered_map<uint64_t, VkImageView> views;
     uint64_t view_failed_frame = 0;   // (transient allocation failure: retry uncached views next frame, keep cached ones usable)
-    struct BlockAttachment {
-        VkImage image;
-        VmaAllocation allocation;
-        VkFormat format;
-        uint32_t level;
-    };
-    std::vector<BlockAttachment> block_attachments;
 };
 
 /// Makes texels [x, x + w) x [y, y + h) of level `level`, layers [first, first + count), of a sparse texture resident
@@ -151,14 +145,6 @@ Texture* texture_get(const nvn_tex* t, bool for_sampling);
 /// A view of it: the view's levels and layers (all when v is null), as view_type, in the view's format
 /// (attachment: one level, one layer; storage: one level, every layer, in a storage-capable format)
 enum class ViewUse { Sample, Attachment, Storage };
-struct TextureAttachment {
-    VkImageView view = VK_NULL_HANDLE;
-    VkFormat format = VK_FORMAT_UNDEFINED;
-    VkImage blocks = VK_NULL_HANDLE;   // A separate attachment holding the encoded blocks of a 3D BC mip
-};
-TextureAttachment texture_attachment(Texture* tex, const nvn_tex* t, const nvn_view* v);
-void copy_block_attachment(VkCommandBuffer cmd, const Texture& tex, VkImage blocks, uint32_t level, uint32_t slice,
-                           bool to_attachment);
 VkImageView texture_view(Texture* tex, const nvn_tex* t, const nvn_view* v, VkImageViewType view_type, ViewUse use,
                          VkFormat* format_out = nullptr, VkFormat force_format = VK_FORMAT_UNDEFINED);
 /// (hookshot) The format rules texture_get and texture_view follow (vk_texture.cpp), shared with the pipeline state list
@@ -184,6 +170,9 @@ void texture_watch_prog(uint64_t prog);
 void texture_rendered(Texture* tex);
 /// The presents so far (the frame number textures are aged by)
 uint64_t texture_frame_no();
+/// (Ocarina Engine, RX_VK_TEX_DETAIL) a copy reached a level a texture left out on a small card (vk_xfer.cpp): the textures
+/// made at its memory from then on keep all their levels
+void texture_detail_refused(const Texture* tex);
 /// A texel buffer view over guest memory (texture targets of NVN_TEXTURE_TARGET_BUFFER, and image buffers)
 VkBufferView texel_buffer_view(const nvn_tex* t, const nvn_view* v, bool storage);
 /// Release an imported buffer's views immediately before its completed destruction (memory.cpp).

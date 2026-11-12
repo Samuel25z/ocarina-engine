@@ -124,7 +124,10 @@ Designed after totk-pc-recomp's runtime/vk_*.c (MIT) and Eden's renderer_vulkan,
   image, unless the texture was finalized since. ASTC is decoded on the GPU by Eden's `astc_decoder.comp`
   (`host_shaders/`, with the Switch 2 tiling), straight from the block-linear storage; other formats are unswizzled
   on the CPU into the staging memory. Huge textures leave out top levels (`RX_VK_TEX_MAX_DIM` 2048,
-  `RX_VK_TEX_MAX_MB` 512: the terrain arrays are 8192 x 8192 x 68 ASTC, 24 GB as RGBA8). New images are cleared.
+  `RX_VK_TEX_MAX_MB` 512: the terrain arrays are 8192 x 8192 x 68 ASTC, 24 GB as RGBA8).  On small cards decoded ASTC textures (2D and 2D arrays, 512+ texels, 4+ levels) leave out their top level too
+  (`RX_VK_TEX_DETAIL`: `auto`; `0`/`full` keeps every level, `1`/`2` that many off on any card; auto: 1 level when the
+  driver allows 6.5 GB or less, 2 for the 6x6-block ones made while the VRAM governor squeezes, only 2048+ ones on 8 GB
+  cards; `RX_VK_TEX_DETAIL_ARRAYS=0` keeps the arrays whole; `tex_detail.h`). New images are cleared.
   An LRU budget (`RX_VK_VRAM_MB`, 4096, less when `VK_EXT_memory_budget` says the process is near its share).
   Images are VRAM only (`requiredFlags`): VMA's fallback to system memory is what ate the user's RAM once.
 - **Uploads never end a pass**: each recording has a second command buffer, submitted right before it, for uploads,
