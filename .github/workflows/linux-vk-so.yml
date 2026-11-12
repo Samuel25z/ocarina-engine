@@ -1,0 +1,58 @@
+# (Ocarina Engine) Only the Linux Vulkan back end (hookshot_vk.so) of this branch's version, for a player on the Linux builder who
+# swaps the back end as the Windows players swap hookshot_vk.dll. A workflow artifact, never a release. Runs on a push to a
+# build-linux-so-* branch or by hand.
+name: Linux back end (hookshot_vk.so)
+on:
+  push:
+    branches: ['build-linux-so-*']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  so:
+    runs-on: ubuntu-latest
+    container: ubuntu:22.04
+    timeout-minutes: 90
+    steps:
+      - name: System packages
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          for try in 1 2 3; do
+            if apt-get update &&
+              apt-get install -y --no-install-recommends software-properties-common gpg-agent &&
+              add-apt-repository -y ppa:ubuntu-toolchain-r/test &&
+              apt-get install -y --no-install-recommends g++-13 libstdc++-13-dev &&
+              apt-get install -y --no-install-recommends git ca-certificates curl xz-utils zstd file unzip python3 \
+              build-essential gcc-12 g++-12 libstdc++-12-dev nasm meson ninja-build cmake pkg-config \
+              libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxss-dev libxfixes-dev libxinerama-dev \
+              libxkbcommon-dev libwayland-dev wayland-protocols libdecor-0-dev libegl-dev libgles-dev libdrm-dev libgbm-dev \
+              libpulse-dev libasound2-dev libpipewire-0.3-dev libudev-dev libdbus-1-dev libxft-dev libfontconfig1-dev zlib1g-dev; then
+              break
+            fi
+            if [ "$try" = 3 ]; then exit 1; fi
+            sleep 20
+          done
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Trust the checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Dependencies (LLVM, Python, Vulkan headers)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/linux/deps.sh
+      - name: hookshot_vk.so
+        shell: bash
+        run: |
+          D="$PWD/build-linux/deps"
+          OOT_WORK="$RUNNER_TEMP/vk" EMSDK="$D/emsdk" RX_CPM="$D/cpm" RX_MARCH=x86-64-v3 RX_VK_ONLY=1 RX_RELEASE=1 \
+            "$D/python/bin/python3" -I nx2/build.py --standalone --jobs "$(nproc)" | tee "$RUNNER_TEMP/vk.log"
+          test "${PIPESTATUS[0]}" -eq 0
+          mkdir -p out && cp "$RUNNER_TEMP/vk/sa/build/hookshot_vk.so" out/
+          sha256sum out/hookshot_vk.so
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hookshot_vk-linux-${{ github.ref_name }}
+          path: out/hookshot_vk.so
