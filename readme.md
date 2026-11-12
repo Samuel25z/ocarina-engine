@@ -8,7 +8,24 @@ Zelda: Ocarina of Time (Switch 2) no PC, em placas comuns, não só nas topo de 
 O Ocarina Engine não traz o jogo. Você monta o jogo com o HookshotBuilder a partir da sua própria cópia, e o Ocarina Engine
 troca só o renderizador (`hookshot_vk.dll`).
 
-## Novo na v0.3: menos travadas ainda, e atualização pelo menu
+## Novo na v0.4: replay mais leve, sem a névoa de um quadro e relatório de problema
+
+- **Compilação guiada pelo próprio jogo (PGO):** o renderizador foi otimizado pelo caminho que o jogo realmente usa. No notebook com RTX 4050, praça do Burgo: o replay (a parte que transforma os comandos do jogo em Vulkan) ficou ~30% mais rápido e o FPS subiu 5 a 7%.
+- **Sem a névoa de um quadro:** a cena às vezes ficava enevoada por um quadro. A causa era o recurso de páginas tardias, que vem desligado agora (`RX_VK_LATE_LIVE=1` liga). O log ganhou um detector de piscada (`vk: scene flicker`).
+- **Guarda de RAM (PCs de 16 GB):** quando a memória do PC aperta, a preparação de shaders usa menos threads e a memória de vídeo parada é devolvida, para o Windows não fechar o jogo por falta de memória. `RX_VK_RAM_GUARD=0` desliga.
+- **Relatório de problema:** menu Insert/F1 > Gameplay > **Gerar relatório**, e **F9** para marcar um bug na hora em que ele acontece. Depois de uma sessão que terminou mal, o relatório é feito sozinho. Ele junta o log, as opções e um resumo do PC (placa, driver, Windows, memória), **sem dados pessoais**, num .zip na pasta do jogo. Mande o .zip junto com o seu relato.
+- **Envio automático dos relatórios:** ligado de fábrica; o jogo avisa numa linha antes do primeiro envio. Vai só o .zip do relatório (sem dados pessoais) para um receptor do Ocarina Engine na Cloudflare. Desliga no menu Insert/F1 > Gameplay > Enviar relatórios automaticamente, ou com `OCARINA_REPORT_UPLOAD=0`.
+- **Memória de vídeo pelo que o jogo precisa:** as texturas usam no máximo 1,5 GB em qualquer placa, em vez de uma fatia da placa. `RX_VK_TEX_CEIL_MB=<MB>` muda, 0 tira o teto.
+- **Menu em português:** Insert/F1 > Jogo > Idioma / Language (Automático segue o idioma do jogo).
+- **Abas pelo controle:** LB/RB (L1/R1 no PlayStation) trocam de aba; o direcional para os lados também, numa linha que não tem valor para mudar.
+- **"Salvar as alterações?"** ao fechar o menu: Sim grava; Não volta tudo ao que era quando o menu abriu.
+- **Cores vivas com nível:** Desligado, Leve, Médio e Forte (de fábrica). `RX_VK_VIVID=0..3` muda.
+- **Visual próprio:** tela de preparo de shaders e menu Insert com a cara do Ocarina Engine, e ícone de ocarina na janela e na barra de tarefas.
+- **Correção:** com pouca RAM livre a tela de preparo podia ficar parada em 100%.
+
+Na primeira abertura depois da troca, o jogo prepara os shaders de novo (alguns minutos, uma vez só).
+
+## Na v0.3: menos travadas ainda, e atualização pelo menu
 
 **v0.3.1:** a trava de VRAM da v0.3.0 deixava o jogo mais lento em algumas placas e agora vem desligada (`RX_VK_VRAM_GOV=1` liga). A VRAM cai pelo **detalhe de textura**: em placas de até 6,5 GB, as texturas ASTC grandes sobem sem o nível de detalhe maior (`RX_VK_TEX_DETAIL=0` desliga). Na GTX 1660 Super, no Burgo: ~740 MB a menos de VRAM, abaixo do limite da placa, e 38% menos quadros acima de 50 ms. Saíram também as correções trazidas do Hookshot oficial e do Mako, que custavam FPS.
 

@@ -83,6 +83,11 @@ enum class ProgramKind { Graphics, Compute, Mesh };
 /// color_types: the attachments' Shader::AttributeType (Float / SignedInt / UnsignedInt), for the fragment outputs.
 /// Graphics programs may come back not ready yet (translation queued): the draw leaves itself out or program_wait()s.
 const Program* program_for(const NvnState& s, ProgramKind kind, const uint8_t color_types[8]);
+/// (hookshot) how program_for's picks went, since the start (RX_VK_PROF_FINE's frame line gives them a draw): from the pair of the last
+/// picks, from the thread's map by the counters of what the answers read (RX_VK_PROG_CACHE), from the map with the same handles read,
+/// with other textures of the same types, a full pick (program_pick); and RX_VK_PROG_CACHE=check's picks checked and those that differed
+enum ProgPickN { PPN_PAIR, PPN_GEN, PPN_SAME, PPN_OTHER, PPN_PICK, PPN_CHECKED, PPN_CHECK_DIFF, PPN_COUNT };
+extern int64_t prog_pick_n[PPN_COUNT];
 uint64_t compute_code_key(const NvnState& s);   // (hookshot) the bound compute program's code key, 0: none
 std::string program_textures(const NvnState& s, const Program& p);   // (hookshot, for logs)
 std::string program_code_keys(const NvnState& s);   // (hookshot) " stage:key" for each of the bound program's codes

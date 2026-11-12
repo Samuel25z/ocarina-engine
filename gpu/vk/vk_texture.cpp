@@ -4420,6 +4420,7 @@ void texture_frame(uint64_t completed) {
                 logf("vk: memory: working set %llu MB (peak %llu), private %llu MB, staging %llu MB in %zu arenas",
                      (unsigned long long)(pm.WorkingSetSize >> 20), (unsigned long long)(pm.PeakWorkingSetSize >> 20),
                      (unsigned long long)(pm.PrivateUsage >> 20), (unsigned long long)(kept >> 20), arenas.size());
+            ram_guard_log();   // (Ocarina Engine: what the RAM guard sees and did, vk_memory.cpp)
 #if defined(__linux__) && defined(__GLIBC__)
             // (glibc's heap: what its arenas hold free. The shader translation and the loads' decoding leave their garbage spread through
             // the threads' arenas (26 of them, 1.2 GB resident in Kokiri Forest, the heap's growth in a scene change never going back),
@@ -4490,6 +4491,17 @@ void texture_frame(uint64_t completed) {
     // in Hyrule Field, so 70% (5.1 GB of an 8 GB card's 7.3) put the whole past what the card holds. The driver paged VRAM to system
     // memory and the GPU time went from ~13 to 55 ms a frame for good: an RTX 3060 Ti at 14 fps ten seconds into play, #1400's
     // RTX 4050 at 5 fps. RX_VK_VRAM_MB=<MB>: the old size, or any)
+    {   // (Ocarina Engine) textures take what the game needs, not a share of the card: a bigger card does not fill up just because it
+        // can. 1500 MB of textures on a GTX 1660 Super (6 GB) measured the same FPS and stutters as ~2000 MB, with no blur, in the Burgo
+        // and in Hyrule Field (bench 2, PEDIDO-19), and 1400 = 1900 MB on the RTX 4050 laptop. RX_VK_TEX_CEIL_MB=<MB> another
+        // ceiling, 0 none; RX_VK_VRAM_MB is not capped
+        static const uint64_t ceil_mb = getenv("RX_VK_TEX_CEIL_MB") ? (uint64_t)atoll(getenv("RX_VK_TEX_CEIL_MB")) : 1536;
+        static bool told_ceil;
+        if (!getenv("RX_VK_VRAM_MB") && ceil_mb && own > (ceil_mb << 20)) {
+            if (!told_ceil) told_ceil = true, logf("vk: textures at most %llu MB, what the game needs (RX_VK_TEX_CEIL_MB=<MB>: other, 0: none)", (unsigned long long)ceil_mb);
+            own = ceil_mb << 20;
+        }
+    }
     {   // (hookshot) an integrated GPU's "VRAM" is the system's RAM, which the game's own ~10 GB also needs: 70% of what the driver allows
         // was 5.3 GB of textures on a 16 GB laptop with a Radeon 780M, and the PC ran out of memory in Hyrule Field within minutes
         // (Discord, 2026-11-09). At most 2.5 GB there unless RX_VK_VRAM_MB says otherwise

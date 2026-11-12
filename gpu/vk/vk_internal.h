@@ -148,6 +148,12 @@ struct UniformUpload {
 UniformUpload uniform_upload(uint64_t size);   // empty: no recording or no room; no history consumed
 /// Changes when a read binding remembered earlier must be looked up again (a pool left, a mirror was made, a new submission)
 uint64_t gpu_bind_stamp();
+/// (Ocarina Engine, RX_VK_BIND_CACHE) Whether this thread's last gpu_buffer_bind answered what its remembered read bindings
+/// keep (a read binding found again, or one remembered just now): the same address and size give the same answer while
+/// bind_cache_stamp() stands. Read once
+bool gpu_bind_was_memo();
+/// (Ocarina Engine, RX_VK_BIND_CACHE) gpu_bind_stamp(), and the game's pool table (gpu_pool_end's answers) with it
+uint64_t bind_cache_stamp();
 /// Around each submission's recording: mirrors wanted since the last one are made (begin), what the GPU wrote into
 /// mirrors goes back to guest memory (end, outside any pass, before the closing barrier)
 void memory_begin_submission();
@@ -298,6 +304,23 @@ uint64_t vram_gov_misc_block_bytes();
 /// (vk_memory.cpp) the mirrors' budget before the VRAM governor's cut, and the cut (RX_VK_VRAM_GOV: the last of its levers)
 uint64_t mirror_budget_base();
 void vram_gov_mirror_cut(uint64_t bytes);
+/// (Ocarina Engine, vk_memory.cpp) The RAM guard: the PC's memory, read at most every 250 ms. commit_level 0: room; 1: under 3 GB of
+/// commit left; 2: under 1.5 GB (the next allocations can fail and the game close "out of memory"). level: the same, and 1 also
+/// when the physical memory is 95% used. RX_VK_RAM_GUARD=0: always 0 (every lever as before)
+struct RamState {
+    uint64_t phys_total = 0, phys_avail = 0, commit_limit = 0, commit_avail = 0, priv = 0;
+    int level = 0;          // (the commit's and the physical memory's: what the imports answer)
+    int commit_level = 0;   // (the commit's alone: what the VRAM levers answer, the VRAM being commit and not RAM)
+};
+RamState ram_state();
+/// (every 600 presents, beside the "vk: memory:" line) what the guard sees and what its levers did
+void ram_guard_log();
+/// (vk_draw.cpp) whether the preparation's worker `me` of `of` may build now, by the commit left (each build ~256 MB at its peak;
+/// worker 0 always may). RX_VK_PREP_RAM=0: all of them, as before
+bool prep_worker_may_run(unsigned me, unsigned of);
+void prep_ram_note(unsigned allowed, unsigned of);
+/// (a preparation's part done) the fewest workers the guard allowed in it, logged once
+void prep_ram_summary(const char* what);
 bool image_compact_active();
 /// A pass begun: the moves VMA asks for. False: nothing left to move, the compaction is over (then *freed_bytes and
 /// *freed_blocks say what went back to the driver in all)

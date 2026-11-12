@@ -27,8 +27,9 @@ struct Options {
     int dlss_model = 0;   // DLSS's network, by its preset: 0 K (transformer), 1 M, 2 L (second-generation transformer), 3 NVIDIA's
                           // default (upscaler_rows.h model_preset; vk_dlss.cpp). RX_VK_DLSS_PRESET over it
     int sharpness = 0;    // 0 to 100
-    int vivid = 1;        // Vivid colors: a little more saturation (vibrance) and contrast in the window pass (shaders/fg_scale.comp);
-                          // on by default (a file without vivid_colors= keeps it on); not with HDR. RX_VK_VIVID=0/1 over it
+    int vivid = 3;        // Vivid colors: more saturation (vibrance) and contrast in the window pass (shaders/fg_scale.comp), by
+                          // level: 0 off, 1 light (the old On: an older file's vivid_colors=1), 2 medium, 3 strong (the default);
+                          // not with HDR. RX_VK_VIVID=0..3 over it
     int anisotropy = 4;   // (hookshot) Anisotropic filtering: 0 the game's own (1x or 2x), 1 2x, 2 4x, 3 8x, 4 16x (the
                           // device's limit at most; gpu/vk/vk_draw.cpp aniso_override, RX_VK_ANISO over it)
     int realtime = 1;     // game time follows the clock (host/nn_vi.c); 0: per frame (slower frames, slower game)
@@ -75,8 +76,17 @@ struct Options {
     int volume = 100;     // (hookshot) the game's sound in percent, 0 to 100 (host/nn_audio.c: HOS_OPT_VOLUME, 27)
     int mute_background = 0;   // (hookshot) no sound while another window has the focus (host/nn_audio.c: HOS_OPT_MUTE_BACKGROUND, 28)
     int mic = 1;          // (hookshot) the ocarina's microphone: 0 Off, 1 the system's default, 2.. a device as host->mic_name lists it (host/nn_audio_in.c)
+    int auto_report = 1;  // (ocarina) Relatórios automáticos: a report after a session that ended badly (ocarina_report.cpp); saved as auto_report
+    int report_upload = 1;   // (ocarina) Enviar relatórios automaticamente: each report sent to the receiver (ocarina_upload.h); saved as report_upload
+    int menu_language = 0;   // (ocarina) the Insert menu's language: 0 Auto (the game's: Portuguese when it is pt), 1 Português,
+                             // 2 English (vk_menu.cpp menu_pt); saved as menu_language
 };
 extern Options opts;
+/// (ocarina) The reports' notice (ocarina_report.cpp toast), by level: 1 the reports are saved, 2 they are also sent. Whether
+/// hookshot_options.ini says one of that level or above was shown (ocarina_report_notice=<level>), and that one is shown now
+/// (saved by the next menu_tick)
+bool menu_report_notice_seen(int level);
+void menu_report_notice_done(int level);
 /// (vk_memory.cpp) true when the quality preset's memory budgets (vram_mb, mirror_mb) are to be used: the card has no more
 /// video memory than the preset is for. A 4GB preset on an 8 GB card kept 256 MB of mirrors and 2.2 GB of textures: the
 /// game's memory was read over PCIe and the textures made again every frame, 5 fps with the CPU idle (Discord, 11-08)

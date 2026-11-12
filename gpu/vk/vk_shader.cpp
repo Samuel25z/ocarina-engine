@@ -671,12 +671,17 @@ uint32_t descriptor_handle(const NvnState& s, const Stage& st, const Shader::Ima
 uint8_t texture_answer(uint32_t handle) {
     if (!handle) return 0xFF;
     // (by the texture slot, until a slot is registered anew: variant checks ask on every draw)
-    static thread_local std::unordered_map<uint32_t, std::pair<uint32_t, uint8_t>> known;   // slot -> (version, answer)
+    // (hookshot, fps: a flat table by slot, not a hash map: every draw's variant check asks this for each texture it samples,
+    // and the map's lookups were ~16% of the back end's time on the replay thread. Slots are the texture pool's indices, ~33k in OoT)
+    struct Known { uint32_t version; uint8_t answer, set; };
+    static thread_local std::vector<Known> known;
     const uint32_t id = handle & 0xFFFFF;
     const uint32_t version = texture_slot_version((int)id);
-    if (auto it = known.find(id); it != known.end() && it->second.first == version) return it->second.second;
+    if (id >= known.size()) known.resize(std::min<size_t>(std::max<size_t>(id + 1, known.size() * 2), 1u << 20));
+    Known& k = known[id];
+    if (k.set && k.version == version) return k.answer;
     const uint8_t a = (uint8_t)((uint8_t)handle_texture_type(handle) | (handle_is_integer(handle) ? 0x80 : 0));
-    known[id] = {version, a};
+    k = {version, a, 1};
     return a;
 }
 /// What the bound textures answer now, for a program whose translation asked about them
@@ -2020,6 +2025,13 @@ namespace {
 struct Pick {
     const Program* p = nullptr;
     std::vector<uint32_t> handles;   // (at its answers' descriptors: their slots and the slots' versions)
+    // (hookshot) what p's answers were read at: the handles stand while the state's counters of what they are read from do (gens_hold).
+    // amask: answer_stage_mask(p), want: what each answer must answer (still_valid's right side), both worked out once for p
+    bool gens = false;
+    uint32_t amask = ~0u;
+    uint64_t bind = 0, reg = 0, ub = 0;
+    uint64_t tex_gen[kNvnStages]{};
+    std::vector<uint8_t> want;
 };
 thread_local std::unordered_map<uint64_t, Pick> picks;   // (each recording thread's: program_pick has its own lock)
 uint64_t pick_inputs(const NvnState& s, const uint8_t color_types[8]) {
@@ -2133,6 +2145,79 @@ struct ProgFast {
 };
 thread_local ProgFast prog_fast[2];
 
+int64_t prog_pick_n[PPN_COUNT];
+
+namespace {
+/// (hookshot) RX_VK_PROG_CACHE: 1 (the default) a pick of the thread's map kept while the counters of what its answers are read from stand
+/// (gens_hold), and one whose handles changed checked at the answers that changed only (pick_recheck); 0: as before (each pick that leaves
+/// the pair reads every handle, and checks every answer when one differs); check: both, the old way's result given, the differences counted
+/// (prog_pick_n, the frame line) and the first ones logged
+int prog_cache_mode() {
+    static const int m = [] {
+        const char* e = getenv("RX_VK_PROG_CACHE");
+        if (!e || !*e) return 1;
+        if (!strcmp(e, "check")) return 2;
+        return atoi(e) ? 1 : 0;
+    }();
+    return m;
+}
+/// A pick's program anew: the stages its answers are read from, and what each must answer (still_valid's right side), once
+void pick_set(Pick& pk, const Program* p, bool compute) {
+    pk.p = p;
+    pk.gens = false;
+    pk.amask = compute ? ~0u : answer_stage_mask(*p);
+    pk.want.resize(p->answers.size());
+    for (size_t i = 0; i < p->answers.size(); i++) pk.want[i] = canonical_answer(*p, p->answers[i], p->answers[i].type);
+}
+/// The counters the pick's handles were read at
+void pick_note(Pick& pk, const NvnState& s, uint64_t bind, uint64_t reg, uint64_t ub) {
+    pk.gens = true, pk.bind = bind, pk.reg = reg, pk.ub = ub;
+    std::memcpy(pk.tex_gen, s.tex_gen, sizeof pk.tex_gen);
+}
+/// Whether nothing the pick's handles are read from changed since they were read: no texture registration (the slots' versions), and the
+/// textures, samplers and images of the stages the answers read (answer_stage_mask, NvnState::tex_gen) or, for a program whose answers read
+/// other banks, no binding at all and no uniform update (what the pair of the last picks asks)
+bool gens_hold(const Pick& pk, const NvnState& s, uint64_t bind, uint64_t reg, uint64_t ub) {
+    if (!pk.gens || pk.reg != reg) return false;
+    if (pk.amask == ~0u) return pk.bind == bind && pk.ub == ub;
+    for (int k = 0; k < kNvnStages; k++)
+        if ((pk.amask >> k & 1) && pk.tex_gen[k] != s.tex_gen[k]) return false;
+    return true;
+}
+/// The pick's handles read again, answer by answer: 0 as before; 1 others, each of the type the program was made for (pk.handles are now
+/// these); 2 one of another type (a full pick follows, pk.handles half written). Only the answers whose slot or version changed are
+/// checked: the others answered as they must when they were read (a slot 0 read from a handle other than 0 excepted, which the read before
+/// may have been from 0: then still_valid's full check, as before)
+int pick_recheck(const NvnState& s, Pick& pk) {
+    const Program& p = *pk.p;
+    uint32_t* h = pk.handles.data();
+    int r = 0;
+    bool zero = false;
+    for (size_t i = 0; i < p.answers.size(); i++) {
+        const Program::Answer& a = p.answers[i];
+        const uint32_t raw = answer_handle(s, p, a);
+        const uint32_t id = raw & 0xFFFFF, version = texture_slot_version((int)id);
+        if (h[2 * i] == id && h[2 * i + 1] == version) {
+            zero |= !id && raw;
+            continue;
+        }
+        r = 1;
+        h[2 * i] = id, h[2 * i + 1] = version;
+        if (raw && canonical_answer(p, a, answer_of(raw, a.image)) != pk.want[i]) return 2;
+    }
+    if (r && zero && !still_valid(s, p)) return 2;
+    return r;
+}
+void prog_check_diff(const Program& p, const char* what, int r, bool eq, bool valid) {
+    prog_pick_n[PPN_CHECK_DIFF]++;
+    static std::atomic<int> logged{0};
+    if (logged++ < 24)
+        logf("vk: program cache check: program %016llx variant %016llx: %s (answer by answer %d; the full read: %s, %s)",
+             (unsigned long long)p.key, (unsigned long long)p.variant, what, r, eq ? "the same handles" : "other handles",
+             valid ? "valid" : "not valid");
+}
+} // namespace
+
 const Program* program_for(const NvnState& s, ProgramKind kind, const uint8_t color_types[8]) {
     if (!s.has_prog) return nullptr;
     if (kind == ProgramKind::Mesh) return mesh_program_for(s, color_types);
@@ -2160,45 +2245,87 @@ const Program* program_for(const NvnState& s, ProgramKind kind, const uint8_t co
         if (prog_same((int)kind, s.prog.serial, stages, bind, reg, ub, s.nvattr, s.vattr, color_types, f.kind, f.serial,
                       f.stages, fbind, f.reg, f.ub, f.nvattr, f.vattr, f.ct)) {
             st_by_tex += by_tex && f.bind != bind;
+            prog_pick_n[PPN_PAIR]++;
             return st_hit++, f.p;
         }
     }
+    // (hookshot) the thread's map: a pick kept while the counters of what its answers are read from stand (gens_hold), else its handles read
+    // again and only the answers that changed checked (pick_recheck). RX_VK_PROG_CACHE=0: as before, =check: both ways, differences counted
+    const int mode = prog_cache_mode();
     const uint64_t key = (compute ? 0x5EED : pick_inputs(s, color_types)) * 1099511628211ull ^ s.prog.serial;
     Pick& pk = picks[key];
-    auto keep = [&](const Program* p) {
+    auto keep = [&](const Program* p, uint32_t amask) {   // (amask: answer_stage_mask(*p), the pick's)
         if (!p || !p->ready.load(std::memory_order_acquire) || p->failed) return p;
         if (!(prog_fast[0].on && prog_fast[0].p == p)) prog_fast[1] = prog_fast[0];
         ProgFast& f = prog_fast[0];
         f.on = true, f.kind = (int)kind, f.serial = s.prog.serial, f.stages = stages, f.bind = bind, f.reg = reg, f.ub = ub;
         f.nvattr = s.nvattr, f.p = p;
-        f.amask = compute ? ~0u : answer_stage_mask(*p);
+        f.amask = compute ? ~0u : amask;
         std::memcpy(f.tex_gen, s.tex_gen, sizeof f.tex_gen);
         std::memcpy(f.vattr, s.vattr, sizeof f.vattr);
         std::memcpy(f.ct, color_types, sizeof f.ct);
         return p;
     };
     if (pk.p && pk.p->ready.load(std::memory_order_acquire) && !pk.p->failed) {
-        if (pk.p->answers.empty()) return st_hit++, keep(pk.p);
-        static thread_local std::vector<uint32_t> now;
-        answer_handles(s, *pk.p, now);
-        if (now == pk.handles) return st_hit++, keep(pk.p);
-        st_differ++;
-        if (still_valid(s, *pk.p)) {   // (other textures of the same types: the same variant)
-            pk.handles.swap(now);
-            return keep(pk.p);
+        const Program* const p = pk.p;
+        if (p->answers.empty()) return st_hit++, prog_pick_n[PPN_SAME]++, keep(p, pk.amask);
+        const size_t n = p->answers.size();
+        const bool fits = pk.want.size() == n && pk.handles.size() == 2 * n;
+        if (mode == 1 && fits) {
+            if (gens_hold(pk, s, bind, reg, ub)) return st_hit++, prog_pick_n[PPN_GEN]++, keep(p, pk.amask);
+            const int r = pick_recheck(s, pk);
+            if (r == 0) {
+                pick_note(pk, s, bind, reg, ub);
+                return st_hit++, prog_pick_n[PPN_SAME]++, keep(p, pk.amask);
+            }
+            st_differ++;
+            if (r == 1) {   // (other textures of the same types: the same variant)
+                pick_note(pk, s, bind, reg, ub);
+                prog_pick_n[PPN_OTHER]++;
+                return keep(p, pk.amask);
+            }
+        } else {
+            static thread_local std::vector<uint32_t> now;
+            if (mode == 2 && fits) {   // (check: the new ways' answers, then the old one's, which is given)
+                static thread_local Pick trial;
+                trial.p = p, trial.want = pk.want, trial.handles = pk.handles;
+                const bool by_gens = gens_hold(pk, s, bind, reg, ub);
+                const int r = pick_recheck(s, trial);
+                answer_handles(s, *p, now);
+                const bool eq = now == pk.handles, valid = eq || still_valid(s, *p);
+                prog_pick_n[PPN_CHECKED]++;
+                if (by_gens && !eq) prog_check_diff(*p, "kept by its counters, but its handles read otherwise", r, eq, valid);
+                else if ((r == 0) != eq || (r != 2) != valid) prog_check_diff(*p, "the answer by answer check differed", r, eq, valid);
+                else if (r == 1 && trial.handles != now) prog_check_diff(*p, "the answer by answer read kept other handles", r, eq, valid);
+            }
+            answer_handles(s, *p, now);
+            if (now == pk.handles) {
+                pick_note(pk, s, bind, reg, ub);
+                return st_hit++, prog_pick_n[PPN_SAME]++, keep(p, pk.amask);
+            }
+            st_differ++;
+            if (still_valid(s, *p)) {   // (other textures of the same types: the same variant)
+                pk.handles.swap(now);
+                pick_note(pk, s, bind, reg, ub);
+                prog_pick_n[PPN_OTHER]++;
+                return keep(p, pk.amask);
+            }
         }
     } else {
         st_none++;
     }
+    prog_pick_n[PPN_PICK]++;
     const Program* picked = program_pick(s, kind, color_types);
     if (picked && picked->ready.load(std::memory_order_acquire) && !picked->failed) {
-        pk.p = picked;
+        pick_set(pk, picked, compute);
         answer_handles(s, *picked, pk.handles);
+        pick_note(pk, s, bind, reg, ub);
     } else {
-        pk.p = nullptr;
+        pk.p = nullptr, pk.gens = false;
     }
+    const uint32_t amask = pk.amask;   // (the map may be emptied below)
     if (picks.size() > 65536) picks.clear();
-    return keep(picked);
+    return keep(picked, amask);
 }
 
 const Program* program_pick(const NvnState& s, ProgramKind kind, const uint8_t color_types[8]) {

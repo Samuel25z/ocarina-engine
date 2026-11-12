@@ -27,7 +27,12 @@
 #include "vk_antilag.h"
 #include "vk_progress.h"
 #include "ocarina_brand.h"   // (ocarina: the window's title)
+#if defined(_WIN32) && __has_include("ocarina_logo.h")
+#include "ocarina_logo.h"    // (ocarina: the window's icon)
+#define OCARINA_HAS_LOGO 1
+#endif
 #include "ocarina_update.h"  // (ocarina: the menu's update, asked for once the window's renderer starts)
+#include "ocarina_report.h"  // (ocarina: the problem report; the automatic one after a session that ended badly)
 
 namespace vkx {
 #define VKX_DEFINE(f) PFN_##f f;
@@ -988,6 +993,35 @@ static void choose_present_queue() {
 }
 
 #ifdef _WIN32
+// (ocarina) The window's icon, in the title bar, the taskbar and Alt+Tab, as the Ocarina Engine's (gpu/vk/ocarina_logo.h), over
+// the host's (the exe's resource, the Hookshot's): a DLL swap changes it too. A 32-bit icon from the logo's RGBA, made once
+static void brand_icon(HWND hwnd) {
+#ifdef OCARINA_HAS_LOGO
+    static HICON icon = [] () -> HICON {   // (an icon resource in memory, user32 only: a DIB of twice the height, then the AND mask)
+        const int w = (int)ocarina_logo_w, h = (int)ocarina_logo_h, mask_row = ((w + 31) / 32) * 4;
+        std::vector<uint8_t> res(sizeof(BITMAPINFOHEADER) + (size_t)w * h * 4 + (size_t)mask_row * h, 0);
+        BITMAPINFOHEADER* bi = (BITMAPINFOHEADER*)res.data();
+        bi->biSize = sizeof *bi, bi->biWidth = w, bi->biHeight = h * 2, bi->biPlanes = 1, bi->biBitCount = 32;
+        bi->biCompression = BI_RGB;
+        uint8_t* o = res.data() + sizeof *bi;
+        for (int y = 0; y < h; y++)   // (bottom-up, RGBA to BGRA)
+            for (int x = 0; x < w; x++) {
+                const uint8_t* in = ocarina_logo_rgba + ((size_t)(h - 1 - y) * w + x) * 4;
+                uint8_t* px = o + ((size_t)y * w + x) * 4;
+                px[0] = in[2], px[1] = in[1], px[2] = in[0], px[3] = in[3];
+            }
+        return CreateIconFromResourceEx(res.data(), (DWORD)res.size(), TRUE, 0x00030000, w, h, LR_DEFAULTCOLOR);
+    }();
+    if (!icon) return;
+    SendMessageW(hwnd, WM_SETICON, ICON_BIG, (LPARAM)icon);
+    SendMessageW(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)icon);
+#else
+    (void)hwnd;
+#endif
+}
+#endif
+
+#ifdef _WIN32
 // (ocarina) The window's title as Ocarina Engine's: the host's leading "Hookshot" (host/hos.h HOS_GAME_TITLE) replaced, what
 // follows it kept; another title gets the name in front. Once, here: the host sets its title at CreateWindowA and never
 // again. start runs on the window's own thread (host/display.c display_main), so the text is set directly
@@ -1002,11 +1036,39 @@ void brand_title(HWND hwnd) {
     if (rest == old && *old) t += L" - ";
     t += rest;
     SetWindowTextW(hwnd, t.c_str());
+    brand_icon(hwnd);
+}
+#endif
+
+#ifdef OCARINA_PGO_GEN
+// (Ocarina Engine, a profiling build only: nx2/build.py RX_VK_PGO_GEN=1) the counters written to ocarina-vk.profraw beside the exe
+// every 30 s, each time the whole run so far: the bench ends the game by killing it, and the runtime writes only at a clean exit
+extern "C" int __llvm_profile_write_file(void);
+extern "C" void __llvm_profile_set_filename(const char*);
+static void pgo_writer() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        std::thread([] {
+            char exe[MAX_PATH];
+            const DWORD n = GetModuleFileNameA(nullptr, exe, MAX_PATH);
+            std::string dir(exe, n);
+            dir = dir.substr(0, dir.find_last_of("\\/") + 1);
+            static std::string path = dir + "ocarina-vk.profraw";
+            __llvm_profile_set_filename(path.c_str());
+            for (;;) {
+                Sleep(30000);
+                __llvm_profile_write_file();
+            }
+        }).detach();
+    });
 }
 #endif
 
 int start(void* hwnd) {
     main_window = (HWND)hwnd;
+#ifdef OCARINA_PGO_GEN
+    pgo_writer();
+#endif
     if (!hwnd) {   // (HOS_HEADLESS: no window; the frames are rendered all the same, RX_VK_SHOTS writes them out)
         dev.offscreen = true;
         dev.swap_extent = {1920, 1080};
@@ -1023,6 +1085,7 @@ int start(void* hwnd) {
     if (vkCreateWin32SurfaceKHR(dev.instance, &si, nullptr, &dev.surface) != VK_SUCCESS) return 0;
     brand_title((HWND)hwnd);
     ocarina_update::begin();   // (ocarina: in the background; the last update's leftovers removed)
+    ocarina_report::begin();   // (ocarina: in the background; a report of the last session when it did not end cleanly)
     VkBool32 ok = VK_FALSE;
     vkGetPhysicalDeviceSurfaceSupportKHR(dev.physical, dev.queue_family, dev.surface, &ok);
     if (!ok) return 0;

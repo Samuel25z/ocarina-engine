@@ -5,7 +5,9 @@
 // its attachments, the barriers, the copy regions, the dynamic state arrays), so a packet owns all it needs and no longer reads the
 // caller's memory. A packet is run by one decoder (execute: the packet's thunk calls the real ::vkx function with the copies).
 //
-//   RX_VK_RECORDER unset / anything else: off, the calls go straight to the driver as before (one relaxed load and a branch a call)
+//   (Ocarina Engine) RX_VK_RECORDER unset: "thread" where the process may use 6 CPU threads or more (kDefaultMinThreads), off on
+//                        fewer. RX_VK_RECORDER=off or 0: off, the calls go straight to the driver as before (one relaxed load and a
+//                        branch a call); thread, on or 1: thread; any other value: off (logged once)
 //   RX_VK_RECORDER=sync: each call packed, then run at once on the same thread, in the same order: the same calls with the same
 //                        values, made from the packet's copies (the proof that the copies are complete and exact)
 //   RX_VK_RECORDER=defer: (step 1.5, serial replay only) the packets held in the thread's arena and run at drain(), in order, on the
@@ -25,8 +27,13 @@
 //                        counted and logged once). The ring full: the producer waits (backpressure); a packet bigger than the room
 //                        it is given, or no ring: the producer waits until the recorder is idle, then makes the call directly.
 //                        Refused (off, logged once) with RX_VK_PARALLEL>=2. RX_VK_RECORDER_RING_MB (default 8),
-//                        RX_VK_RECORDER_POISON=1 (each packet filled with 0xCD once run), RX_VK_RECORDER_STATS=0 (no 10 s stats
-//                        line), RX_VK_RECORDER_SPIN_US (the recorder's spin with nothing to run, before it sleeps: default adaptive 20-200)
+//                        RX_VK_RECORDER_POISON=1 (each packet filled with 0xCD once run), RX_VK_RECORDER_STATS=0 (no stats line;
+//                        (Ocarina Engine) the line is written every 600 presents: present_tick()), RX_VK_RECORDER_SPIN_US (the
+//                        recorder's spin with nothing to run, before it sleeps: default adaptive 20-200).
+//                        (Ocarina Engine) The recorder checks each packet's header before it runs it (check_packet: its sequence
+//                        number, its call, its size inside the room): a packet out of order or torn ends the process loudly
+//                        (FATAL, exit code 3) instead of running a call from garbage. The recorder thread is kept off the replay's
+//                        reserved core (vk_replay.cpp's start hook)
 //
 // A packet: [Packet header: thunk, next, op, size][the call's closure: its value arguments and the arena pointers of its copies],
 // preceded in the arena by the copied arrays. The arena is the recording thread's own (thread_local: the parallel replay's workers each
@@ -165,22 +172,48 @@ inline bool parallel_configured() {
     const char* p = getenv("RX_VK_PARALLEL");
     return p && atoi(p) >= 2;
 }
-/// RX_VK_RECORDER: sync; defer, thread (serial only: refused, off, with RX_VK_PARALLEL); anything else, or unset, off
-inline int mode_from_env(bool* refused) {
+/// (Ocarina Engine) the CPU threads the process may use from which RX_VK_RECORDER unset means thread: the recorder takes a core
+/// of its own while the replay records (the replay thread has its reserved one), which a CPU with fewer cannot spare
+constexpr unsigned kDefaultMinThreads = 6;
+inline bool default_thread() { return std::thread::hardware_concurrency() >= kDefaultMinThreads; }
+/// Why mode_from_env() did not give the mode asked for (logged once by mode_init)
+enum EnvNote : int { ENV_ASKED = 0, ENV_DEFAULT = 1 /* (unset: the default) */, ENV_REFUSED = 2, ENV_UNKNOWN = 3 };
+/// RX_VK_RECORDER: unset, thread where default_thread(), else off; off, 0: off; sync; defer; thread, on, 1: thread (defer and
+/// thread: serial only, refused, off, with RX_VK_PARALLEL); anything else: off. *note: why (EnvNote); *by_default: unset
+inline int mode_from_env(int* note, bool* by_default) {
     const char* e = getenv("RX_VK_RECORDER");
-    *refused = false;
-    if (!e) return OFF;
-    if (!strcmp(e, "sync")) return SYNC;
-    if (!strcmp(e, "defer") || !strcmp(e, "thread")) {
-        if (!parallel_configured()) return e[0] == 'd' ? DEFER : THREAD;
-        *refused = true;
+    *note = ENV_ASKED, *by_default = false;
+    int want = OFF;
+    if (!e || !*e) {
+        *by_default = true;
+        if (!default_thread()) return OFF;
+        want = THREAD;
+    } else if (!strcmp(e, "off") || !strcmp(e, "0")) {
+        return OFF;
+    } else if (!strcmp(e, "sync")) {
+        return SYNC;
+    } else if (!strcmp(e, "defer")) {
+        want = DEFER;
+    } else if (!strcmp(e, "thread") || !strcmp(e, "on") || !strcmp(e, "1")) {
+        want = THREAD;
+    } else {
+        *note = ENV_UNKNOWN;
         return OFF;
     }
-    return OFF;
+    if (parallel_configured()) {   // (serial replay only)
+        *note = ENV_REFUSED;
+        return OFF;
+    }
+    if (*by_default) *note = ENV_DEFAULT;
+    return want;
 }
 inline int mode_init() {
-    bool refused;
-    const int m = mode_from_env(&refused);
+    int note;
+    bool by_default;
+    const int m = mode_from_env(&note, &by_default);
+    const bool refused = note == ENV_REFUSED;
+    const char* asked = getenv("RX_VK_RECORDER");
+    if (!asked || !*asked) asked = "thread (the default)";
     const char* p = getenv("RX_VK_RECORDER_POISON");
     g_poison.store((m == DEFER || m == THREAD) && p && atoi(p) != 0, std::memory_order_relaxed);
     if (m == THREAD) {
@@ -194,7 +227,9 @@ inline int mode_init() {
     if (refused)   // (once: the thread that set the mode)
         ::mkwvk::logf("vk: RX_VK_RECORDER=%s refused: RX_VK_PARALLEL=%s records a command buffer on several threads (deferred "
                       "packets are the recording thread's own); the recorder is off",
-                      getenv("RX_VK_RECORDER"), getenv("RX_VK_PARALLEL"));
+                      asked, getenv("RX_VK_PARALLEL"));
+    else if (note == ENV_UNKNOWN)
+        ::mkwvk::logf("vk: RX_VK_RECORDER=%s is not a mode (thread, off, sync, defer): the recorder is off", asked);
     else if (m == DEFER)
         ::mkwvk::logf("vk: RX_VK_RECORDER=defer: vkCmd* packed and held, drained in order at each command buffer begin, end and "
                       "reset, submit, wait, readback, destruction and replay lock release (serial replay only)%s",
@@ -202,9 +237,15 @@ inline int mode_init() {
     else if (m == THREAD)
         ::mkwvk::logf("vk: RX_VK_RECORDER=thread: vkCmd* packed on the replay thread and run in order by a recorder thread; the "
                       "replay waits for it at each command buffer begin, end and reset, submit, wait, readback, destruction and "
-                      "replay lock release (serial replay only); ring %zu KB, spin %s%llu us%s",
+                      "replay lock release (serial replay only); ring %zu KB, spin %s%llu us%s; %s (%u CPU threads; "
+                      "RX_VK_RECORDER=off: off)%s",
                       g_ring_bytes >> 10, g_spin_ns ? "" : "adaptive 20-", (unsigned long long)(g_spin_ns ? g_spin_ns / 1000 : 200),
-                      g_poison.load(std::memory_order_relaxed) ? "; packets poisoned once run" : "");
+                      g_poison.load(std::memory_order_relaxed) ? "; packets poisoned once run" : "",
+                      note == ENV_DEFAULT ? "on by default" : "asked for", std::thread::hardware_concurrency(),
+                      g_stats_log ? "; a line every 600 presents" : "");
+    else if (by_default)
+        ::mkwvk::logf("vk: RX_VK_RECORDER: off by default on %u CPU threads (thread from %u; RX_VK_RECORDER=thread: on)",
+                      std::thread::hardware_concurrency(), kDefaultMinThreads);
     return m;
 }
 inline int mode() {
@@ -218,7 +259,9 @@ struct alignas(16) Packet {
     Packet* next;                 // (DEFER) the next held packet
     uint32_t op;                  // Op, for diagnostics
     uint32_t size;                // bytes of the closure after the header
+    uint32_t seq;                 // (Ocarina Engine, THREAD) its number in the ring since the recorder started: check_packet
 };
+static_assert(sizeof(Packet) == 32, "the header's size (the seq fills its padding)");
 
 /// The thread's packets. Chunks in a fixed table, each from the non-throwing aligned new: alloc never throws and never loses a
 /// block. It returns null when the table is full, the hard budget would be passed, or the system has no memory; the encoder then
@@ -336,21 +379,32 @@ struct Recorder {
     size_t cap = 0, mask = 0, room = 0;
     // (the producer's: its cursor, what of it is published (W), R as it last read it, and how much it writes before publishing)
     alignas(64) uint64_t w = 0, w_pub = 0, r_seen = 0, batch = 0;
+    uint32_t seq_w = 0;        // (Ocarina Engine: the producer's, the next packet's number; the recorder expects them in order)
     uint64_t spin_limit = 0;   // (the recorder's: g_spin_ns when it started)
-    // (stats: written by the producer or the recorder, read by the recorder's stats line; never on a packet's path)
+    // (stats: written by the producer or the recorder, read by the stats line; never on a packet's path. (Ocarina Engine) they only
+    // grow: the line takes the difference from the last one it wrote, so a reader (the tests) never sees them go back to 0)
     std::atomic<uint64_t> wait_n[B_COUNT]{}, wait_ns[B_COUNT]{}, wait_max[B_COUNT]{};
     std::atomic<uint64_t> spin_ns{0}, sleeps{0}, short_sleeps{0};   // (the recorder idle: time spun, sleeps, those under 200 us)
     std::atomic<uint64_t> packets{0}, busy_ns{0}, starts{0}, direct{0};   // (direct: packets that did not fit, made directly)
+    std::atomic<uint64_t> fallbacks{0};   // (Ocarina Engine: calls not packed (pNext chain, unknown descriptor type), made directly)
     std::mutex life_mu, sleep_mu;
     std::condition_variable sleep_cv;
     std::thread th;
+    // (Ocarina Engine) the stats line's: what the counters were at the last line, and when
+    struct Seen {
+        uint64_t at_ns = 0, W = 0, packets = 0, busy = 0, spun = 0, slept = 0, short_slept = 0, direct = 0, fallbacks = 0;
+        uint64_t n[B_COUNT] = {}, ns[B_COUNT] = {};
+    };
+    std::mutex stats_mu;
+    Seen seen_at_log;
 
     bool start();
     void stop();
     void main();
     void loop();
-    bool idle(uint64_t r, uint64_t& seen, uint64_t& last_log);
-    void log_stats(double secs);
+    bool idle(uint64_t r, uint64_t& seen);
+    void log_stats(const char* why);
+    [[noreturn]] void bad_packet(const Packet* p, size_t off, uint32_t want, size_t len) const;
 
     void wake() {
         { std::lock_guard lk(sleep_mu); }
@@ -424,17 +478,22 @@ struct Recorder {
             wait_room(tail + room);
             if (tail >= sizeof(Packet)) {
                 Packet* mk = reinterpret_cast<Packet*>(base + off);
-                mk->run = nullptr, mk->next = nullptr, mk->op = 0, mk->size = 0;
+                mk->run = nullptr, mk->next = nullptr, mk->op = 0, mk->size = 0, mk->seq = 0;
             }
             w += tail;   // (published with the next packet)
             off = 0, tail = cap;
         } else {
             wait_room(room);
         }
-        lim = base + off + std::min<uint64_t>(tail, cap - (w - r_seen));
+        // (Ocarina Engine) the packet's end: exactly its room, never what more the ring happens to have free. That free space
+        // depended on how far the recorder had got, so a call bigger than the room was packed on one run and made directly on
+        // another, and a packet could be bigger than the recorder's check allows. The room is free and contiguous here: tail >=
+        // room, and wait_room() waited for it. (tests/test_recorder_sync.py: the oversize runs, the second in an empty ring)
+        lim = base + off + room;
         return reinterpret_cast<Packet*>(base + off);
     }
-    void publish(const Packet* p, const uint8_t* end) {
+    void publish(Packet* p, const uint8_t* end) {
+        p->seq = seq_w++;
         w += (uint64_t)(end - reinterpret_cast<const uint8_t*>(p));
         // (the recorder asleep: this packet now, and the wake-up with it, so that it runs while the replay goes on, not at its
         // next wait)
@@ -472,6 +531,11 @@ inline bool Recorder::start() {   // (the producer, its first packet)
     // a restart still sees R reach it. Anything a stopped recorder left unrun is dropped, as a fresh ring did; offsets are & mask)
     const uint64_t at = W.load(std::memory_order_acquire);
     R.store(at, std::memory_order_release), w = w_pub = r_seen = at, stop_req.store(false);
+    seq_w = 0;   // (the new thread's loop() expects packet 0 first)
+    {
+        std::lock_guard sk(stats_mu);
+        if (!seen_at_log.at_ns) seen_at_log.at_ns = now_ns();   // (the first stats line's time: from the first start)
+    }
     batch = std::min(g_publish_bytes, room);
     spin_limit = 0;   // (set by the recorder: g_spin_ns, or adaptive)
     try {
@@ -497,7 +561,7 @@ inline void Recorder::stop() {
     wake();
     th.join();
     ready.store(false);
-    if (g_stats_log) log_stats(0);
+    if (g_stats_log) log_stats("stopped");
     ::operator delete(base, std::align_val_t(64));
     base = nullptr, cap = 0;
 }
@@ -512,7 +576,7 @@ inline void Recorder::main() {
     }
 }
 /// (the recorder, nothing published to run) spins a while, then sleeps until woken (or 2 ms); false: stop asked and nothing left
-inline bool Recorder::idle(uint64_t r, uint64_t& seen, uint64_t& last_log) {
+inline bool Recorder::idle(uint64_t r, uint64_t& seen) {
     const uint64_t t0 = now_ns();
     if (!spin_limit) spin_limit = g_spin_ns ? g_spin_ns : kSpinHi;   // (fixed, or adaptive from the top)
     for (uint32_t i = 0;; i++) {
@@ -525,10 +589,6 @@ inline bool Recorder::idle(uint64_t r, uint64_t& seen, uint64_t& last_log) {
     }
     spin_ns.fetch_add(now_ns() - t0, std::memory_order_relaxed);
     sleeps.fetch_add(1, std::memory_order_relaxed);
-    if (g_stats_log && t0 - last_log > 10000000000ull) {
-        if (last_log) log_stats((double)(t0 - last_log) / 1e9);
-        last_log = t0;
-    }
     const uint64_t s0 = now_ns();
     {
         std::unique_lock lk(sleep_mu);
@@ -548,14 +608,32 @@ inline bool Recorder::idle(uint64_t r, uint64_t& seen, uint64_t& last_log) {
     }
     return true;
 }
+/// (Ocarina Engine) A packet that fails check_packet: what it held, logged, and the process ended (FATAL, exit code 3) before its
+/// call could run from garbage
+inline void Recorder::bad_packet(const Packet* p, size_t off, uint32_t want, size_t len) const {
+    char why[320];
+    std::snprintf(why, sizeof why,
+                  "packet at ring offset %zu fails its check: number %u (%u expected), call %u (%s), size %zu (room %zu), closure at "
+                  "%u: a packet out of order or torn (the producer and the recorder disagree about the ring)",
+                  off, p->seq, want, p->op, op_name(p->op), len, room, p->size);
+    recorder_fatal(why);
+}
+/// (Ocarina Engine) the cheap check of a packet's header, before its call runs: its number is the next one (none lost, none run
+/// twice, none out of order), its call one the recorder packs, its size inside its room and the ring's tail, its closure inside it.
+/// A few compares on a header the recorder reads anyway
+inline bool check_packet(const Packet* p, uint32_t want, size_t len, size_t room, size_t tail) {
+    return p->seq == want && p->op < OP_COUNT && len > sizeof(Packet) && len <= room && len <= tail && len % alignof(Packet) == 0 &&
+           p->size >= sizeof(Packet) && p->size < len;
+}
 inline void Recorder::loop() {
-    uint64_t r = R.load(std::memory_order_relaxed), seen = r, last_log = now_ns(), n = 0, busy0 = 0;
+    uint64_t r = R.load(std::memory_order_relaxed), seen = r, n = 0, busy0 = 0;
+    uint32_t seq = 0;   // (the next packet's number: start() set the producer's to 0)
     const bool poison = g_poison.load(std::memory_order_relaxed);
     for (;;) {
         if (r == seen && (seen = W.load(std::memory_order_acquire)) == r) {
             if (busy0) busy_ns.fetch_add(now_ns() - busy0, std::memory_order_relaxed), busy0 = 0;
             if (n) packets.fetch_add(n, std::memory_order_relaxed), n = 0;
-            if (!idle(r, seen, last_log)) return;
+            if (!idle(r, seen)) return;
             continue;
         }
         if (!busy0) busy0 = now_ns();
@@ -566,41 +644,62 @@ inline void Recorder::loop() {
             R.store(r, std::memory_order_release);
             continue;
         }
+        const size_t len = (size_t)(reinterpret_cast<uintptr_t>(p->next) - reinterpret_cast<uintptr_t>(p));
+        if (!check_packet(p, seq, len, room, tail)) [[unlikely]]
+            bad_packet(p, off, seq, len);
+        seq++;
         p->run(p);
-        const size_t len = (size_t)(reinterpret_cast<const uint8_t*>(p->next) - reinterpret_cast<const uint8_t*>(p));
         if (poison) std::memset(base + off, 0xCD, len);
         r += len, n++;
         R.store(r, std::memory_order_release);
     }
 }
-inline void Recorder::log_stats(double secs) {
-    uint64_t n[B_COUNT], ns[B_COUNT], mx[B_COUNT], tot_n = 0, tot_ns = 0, max_ns = 0;
-    for (int k = 0; k < B_COUNT; k++)
-        n[k] = wait_n[k].exchange(0, std::memory_order_relaxed), ns[k] = wait_ns[k].exchange(0, std::memory_order_relaxed),
-        mx[k] = wait_max[k].exchange(0, std::memory_order_relaxed), tot_n += n[k], tot_ns += ns[k], max_ns = std::max(max_ns, mx[k]);
-    const uint64_t spun = spin_ns.exchange(0, std::memory_order_relaxed), slept = sleeps.exchange(0, std::memory_order_relaxed);
-    const uint64_t short_slept = short_sleeps.exchange(0, std::memory_order_relaxed);
-    const uint64_t pk = packets.exchange(0, std::memory_order_relaxed), busy = busy_ns.exchange(0, std::memory_order_relaxed);
-    const uint64_t dr = direct.exchange(0, std::memory_order_relaxed);
-    if (!pk && !tot_n && !dr) return;
+/// (Ocarina Engine) The stats line: what the recorder did since the last line (every 600 presents: present_tick(); and when it
+/// stops). The packets and their bytes, the recorder thread's time (running packets, spinning idle, asleep), and where the replay
+/// waited for it: for room in a full ring, and at each boundary (a forced drain: everything published run before the call), the
+/// longest six by time. Any thread; the counters are read, never reset
+inline void Recorder::log_stats(const char* why) {
+    std::lock_guard lk(stats_mu);
+    Seen now;
+    now.at_ns = now_ns();
+    now.W = W.load(std::memory_order_acquire), now.packets = packets.load(std::memory_order_relaxed);
+    now.busy = busy_ns.load(std::memory_order_relaxed), now.spun = spin_ns.load(std::memory_order_relaxed);
+    now.slept = sleeps.load(std::memory_order_relaxed), now.short_slept = short_sleeps.load(std::memory_order_relaxed);
+    now.direct = direct.load(std::memory_order_relaxed), now.fallbacks = fallbacks.load(std::memory_order_relaxed);
+    uint64_t n[B_COUNT], ns[B_COUNT], mx[B_COUNT], drains = 0, drain_ns = 0, max_ns = 0;
+    for (int k = 0; k < B_COUNT; k++) {
+        now.n[k] = wait_n[k].load(std::memory_order_relaxed), now.ns[k] = wait_ns[k].load(std::memory_order_relaxed);
+        n[k] = now.n[k] - seen_at_log.n[k], ns[k] = now.ns[k] - seen_at_log.ns[k];
+        mx[k] = wait_max[k].exchange(0, std::memory_order_relaxed);   // (the longest since the last line: the one value reset)
+        if (k != B_RING_FULL) drains += n[k], drain_ns += ns[k], max_ns = std::max(max_ns, mx[k]);
+    }
+    const Seen was = seen_at_log;
+    const uint64_t pk = now.packets - was.packets, bytes = now.W - was.W, busy = now.busy - was.busy, spun = now.spun - was.spun;
+    const uint64_t dr = now.direct - was.direct, fb = now.fallbacks - was.fallbacks;
+    const double secs = was.at_ns ? (double)(now.at_ns - was.at_ns) / 1e9 : 0.0;
+    seen_at_log = now;
+    if (!pk && !drains && !dr && !n[B_RING_FULL]) return;
     char top[512];
     size_t at = 0;
     top[0] = 0;
     for (int shown = 0; shown < 6; shown++) {   // (the six it waited longest at)
         int best = -1;
         for (int k = 0; k < B_COUNT; k++)
-            if (n[k] && (best < 0 || ns[k] > ns[best])) best = k;
+            if (k != B_RING_FULL && n[k] && (best < 0 || ns[k] > ns[best])) best = k;
         if (best < 0) break;
-        const int c = std::snprintf(top + at, sizeof top - at, "%s %s %llu/%.2f ms (max %.2f)", shown ? "," : ";", bound_name(best),
+        const int c = std::snprintf(top + at, sizeof top - at, "%s %s %llu/%.2f ms (max %.2f)", shown ? "," : ":", bound_name(best),
                                     (unsigned long long)n[best], ns[best] / 1e6, mx[best] / 1e6);
         if (c < 0 || (size_t)c >= sizeof top - at) break;
         at += (size_t)c;
         n[best] = 0;
     }
-    ::mkwvk::logf("vk: recorder: %llu packets run in %.1f s (busy %.2f s, spun idle %.2f s, slept %llu times, %llu of them under 200 "
-                  "us), %llu calls made directly (no room); the replay waited for it %llu times, %.2f ms in all, the longest %.2f ms%s",
-                  (unsigned long long)pk, secs, busy / 1e9, spun / 1e9, (unsigned long long)slept, (unsigned long long)short_slept,
-                  (unsigned long long)dr, (unsigned long long)tot_n, tot_ns / 1e6, max_ns / 1e6, top);
+    ::mkwvk::logf("vk: recorder (%s, %.1f s): %llu packets, %.1f MB; the recorder thread ran them %.2f s (%.1f%%), spun idle %.2f s, "
+                  "slept %llu times (%llu under 200 us); the replay waited for ring room %llu times (%.2f ms, longest %.2f); forced "
+                  "drains %llu, %.2f ms in all, longest %.2f ms%s; %llu calls made directly (no room), %llu not packed (fallback)",
+                  why, secs, (unsigned long long)pk, bytes / 1048576.0, busy / 1e9, secs > 0 ? 100.0 * (busy / 1e9) / secs : 0.0,
+                  spun / 1e9, (unsigned long long)(now.slept - was.slept), (unsigned long long)(now.short_slept - was.short_slept),
+                  (unsigned long long)n[B_RING_FULL], ns[B_RING_FULL] / 1e6, mx[B_RING_FULL] / 1e6, (unsigned long long)drains,
+                  drain_ns / 1e6, max_ns / 1e6, top, (unsigned long long)dr, (unsigned long long)fb);
 }
 
 /// (THREAD) The boundary calls the producer makes without waiting for the recorder: only a call that touches no command buffer or
@@ -670,6 +769,15 @@ inline void set_mode(int m) {
     g_mode.store(m, std::memory_order_relaxed);
 }
 
+/// (Ocarina Engine) Each present (vk_replay.cpp's do_present): every 600th writes the recorder's stats line (Recorder::log_stats),
+/// with RX_VK_RECORDER=thread and RX_VK_RECORDER_STATS not 0. A relaxed load and a branch otherwise
+inline void present_tick() {
+    if (g_mode.load(std::memory_order_relaxed) != THREAD || !g_stats_log) return;
+    static std::atomic<uint32_t> presents{0};
+    if (presents.fetch_add(1, std::memory_order_relaxed) % 600 != 599) return;
+    g_rec.log_stats("600 presents");
+}
+
 /// THREAD: the recorder has run what this thread may depend on (the producer: all it published; another thread: what was published)
 inline void settle(Bound k) {
     if (Recorder* g = t_prod) g->wait_idle(k);
@@ -679,7 +787,7 @@ inline void settle(Bound k) {
 /// A call that is not packed (a pNext chain, an unknown descriptor type): what is held goes first, then the call itself
 template <class F>
 inline void fallback(const F& direct) {
-    if (g_mode.load(std::memory_order_relaxed) == THREAD) settle(B_FALLBACK);
+    if (g_mode.load(std::memory_order_relaxed) == THREAD) settle(B_FALLBACK), g_rec.fallbacks.fetch_add(1, std::memory_order_relaxed);
     else drain();
     t_arena.fallbacks++;
     direct();
@@ -790,7 +898,7 @@ struct Enc {
             direct();
             return;
         }
-        p->run = &thunk<F>, p->next = nullptr, p->op = op, p->size = (uint32_t)sizeof(F);
+        p->run = &thunk<F>, p->next = nullptr, p->op = op, p->size = (uint32_t)sizeof(F), p->seq = 0;
         new (static_cast<void*>(p + 1)) F(f);
         a->packets++;
         if (md == SYNC) {

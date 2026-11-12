@@ -110,6 +110,11 @@ struct StartupView {
     std::string left, right;        // (under the bar: "12,345 / 38,809 shaders", "about 40 s left")
     std::string hint;
     double fraction = -1;           // (the bar, 0 to 1; negative: none)
+    // (ocarina: the state it was made from, for the Ocarina Engine's own wording of it, brand_startup_text)
+    int stage = 0;
+    size_t done = 0, total = 0;
+    double secs_left = -1;
+    bool prepared = false, finished = false, stopping = false;
     bool operator==(const StartupView&) const = default;
 };
 
@@ -182,6 +187,8 @@ struct PrepareBar {
 /// The screen for a state. The first second shows the wordmark alone: a start with next to nothing to prepare is over by then
 inline StartupView startup_view(const StartupState& s) {
     StartupView v;
+    v.stage = s.stage, v.done = s.done, v.total = s.total, v.secs_left = s.left;
+    v.prepared = s.prepared, v.finished = s.finished, v.stopping = s.stopping;
     if (s.stopping) {
         v.title = "Closing";
         v.left = "Keeping what is prepared for the next start";
@@ -206,6 +213,58 @@ inline StartupView startup_view(const StartupState& s) {
     v.left = with_commas(s.done) + " / " + with_commas(s.total) + (pipelines ? " pipelines" : " shaders");
     v.right = left_text(s.left);
     return v;
+}
+
+/// (ocarina) 12345 as "12.345" (Portuguese) or "12,345"
+inline std::string count_text(size_t v, bool pt) {
+    std::string s = with_commas(v);
+    if (pt)
+        for (char& ch : s)
+            if (ch == ',') ch = '.';
+    return s;
+}
+/// (ocarina) The time left in Portuguese or English: "cerca de 4 min", "about 4 min left"; empty when unknown
+inline std::string left_text_in(double secs, bool pt) {
+    if (!pt) return left_text(secs);
+    if (secs < 0) return "";
+    char b[48];
+    if (secs < 10) return "alguns segundos";
+    if (secs < 55) snprintf(b, sizeof b, "cerca de %d s", (int)((secs + 4.999) / 5) * 5);
+    else snprintf(b, sizeof b, "cerca de %d min", secs < 90 ? 1 : (int)(secs / 60 + 0.5));
+    return b;
+}
+/// (ocarina) The Ocarina Engine start-up screen's words (vk_menu.cpp, ocarina_ui.h ocarina_startup): one line of what is being
+/// done, with the counts; the time left; the hint. In Portuguese when the game is (language.txt pt-BR), else in English
+struct BrandStartupText {
+    std::string line, eta, hint;
+};
+inline BrandStartupText brand_startup_text(const StartupView& v, bool pt) {
+    BrandStartupText t;
+    if (v.stopping) {
+        t.line = pt ? "Fechando. O que já foi preparado fica guardado para a próxima vez" : "Closing, keeping what is prepared for the next start";
+        return t;
+    }
+    if (v.title.empty()) return t;   // (the first second, or a start over before it: the name alone)
+    if (v.finished) {
+        t.line = pt ? "Abrindo o jogo" : "Starting the game";
+        return t;
+    }
+    const bool pipelines = v.stage > 0, building = pipelines && v.prepared;
+    if (!v.total) {
+        t.line = !pipelines ? (pt ? "Lendo os shaders do jogo" : "Reading the game's shaders")
+                 : v.stage == 1 ? (pt ? "Lendo as anotações de pipelines" : "Reading the pipeline notes")
+                                : (pt ? "Carregando o cache de shaders" : "Loading the shader cache");
+    } else {
+        const std::string of = count_text(std::min(v.done, v.total), pt) + (pt ? " de " : " of ") + count_text(v.total, pt);
+        if (!pipelines) t.line = (pt ? "Preparando " : "Preparing ") + of + " shaders";
+        else t.line = (building ? (pt ? "Montando " : "Building ") : (pt ? "Carregando " : "Loading ")) + of + " pipelines";
+        if (v.prepared) t.line += pt ? " · só desta vez" : ", just this once";
+    }
+    if (!v.right.empty()) t.eta = left_text_in(v.secs_left, pt);
+    if (v.prepared)
+        t.hint = pt ? "Isso acontece uma vez depois de cada atualização. Fechar a janela guarda o que já foi feito."
+                    : "This happens once after an update. Closing the window keeps what is done.";
+    return t;
 }
 
 } // namespace mkwvk

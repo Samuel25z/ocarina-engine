@@ -148,6 +148,26 @@ int main() {
         CHECK(std::fabs(w.fraction() - 0.5) < 1e-9);
         CHECK(percent_of(0.999) == "99%" && percent_of(1) == "100%" && percent_of(-1).empty());
     }
+    // (ocarina) the Ocarina Engine screen's wording: one line with the counts, the time left, in Portuguese or English
+    {
+        CHECK(count_text(120566, true) == "120.566" && count_text(120566, false) == "120,566");
+        CHECK(left_text_in(236, true) == "cerca de 4 min" && left_text_in(236, false) == "about 4 min left");
+        CHECK(left_text_in(3, true) == "alguns segundos" && left_text_in(-1, true).empty());
+        StartupState st;
+        st.secs = 30, st.prepared = true, st.done = 73638, st.total = 120566, st.left = 236, st.whole = 0.37;
+        BrandStartupText t = brand_startup_text(startup_view(st), true);
+        CHECK(t.line == "Preparando 73.638 de 120.566 shaders \xC2\xB7 s\xC3\xB3 desta vez" && t.eta == "cerca de 4 min" && !t.hint.empty());
+        t = brand_startup_text(startup_view(st), false);
+        CHECK(t.line == "Preparing 73,638 of 120,566 shaders, just this once" && t.eta == "about 4 min left");
+        StartupState warm;   // (a warm start: the pipelines loaded, nothing "just this once", no hint)
+        warm.secs = 3, warm.stage = 2, warm.done = 100, warm.total = 3822;
+        t = brand_startup_text(startup_view(warm), false);
+        CHECK(t.line == "Loading 100 of 3,822 pipelines" && t.hint.empty());
+        warm.secs = 0.4;   // (the first second: the name alone)
+        CHECK(brand_startup_text(startup_view(warm), true).line.empty());
+        st.stopping = true;
+        CHECK(!brand_startup_text(startup_view(st), true).line.empty());
+    }
     std::printf("PASS: counts, time left and its wording\n");
 }
 '''

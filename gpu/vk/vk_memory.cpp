@@ -24,6 +24,7 @@
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <psapi.h>   // (K32GetProcessMemoryInfo: the RAM guard)
 
 #include "vk_internal.h"
 #include "vk_texture.h"   // (upload_command_buffer)
@@ -985,7 +986,10 @@ inline int64_t zs_us_since(std::chrono::steady_clock::time_point t0) {
 // landed when the copy runs, which is what the wait was for. Nobody waits. Kept here until that submission is done: a read of
 // such a page on the CPU (memory_read_as_submitted) still waits for it, as the take did. RX_VK_LATE_LIVE=0: the take waits, as before
 bool late_live_on() {
-    static const bool on = !getenv("RX_VK_LATE_LIVE") || atoi(getenv("RX_VK_LATE_LIVE")) != 0;
+    // (Ocarina Engine v0.4) off by default: with it the scene flickered hazy for a frame (the exposure's page read before the
+    // GPU wrote it back): 8 flickers in 900 frames at a 60 fps cap in the Burgo, 0 without it (b69); testers saw it several
+    // times a second in the market. RX_VK_LATE_LIVE=1: on
+    static const bool on = getenv("RX_VK_LATE_LIVE") && atoi(getenv("RX_VK_LATE_LIVE")) != 0;
     return on;
 }
 struct LateLive {
@@ -2211,6 +2215,7 @@ int async_import_mode() {
 }
 thread_local int tl_copy_kind = 0;         // (ImportCopyOk: 0 none, 1 a stream copy, 2 the caller reads the range itself)
 thread_local bool tl_bind_copied = false;  // (gpu_bind_was_copy)
+thread_local bool tl_bind_memo = false;    // (Ocarina Engine: gpu_bind_was_memo)
 struct CopyMemo {   // (a range copied into this recording's stream: the same binding again takes the same copy)
     uint64_t guest = 0, size = 0, serial = 0;
     BufferRef ref{};
@@ -2270,6 +2275,101 @@ bool preset_caps_memory() {
     const uint64_t vram = device_vram_bytes();
     return !vram || vram <= ((nominal_gb[opts.preset] << 30) + (768ull << 20));
 }
+
+// ---- (Ocarina Engine) The RAM guard. On 16 GB PCs the process's private bytes (commit) reached 24-30 GB: the game's memory
+// (its 6.9 GB heap and its address regions, committed whole by the executable), the VRAM (WDDM charges the commit of every
+// device-local allocation, MB for MB: 1 GB allocated, +1026 MB private on an RTX 4050), the pipeline cache the driver holds (a
+// 1255 MB file: +1.6 GB, kept after the cache is destroyed). Past the commit limit (RAM + page file) an allocation fails and the
+// game closes "out of memory", mostly while preparing the shaders or entering a big area. The imports add no commit (the game's
+// pages, committed already: the same 1 GB imported twice, +0 MB) but the driver pins them, physical RAM Windows cannot page. The guard reads the PC's memory and turns the renderer's levers down before that: the preparation's
+// threads (vk_draw.cpp), the mirrors' budget and the idle imports (below). RX_VK_RAM_GUARD=0: off ----
+namespace {
+std::mutex ram_mu;
+RamState ram_cached;
+int64_t ram_read_ms = -1000000;
+int64_t ram_now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+bool ram_guard_on() {
+    static const bool on = !getenv("RX_VK_RAM_GUARD") || atoi(getenv("RX_VK_RAM_GUARD")) != 0;
+    return on;
+}
+std::atomic<int> st_ram_worst_level{0};
+std::atomic<uint64_t> st_ram_least_commit_mb{UINT64_MAX};
+// (the levers' counters, for ram_guard_log)
+std::atomic<uint64_t> ram_mirror_cut{0};               // (what the guard takes off the mirrors' budget now)
+std::atomic<uint64_t> st_live_import_bytes{0};         // (imports now, and those of pools without a mirror: the ones that can go)
+std::atomic<uint64_t> st_bare_import_bytes{0};
+std::atomic<int64_t> st_cap_given_n{0}, st_cap_given_bytes{0};
+std::atomic<unsigned> prep_allowed_now{0}, prep_allowed_least{UINT32_MAX}, prep_of{0};
+}   // namespace
+
+RamState ram_state() {
+    std::lock_guard lk(ram_mu);
+    const int64_t now = ram_now_ms();
+    if (now - ram_read_ms < 250) return ram_cached;
+    ram_read_ms = now;
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof ms;
+    RamState s;
+    if (GlobalMemoryStatusEx(&ms)) {
+        s.phys_total = ms.ullTotalPhys, s.phys_avail = ms.ullAvailPhys;
+        s.commit_limit = ms.ullTotalPageFile, s.commit_avail = ms.ullAvailPageFile;   // (the "page file" figures are the commit's)
+    }
+    PROCESS_MEMORY_COUNTERS_EX pm{};
+    pm.cb = sizeof pm;
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pm, sizeof pm)) s.priv = pm.PrivateUsage;
+    if (ram_guard_on() && s.commit_limit) {
+        constexpr uint64_t MB = 1ull << 20;
+        // (half a GB more to leave a level than to enter it, 2 points of RAM: no flapping around a threshold)
+        const bool phys_tight = s.phys_total && s.phys_avail * 100 < s.phys_total * (ram_cached.level > 0 ? 7 : 5);
+        const uint64_t cback = ram_cached.commit_level > 0 ? 512 * MB : 0;
+        if (s.commit_avail < 1536 * MB + (ram_cached.commit_level >= 2 ? cback : 0)) s.commit_level = 2;
+        else if (s.commit_avail < 3072 * MB + cback) s.commit_level = 1;
+        s.level = std::max(s.commit_level, phys_tight ? 1 : 0);
+        const uint64_t mb = s.commit_avail >> 20;
+        uint64_t least = st_ram_least_commit_mb.load();
+        while (mb < least && !st_ram_least_commit_mb.compare_exchange_weak(least, mb)) {}
+        int worst = st_ram_worst_level.load();
+        while (s.level > worst && !st_ram_worst_level.compare_exchange_weak(worst, s.level)) {}
+    }
+    ram_cached = s;
+    return s;
+}
+
+/// (Ocarina Engine) The preparation's workers by the commit left: each pipeline build holds ~256 MB at its peak (16 threads took
+/// a 6 GB laptop from 10.7 to 14.5 GB private, 7.8 GB working set). Worker 0 always runs, so the preparation never stops; the
+/// others wait while the commit left, less a reserve of 2 GB, does not cover them. RX_VK_PREP_RAM=0: all of them, as before;
+/// RX_VK_PREP_RAM_MB=<n>: each worker's share (256)
+bool prep_worker_may_run(unsigned me, unsigned of) {
+    static const bool on = ram_guard_on() && (!getenv("RX_VK_PREP_RAM") || atoi(getenv("RX_VK_PREP_RAM")) != 0);
+    if (!on || me == 0) return true;
+    static const uint64_t share = (getenv("RX_VK_PREP_RAM_MB") ? std::max(64, atoi(getenv("RX_VK_PREP_RAM_MB"))) : 256) * (1ull << 20);
+    const RamState s = ram_state();
+    if (!s.commit_limit) return true;
+    constexpr uint64_t reserve = 2048ull << 20;
+    uint64_t allowed = s.commit_avail > reserve ? (s.commit_avail - reserve) / share : 0;
+    // (and the physical memory: below 1 GB available the PC is paging, more threads only make it worse)
+    if (s.phys_avail < (1024ull << 20)) allowed = std::min<uint64_t>(allowed, of / 4);
+    allowed = std::clamp<uint64_t>(allowed, 1, of);
+    prep_ram_note((unsigned)allowed, of);
+    return me < allowed;
+}
+void prep_ram_note(unsigned allowed, unsigned of) {
+    prep_allowed_now.store(allowed, std::memory_order_relaxed);
+    prep_of.store(of, std::memory_order_relaxed);
+    unsigned least = prep_allowed_least.load();
+    while (allowed < least && !prep_allowed_least.compare_exchange_weak(least, allowed)) {}
+}
+void prep_ram_summary(const char* what) {
+    const unsigned least = prep_allowed_least.exchange(UINT32_MAX), of = prep_of.load();
+    if (least == UINT32_MAX || !of) return;
+    const RamState s = ram_state();
+    logf("vk: RAM guard: %s on at least %u of %u threads (commit left now %llu MB, the least %llu MB; private %llu MB; "
+         "RX_VK_PREP_RAM=0: all threads)", what, least, of, (unsigned long long)(s.commit_avail >> 20),
+         (unsigned long long)st_ram_least_commit_mb.load(), (unsigned long long)(s.priv >> 20));
+}
+
 namespace {
 // (Ocarina Engine, RX_VK_VRAM_GOV) what the VRAM governor takes off the mirrors' budget, the last of its levers and slowly
 // (vk_texture.cpp): with less, the idle mirrors go at the next give-back and no new one is made past it. 0: none
@@ -2277,7 +2377,9 @@ std::atomic<uint64_t> gov_mirror_cut{0};
 uint64_t mirror_budget_uncut();
 uint64_t mirror_budget() {
     const uint64_t b = mirror_budget_uncut();
-    return b - std::min(b, gov_mirror_cut.load(std::memory_order_relaxed));
+    // (and the RAM guard's: the mirrors are VRAM, and the VRAM is the process's commit too)
+    const uint64_t cut = std::max(gov_mirror_cut.load(std::memory_order_relaxed), ram_mirror_cut.load(std::memory_order_relaxed));
+    return b - std::min(b, cut);
 }
 uint64_t mirror_budget_uncut() {
     // (a quarter of the card, at most the 3 GB it was for all: on a 6 GB laptop those and the textures were past what the card has)
@@ -2291,7 +2393,15 @@ uint64_t mirror_budget_uncut() {
         // (Ocarina Engine: a quarter of the card from 4.5 GB up: 1536 MB on a 6 GB laptop took Hyrule Field from 22 to 34 fps
         // and Lon Lon Ranch from 26 to 37, the GPU no longer reading the game's memory over PCIe; an eighth on 4 GB cards)
         if (vram && vram <= (4ull << 30) + (512ull << 20)) return vram / 8;
-        return vram ? std::min<uint64_t>(vram / 4, 3072ull << 20) : (uint64_t)(3072ull << 20);
+        uint64_t most = 3072ull << 20;
+        // (Ocarina Engine) on PCs of 16 GB of RAM or less, 1536 MB at most (what took the 6 GB laptop from 22 to 34 fps): an 8 GB
+        // card kept 2 GB of mirrors, and the VRAM is commit too (WDDM), there where it ran out. RX_VK_MIRROR_RAM_CAP=0: as before
+        if (!getenv("RX_VK_MIRROR_RAM_CAP") || atoi(getenv("RX_VK_MIRROR_RAM_CAP")) != 0) {
+            MEMORYSTATUSEX ms{};
+            ms.dwLength = sizeof ms;
+            if (GlobalMemoryStatusEx(&ms) && ms.ullTotalPhys && ms.ullTotalPhys <= (17ull << 30)) most = 1536ull << 20;
+        }
+        return vram ? std::min<uint64_t>(vram / 4, most) : most;
     }();
     // (the Insert menu's quality preset sets one, 256 MB at Minimum (4GB): it was never read, and an 8 GB card kept ~2 GB of
     // mirrors with the 4GB preset on, 2026-11-08)
@@ -2761,6 +2871,14 @@ uint64_t gpu_pool_start(uint64_t gpu) {   // (EvilOOT) where it begins
 uint64_t gpu_bind_stamp() {
     return pools_gen.load(std::memory_order_relaxed) ^ (mirror_epoch * 0x9E3779B97F4A7C15ull);
 }
+uint64_t bind_cache_stamp() {
+    return gpu_bind_stamp() ^ (guest_pools_gen.load(std::memory_order_relaxed) * 0xC2B2AE3D27D4EB4Full);
+}
+bool gpu_bind_was_memo() {
+    const bool was = tl_bind_memo;
+    tl_bind_memo = false;
+    return was;
+}
 
 uint32_t bind_slot(uint64_t guest, uint64_t size) {
     // (a page-aligned range's low bits are zero: fold the rest in, or every one of them lands in one slot)
@@ -2789,6 +2907,7 @@ void note_direct_write(Pool& p, uint64_t off, uint64_t size) {   // (pools_mu he
 }
 
 BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
+    tl_bind_memo = false;
     if (written) texture_gpu_wrote(gpu, size);
     // (below 1 TB a GPU address is the guest address itself, and a pool holds the whole range or nothing: the host's
     // two translations are for the virtual pools above)
@@ -2802,13 +2921,13 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
     // runs the lookup below, including a mirror sync, and remembers what it returned. a write is not remembered)
     auto remember = [&](BufferRef ref) {
         if (!written && ref.buffer != VK_NULL_HANDLE && size)
-            bind_memo[bind_slot(guest, size)] = BindMemo{guest, size, gpu_bind_stamp(), ref};
+            bind_memo[bind_slot(guest, size)] = BindMemo{guest, size, gpu_bind_stamp(), ref}, tl_bind_memo = true;
         return ref;
     };
     if (!written) {
         const BindMemo& m = bind_memo[bind_slot(guest, size)];
         if (bind_memo_hit(guest, size, gpu_bind_stamp(), m.guest, m.size, m.stamp, m.ref.buffer != VK_NULL_HANDLE))
-            return m.ref;
+            return tl_bind_memo = true, m.ref;
     }
     // (a read binding of a pool this thread found before and whose mirror is in use this submission or that has none,
     // without the lock: every thread's, the replay thread's too (each draw binds several uniform buffers: the pool's
@@ -3009,7 +3128,13 @@ void retired_imports_give_back() {   // (pools_mu held)
 #endif
     uint64_t live_bytes = 0, retired_bytes = 0;
     size_t retired_alive = 0;
-    for (auto& [lo, p] : imported) live_bytes += p.hi - p.lo;
+    uint64_t bare_bytes = 0;   // (Ocarina Engine: those of pools without a mirror, the ones the RAM guard's cap may give back)
+    for (auto& [lo, p] : imported) {
+        live_bytes += p.hi - p.lo;
+        if (p.mstate == Pool::MIRROR_NONE || p.mstate == Pool::MIRROR_REFUSED) bare_bytes += p.hi - p.lo;
+    }
+    st_live_import_bytes.store(live_bytes, std::memory_order_relaxed);
+    st_bare_import_bytes.store(bare_bytes, std::memory_order_relaxed);
     for (auto& nh : retired_pools) {
         Pool& p = nh.mapped();
         if (!p.memory) continue;
@@ -3060,7 +3185,9 @@ void mirrors_give_back(uint64_t want_bytes) {   // (pools_mu held)
     // (Ocarina Engine, RX_VK_VRAM_GOV) while the VRAM governor has cut the budget, a mirror not bound for 120 submissions is idle
     // enough to go for it, so the cut is reached in seconds (the same rule otherwise: the GPU done with it; a new one past the
     // budget is refused, so none comes back meanwhile)
-    const uint64_t idle_epochs = gov_mirror_cut.load(std::memory_order_relaxed) ? 120 : kIdleEpochs;
+    // (and while the RAM guard has: the commit is running out)
+    const uint64_t idle_epochs =
+        gov_mirror_cut.load(std::memory_order_relaxed) || ram_mirror_cut.load(std::memory_order_relaxed) ? 120 : kIdleEpochs;
     for (auto& [lo, p] : imported)
         if (p.mstate == Pool::MIRROR_ON && mirror_epoch - p.synced_epoch > idle_epochs && p.last_value <= mem_completed)
             idle.push_back(&p);
@@ -3092,41 +3219,14 @@ int64_t st_imports_evicted = 0;
 uint64_t st_import_bytes_evicted = 0;
 constexpr uint64_t kImportIdle = 600;
 
-void imports_give_back() {   // (pools_mu held)
-    while (!evicted_pools.empty() && evicted_pools.front().mapped().retired_value <= mem_completed) {
-        Pool& p = evicted_pools.front().mapped();
-        destroy_import_buffer(p.buffer);
-        vkFreeMemory(dev.device, p.memory, nullptr);
-        for (VkDeviceMemory m : p.pieces) vkFreeMemory(dev.device, m, nullptr);   // (a pool imported as several dma-bufs)
-        evicted_pools.pop_front();
-    }
-    // (hookshot) Off by default on Windows, as giving retired imports back is (RX_VK_KEEP_RETIRED, retired_imports_give_back:
-    // device losses on Intel Arc and AMD right after imports went back): RX_VK_IMPORT_HIGH=85 turns it on there
-    static const char* env_high = getenv("RX_VK_IMPORT_HIGH");
-#ifdef _WIN32
-    static const int high = env_high ? atoi(env_high) : 0;
-#else
-    static const int high = env_high ? atoi(env_high) : 85;
-#endif
-    static const int low = getenv("RX_VK_IMPORT_LOW") ? std::clamp(atoi(getenv("RX_VK_IMPORT_LOW")), 10, 95) : 75;
-    static uint64_t calls = 0;
-    if (high <= 0 || ++calls % 16) return;   // (the driver asked every 16 submissions)
-    uint64_t used = 0, budget = 0;
-    if (!system_heap_usage(&used, &budget)) return;
-    static const bool small = [&] {   // (on by default where the budget is small: 16 GB of RAM and less)
-        const bool on = env_high || budget < (12ull << 30);
-        logf("vk: imports given back past %d%% of a %llu MB system heap budget: %s", high, (unsigned long long)(budget >> 20),
-             on ? "on" : "off (RX_VK_IMPORT_HIGH=85 turns it on)");
-        return on;
-    }();
-    if (!small || used <= budget / 100 * (uint64_t)high) return;
-    const uint64_t target = budget / 100 * (uint64_t)low;
-    const uint64_t want = used > target ? used - target : 0;
+/// The pools without a mirror, done on the GPU and bound last before `older_than` (a submission value) and over kImportIdle
+/// submissions ago, given back least lately bound first until `want` bytes are (pools_mu held). How many; *freed_out: their bytes
+int imports_evict_idle(uint64_t want, uint64_t older_than, uint64_t* freed_out) {
     std::vector<std::map<uint64_t, Pool>::iterator> idle;
     for (auto it = imported.begin(); it != imported.end(); ++it) {
         const Pool& p = it->second;
         if ((p.mstate == Pool::MIRROR_NONE || p.mstate == Pool::MIRROR_REFUSED) && p.last_value <= mem_completed &&
-            mem_rec_value > p.last_value + kImportIdle)
+            mem_rec_value > p.last_value + kImportIdle && p.last_value < older_than && !p.prefetched)
             idle.push_back(it);
     }
     std::sort(idle.begin(), idle.end(), [](auto a, auto b) { return a->second.last_value < b->second.last_value; });
@@ -3141,6 +3241,107 @@ void imports_give_back() {   // (pools_mu held)
         n++;
         evicted_pools.push_back(imported.extract(it));
     }
+    if (n) {
+        pools_gen++;
+        last_pool = nullptr;
+        std::fill(std::begin(pool_cache), std::end(pool_cache), nullptr);
+        if (mirror_on()) publish_cap_ranges();
+        st_imports_evicted += n, st_import_bytes_evicted += freed;
+    }
+    *freed_out = freed;
+    return n;
+}
+
+// ---- (Ocarina Engine) imports kept under a cap by the PC's RAM, by time. The game's pools stayed imported for the session (a
+// tester's RTX 3060 Ti with 16 GB: 192 MB at the title, 5.2 GB after a few areas, never given back; RAM at 96-98%, the system
+// heap 6.5 of 7.5 GB), every one pinned by the driver. Past the cap, the imports of pools without a mirror not bound for
+// RX_VK_IMPORT_IDLE_S seconds (30) go, the least lately bound first, down to 85% of it, by the path above (imported again at
+// their next binding, 15-40 ms each). The cap: an eighth of the RAM, 1 to 4 GB (2 GB on 16 GB); half of it, and 5 s idle, while
+// the RAM guard sees the PC short (level 1 or 2). On by default on NVIDIA, where retired pools already go back (issue 1057);
+// RX_VK_IMPORT_CAP_MB=<n>: that cap, anywhere; =0: off ----
+std::deque<std::pair<int64_t, uint64_t>> import_clock;   // (ms, the submission value then), every 16 submissions, 2 minutes of it
+uint64_t import_value_before(int64_t ms) {   // (the newest submission value noted at or before ms; 0: none that old)
+    uint64_t v = 0;
+    for (const auto& [t, value] : import_clock) {
+        if (t > ms) break;
+        v = value;
+    }
+    return v;
+}
+std::atomic<uint64_t> import_cap_now{0};   // (for ram_guard_log; 0: the cap is off)
+
+void imports_give_back() {   // (pools_mu held)
+    while (!evicted_pools.empty() && evicted_pools.front().mapped().retired_value <= mem_completed) {
+        Pool& p = evicted_pools.front().mapped();
+        destroy_import_buffer(p.buffer);
+        vkFreeMemory(dev.device, p.memory, nullptr);
+        for (VkDeviceMemory m : p.pieces) vkFreeMemory(dev.device, m, nullptr);   // (a pool imported as several dma-bufs)
+        evicted_pools.pop_front();
+    }
+    static uint64_t calls = 0;
+    if (++calls % 16) return;   // (the driver and the PC asked every 16 submissions)
+    {   // (Ocarina Engine) the cap by the RAM, by time
+        static const int64_t cap_env = getenv("RX_VK_IMPORT_CAP_MB") ? atoll(getenv("RX_VK_IMPORT_CAP_MB")) : -1;
+        static const bool cap_on = cap_env > 0 || (cap_env < 0 && ram_guard_on() && dev.props.vendorID == 0x10DE);
+        static const int idle_s = getenv("RX_VK_IMPORT_IDLE_S") ? std::max(1, atoi(getenv("RX_VK_IMPORT_IDLE_S"))) : 30;
+        const int64_t now = ram_now_ms();
+        import_clock.push_back({now, mem_rec_value});
+        while (import_clock.size() > 2 && import_clock[1].first < now - 120000) import_clock.pop_front();
+        if (cap_on) {
+            const RamState rs = ram_state();
+            static const uint64_t cap = [&] {
+                const uint64_t c = cap_env > 0 ? (uint64_t)cap_env << 20
+                                               : std::clamp<uint64_t>(rs.phys_total / 8, 1ull << 30, 4ull << 30);
+                logf("vk: RAM guard: imports of pools without a mirror kept under %llu MB (those not bound for %d s go past it; "
+                     "RX_VK_IMPORT_CAP_MB=0: off)", (unsigned long long)(c >> 20), idle_s);
+                return c;
+            }();
+            const bool short_ram = rs.level >= 1;
+            const uint64_t cap_now = short_ram ? cap / 2 : cap;
+            import_cap_now.store(cap_now, std::memory_order_relaxed);
+            const uint64_t bare = st_bare_import_bytes.load(std::memory_order_relaxed);
+            if (bare > cap_now) {
+                const uint64_t want = bare - cap_now / 100 * 85;
+                const uint64_t older = import_value_before(now - (short_ram ? 5000 : (int64_t)idle_s * 1000));
+                uint64_t freed = 0;
+                const int n = older ? imports_evict_idle(want, older, &freed) : 0;
+                if (n) {
+                    st_bare_import_bytes.store(bare - std::min(freed, bare), std::memory_order_relaxed);
+                    st_cap_given_n += n, st_cap_given_bytes += (int64_t)freed;
+                    static int logged;
+                    if (logged++ < 24 || logged % 64 == 0)
+                        logf("vk: RAM guard: %d idle imports given back (%llu MB): %llu MB of pools without a mirror over the "
+                             "cap of %llu MB%s; %lld (%lld MB) in all", n, (unsigned long long)(freed >> 20),
+                             (unsigned long long)(bare >> 20), (unsigned long long)(cap_now >> 20),
+                             short_ram ? " (the PC short of memory: half the cap)" : "", (long long)st_cap_given_n.load(),
+                             (long long)(st_cap_given_bytes.load() >> 20));
+                }
+            }
+        }
+    }
+    // (hookshot) Off by default on Windows, as giving retired imports back is (RX_VK_KEEP_RETIRED, retired_imports_give_back:
+    // device losses on Intel Arc and AMD right after imports went back): RX_VK_IMPORT_HIGH=85 turns it on there
+    static const char* env_high = getenv("RX_VK_IMPORT_HIGH");
+#ifdef _WIN32
+    static const int high = env_high ? atoi(env_high) : 0;
+#else
+    static const int high = env_high ? atoi(env_high) : 85;
+#endif
+    static const int low = getenv("RX_VK_IMPORT_LOW") ? std::clamp(atoi(getenv("RX_VK_IMPORT_LOW")), 10, 95) : 75;
+    if (high <= 0) return;
+    uint64_t used = 0, budget = 0;
+    if (!system_heap_usage(&used, &budget)) return;
+    static const bool small = [&] {   // (on by default where the budget is small: 16 GB of RAM and less)
+        const bool on = env_high || budget < (12ull << 30);
+        logf("vk: imports given back past %d%% of a %llu MB system heap budget: %s", high, (unsigned long long)(budget >> 20),
+             on ? "on" : "off (RX_VK_IMPORT_HIGH=85 turns it on)");
+        return on;
+    }();
+    if (!small || used <= budget / 100 * (uint64_t)high) return;
+    const uint64_t target = budget / 100 * (uint64_t)low;
+    const uint64_t want = used > target ? used - target : 0;
+    uint64_t freed = 0;
+    const int n = imports_evict_idle(want, UINT64_MAX, &freed);
     if (!n) {
         static int logged_none;
         if (logged_none++ < 8)
@@ -3148,16 +3349,31 @@ void imports_give_back() {   // (pools_mu held)
                  (unsigned long long)(budget >> 20), imported.size());
         return;
     }
-    pools_gen++;
-    last_pool = nullptr;
-    std::fill(std::begin(pool_cache), std::end(pool_cache), nullptr);
-    if (mirror_on()) publish_cap_ranges();
-    st_imports_evicted += n, st_import_bytes_evicted += freed;
     static int logged;
     if (logged++ < 40 || logged % 64 == 0)
         logf("vk: system heap %llu of %llu MB: %d idle imports given back (%llu MB); %lld (%llu MB) in all",
              (unsigned long long)(used >> 20), (unsigned long long)(budget >> 20), n, (unsigned long long)(freed >> 20),
              (long long)st_imports_evicted, (unsigned long long)(st_import_bytes_evicted >> 20));
+}
+
+/// (Ocarina Engine) The RAM guard's mirror lever, every 64 submissions (pools_mu held): with under 3 GB of commit left half the
+/// mirrors' budget off, under 1.5 GB all of it (the mirrors are VRAM, which WDDM charges to the commit; the pools are read from
+/// their imports then, over PCIe: slower, not closed "out of memory"). Back as the commit comes back. RX_VK_RAM_MIRRORS=1: on.
+/// OFF by default (12/11, b73, notebook of 16 GB in the Burgo): with the mirrors' budget cut to 0 the replay's memory sync went
+/// from ~1.7 ms to ~165 ms a frame, 30 fps to 5; and it cut at the commit limit of the moment, which the system-managed page file
+/// raises as it is needed (38.6 to 44.8 GB in that run). A lever that costs that much is not one to pull by itself
+void ram_guard_mirrors() {
+    static const bool on = ram_guard_on() && getenv("RX_VK_RAM_MIRRORS") && atoi(getenv("RX_VK_RAM_MIRRORS")) != 0;
+    if (!on || mirror_epoch % 64) return;
+    const RamState rs = ram_state();
+    const uint64_t b = mirror_budget_uncut();
+    const uint64_t cut = rs.commit_level >= 2 ? b : rs.commit_level == 1 ? b / 2 : 0;
+    const uint64_t was = ram_mirror_cut.exchange(cut, std::memory_order_relaxed);
+    if (cut != was)
+        logf("vk: RAM guard: mirrors' budget %llu MB -> %llu MB (commit left %llu MB of %llu; mirrors now %llu MB)",
+             (unsigned long long)((b - std::min(b, was)) >> 20), (unsigned long long)((b - cut) >> 20),
+             (unsigned long long)(rs.commit_avail >> 20), (unsigned long long)(rs.commit_limit >> 20),
+             (unsigned long long)(mirror_bytes >> 20));
 }
 
 void memory_begin_submission() {
@@ -3171,6 +3387,7 @@ void memory_begin_submission() {
     imports_give_back();
     if (tex_capture_on()) publish_tex_spans(texture_frame_no());
     if (!mirror_on()) return;
+    ram_guard_mirrors();
     {
         uint64_t want = 0;
         for (Pool* p : mirror_wanted) want += p->hi - p->lo;
@@ -3943,6 +4160,100 @@ void memory_end_submission(VkCommandBuffer cmd) {
 }
 
 uint64_t mirror_budget_base() { return mirror_budget_uncut(); }
+/// (Ocarina Engine) Where the process's private bytes are, every 1800 presents, on a thread of its own (a walk of the address
+/// space, a few ms): the game's memory committed in its window (the image and heap below 256 GB of it, the address regions above,
+/// committed whole by the executable and never given back when freed), the private memory outside it (the driver's, ours: the
+/// pipeline cache the driver holds, the heaps), and what is in no address range at all (the commit WDDM charges for the VRAM).
+/// RX_VK_MEM_MAP=0: off
+void mem_map_log_async() {
+    static const bool on = !getenv("RX_VK_MEM_MAP") || atoi(getenv("RX_VK_MEM_MAP")) != 0;
+    static std::atomic<bool> busy{false};
+    if (!on || busy.exchange(true)) return;
+    try {
+        std::thread([] {
+            SetThreadDescription(GetCurrentThread(), L"mkw_vk memory map");
+            // (the window is one reservation: from its base, whatever offset the guest's address 0 is at in it)
+            MEMORY_BASIC_INFORMATION m0{};
+            VirtualQuery(host->guest_base(), &m0, sizeof m0);
+            uint8_t* const g0 = (uint8_t*)m0.AllocationBase;
+            if (!g0) {
+                busy = false;
+                return;
+            }
+            uint64_t low = 0, high = 0, ranges = 0, gend = 0;
+            for (uint8_t* a = g0;;) {
+                MEMORY_BASIC_INFORMATION m{};
+                if (!VirtualQuery(a, &m, sizeof m) || m.AllocationBase != (void*)g0) break;
+                if (m.State == MEM_COMMIT) {
+                    const uint64_t off = (uint64_t)((uint8_t*)m.BaseAddress - g0);
+                    (off < (256ull << 30) ? low : high) += m.RegionSize;
+                    ranges++;
+                }
+                a = (uint8_t*)m.BaseAddress + m.RegionSize;
+                gend = (uint64_t)(uintptr_t)a;
+            }
+            const uint64_t gbeg = (uint64_t)(uintptr_t)g0;
+            uint64_t priv = 0, mapped = 0, cur = 0, cur_base = 0;
+            struct Top { uint64_t base, bytes; } top[4]{};
+            const auto flush = [&] {
+                for (int k = 0; k < 4 && cur; k++)
+                    if (cur > top[k].bytes) {
+                        for (int j = 3; j > k; j--) top[j] = top[j - 1];
+                        top[k] = {cur_base, cur};
+                        break;
+                    }
+            };
+            for (uint64_t a = 0x10000; a < 0x7FFFFFFF0000ull;) {
+                if (a >= gbeg && a < gend) { a = gend; continue; }
+                MEMORY_BASIC_INFORMATION m{};
+                if (!VirtualQuery((void*)(uintptr_t)a, &m, sizeof m)) break;
+                const uint64_t base = (uint64_t)(uintptr_t)m.AllocationBase, end = (uint64_t)(uintptr_t)m.BaseAddress + m.RegionSize;
+                if (base != cur_base) flush(), cur_base = base, cur = 0;
+                if (m.State == MEM_COMMIT && m.Type == MEM_PRIVATE) priv += m.RegionSize, cur += m.RegionSize;
+                if (m.State == MEM_COMMIT && m.Type == MEM_MAPPED) mapped += m.RegionSize;
+                a = end > a ? end : a + 0x1000;
+            }
+            flush();
+            PROCESS_MEMORY_COUNTERS_EX pm{};
+            pm.cb = sizeof pm;
+            K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pm, sizeof pm);
+            const uint64_t total = pm.PrivateUsage, in_va = low + high + priv;
+            constexpr int S = 20;
+            logf("vk: memory map: process private %llu MB = the game's memory %llu MB (image and heap %llu, address regions %llu, %llu "
+                 "ranges) + other private memory %llu MB (largest %llu, %llu, %llu, %llu MB) + %lld MB in no address range (the "
+                 "driver's charge for its allocations: the VRAM's, MB for MB); %llu MB of mapped views besides (RX_VK_MEM_MAP=0: off)",
+                 (unsigned long long)(total >> S), (unsigned long long)((low + high) >> S), (unsigned long long)(low >> S),
+                 (unsigned long long)(high >> S), (unsigned long long)ranges, (unsigned long long)(priv >> S),
+                 (unsigned long long)(top[0].bytes >> S), (unsigned long long)(top[1].bytes >> S), (unsigned long long)(top[2].bytes >> S),
+                 (unsigned long long)(top[3].bytes >> S), (long long)(((int64_t)total - (int64_t)in_va) / (1 << S)),
+                 (unsigned long long)(mapped >> S));
+            busy = false;
+        }).detach();
+    } catch (...) {
+        busy = false;
+    }
+}
+void ram_guard_log() {
+    {
+        static int calls = 0;
+        if (calls++ % 3 == 0) mem_map_log_async();
+    }
+    if (!ram_guard_on()) return;
+    const RamState rs = ram_state();
+    const unsigned of = prep_of.load(), now_allowed = prep_allowed_now.load();
+    char prep[96] = "";
+    if (of) snprintf(prep, sizeof prep, "; preparation threads %u of %u allowed lately", now_allowed, of);
+    logf("vk: RAM guard: level %d (commit %d); commit left %llu of %llu MB (the least %llu), RAM free %llu of %llu MB, private "
+         "%llu MB; imports %llu MB (%llu MB without a mirror, cap %llu MB%s), %lld given back by the cap (%lld MB); mirrors %llu MB "
+         "(budget %llu MB, the guard's cut %llu MB)%s (RX_VK_RAM_GUARD=0: off)",
+         rs.level, rs.commit_level, (unsigned long long)(rs.commit_avail >> 20), (unsigned long long)(rs.commit_limit >> 20),
+         (unsigned long long)std::min<uint64_t>(st_ram_least_commit_mb.load(), rs.commit_avail >> 20),
+         (unsigned long long)(rs.phys_avail >> 20), (unsigned long long)(rs.phys_total >> 20), (unsigned long long)(rs.priv >> 20),
+         (unsigned long long)(st_live_import_bytes.load() >> 20), (unsigned long long)(st_bare_import_bytes.load() >> 20),
+         (unsigned long long)(import_cap_now.load() >> 20), import_cap_now.load() ? "" : ": off", (long long)st_cap_given_n.load(),
+         (long long)(st_cap_given_bytes.load() >> 20), (unsigned long long)(mirror_bytes >> 20),
+         (unsigned long long)(mirror_budget() >> 20), (unsigned long long)(ram_mirror_cut.load() >> 20), prep);
+}
 void vram_gov_mirror_cut(uint64_t bytes) { gov_mirror_cut.store(bytes, std::memory_order_relaxed); }
 void memory_stats(int64_t* mirrors, uint64_t* mirror_mb, int64_t* sync_bytes, int64_t* sync_copies, int64_t* wb_bytes) {
     *mirrors = st_mirrors, *mirror_mb = mirror_bytes >> 20, *sync_bytes = st_sync_bytes, *sync_copies = st_sync_copies;

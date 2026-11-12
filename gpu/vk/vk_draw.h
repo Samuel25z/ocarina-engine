@@ -78,6 +78,9 @@ void draw_records_log(uint64_t frame_lo, uint64_t frame_hi);
 void pass_traces_log(uint64_t frame_lo, uint64_t frame_hi);   // (RX_VK_PASS_TRACE=1)
 /// Changes with every uniform update the stream makes (vk_replay.cpp): descriptors bound before may be stale
 uint64_t ub_generation();
+/// (Ocarina Engine, RX_VK_BIND_CACHE) Changes whenever ub_overlay could answer differently for a range it left alone: the
+/// uniform updates it looks through (the list's changes and this thread's part of it)
+uint64_t ub_bind_stamp();
 /// A background thread (shader translation, pipeline builds) reads guest memory from the captures only, never the stream's
 /// uniform updates: that list is the replay's, which grows and is pruned while such a thread runs
 void ub_thread_off();

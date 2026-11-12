@@ -545,7 +545,7 @@ bool wide_sides_possible() { return wide_possible.load(std::memory_order_relaxed
 
 VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint32_t sw, uint32_t sh, const int crop[4], uint32_t dw, uint32_t dh) {
     const WideSides wide = wide_now.load(std::memory_order_relaxed);   // (wide_sides_tick, each present)
-    // (Vivid colors: SDR only. With HDR this picture feeds the HDR10 encode, or is the game's PQ codes, where it does not belong)
+    // (Vivid colors, 1 to 3 its level: SDR only. With HDR this picture feeds the HDR10 encode, or is the game's PQ codes, where it does not belong)
     const bool vivid = opts.vivid && opts.hdr == 0 && !dev.hdr;
     if (!opts.upscale && !opts.sharpness && !wide.side && !vivid) return VK_NULL_HANDLE;
     if (!src || !image || !sw || !sh || !dw || !dh) return VK_NULL_HANDLE;
@@ -594,7 +594,8 @@ VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint
         to_general(cmd, scale.scaled.image);
     }
     struct { int mode; float sharp; float x0, x1; int side; float vivid; } pc{opts.upscale, opts.sharpness / 100.0f, wide.x0,
-                                                                              1.0f - wide.x0, wide.side, vivid ? 1.0f : 0.0f};
+                                                                              1.0f - wide.x0, wide.side,
+                                                                              vivid ? (float)std::clamp(opts.vivid, 1, 3) : 0.0f};   // (the level: fg_scale.comp vivid)
     if (wide.side == 1) {   // (the blurred sides: first the picture at 1/8, each pixel the mean of its 8 x 8, which they blur)
         // (from #1448's checked source rectangle, as the crop above: the picture src now holds)
         const uint32_t smw = std::max(1u, source.w / 8), smh = std::max(1u, source.h / 8);

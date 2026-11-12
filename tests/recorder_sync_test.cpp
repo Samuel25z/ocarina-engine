@@ -971,6 +971,17 @@ static void oversize() {
     draws_into(kCmd, 20, 1);
     recording_end(6);
 }
+/// (Ocarina Engine) the same packet bigger than its room as the first one in an empty ring, where the whole ring is free: made
+/// directly all the same (a packet's size alone decides, not how far the recorder had got)
+static void oversize_first() {
+    recording_begin();
+    std::vector<uint8_t> big(4096);
+    for (size_t i = 0; i < big.size(); i++) big[i] = (uint8_t)(i * 7);
+    vkCmdUpdateBuffer(kUp, H<VkBuffer>(0xE101), 0, big.size(), big.data());
+    if (g_mutate) poison(big.data(), big.size());
+    draws_into(kCmd, 4, 2);
+    recording_end(6);
+}
 /// Teardown with work queued: g_at_stop runs with frames in flight (the recorder stopped and joined), then more is recorded (the
 /// recorder started again), then vkDestroyDevice (stopped again: its boundary)
 static void (*g_at_stop)() = nullptr;
@@ -1069,6 +1080,19 @@ static int throw_test() {
     vkCmdDraw(kCmd, 3, 1, 0, 0);
     rec::boundary(rec::B_vkEndCommandBuffer);
     std::printf("the recorder's exception was not reported\n");
+    return 0;
+}
+/// (Ocarina Engine) --badpacket: a packet published out of order (the producer's numbering skips 5) must stop the recorder before
+/// its call runs: FATAL, exit code 3
+static int bad_packet_test() {
+    rec::set_mode(rec::THREAD);
+    std::lock_guard lk(g_replay_mu);
+    vkCmdDraw(kCmd, 1, 1, 0, 0);
+    rec::boundary(rec::B_vkEndCommandBuffer);   // (the first one run: the recorder is past packet 0)
+    rec::g_rec.seq_w += 5;
+    vkCmdDraw(kCmd, 7, 1, 0, 0);
+    rec::boundary(rec::B_vkEndCommandBuffer);
+    std::printf("the packet out of order was run\n");
     return 0;
 }
 
@@ -1526,6 +1550,19 @@ static void thread_checks(const std::vector<Call>& ref) {
         check_run("thread, a packet bigger than its room (4 KB vkCmdUpdateBuffer, 2 KB room): made directly in order", oref.log,
                   run_tracked(oversize, rec::THREAD, true));
         if (rec::g_rec.direct.load() - d0 != 1) std::printf("FAIL thread oversize: %llu calls made directly, 1 expected\n", (unsigned long long)(rec::g_rec.direct.load() - d0)), failures++;
+        {   // (Ocarina Engine) the recorder stopped and its counters at the ring's start: the next packet, the oversize one, finds
+            // the whole 8 KB ring free and its tail whole
+            rec::g_rec.stop();
+            const uint64_t at = (rec::g_rec.W.load() + 8191) & ~uint64_t(8191);
+            rec::g_rec.W.store(at), rec::g_rec.R.store(at);
+            const uint64_t d1 = rec::g_rec.direct.load();
+            const Out fref = run_tracked(oversize_first, rec::OFF, false);
+            check_run("thread, a packet bigger than its room first in an empty ring: made directly in order", fref.log,
+                      run_tracked(oversize_first, rec::THREAD, true));
+            if (rec::g_rec.direct.load() - d1 != 1)
+                std::printf("FAIL thread oversize, ring empty: %llu calls made directly, 1 expected\n",
+                            (unsigned long long)(rec::g_rec.direct.load() - d1)), failures++;
+        }
         rec::g_rec.stop();
         rec::g_ring_bytes = bytes, rec::g_ring_room = room;
     }
@@ -1585,6 +1622,7 @@ int main(int argc, char** argv) {
     if (argc > 2 && !std::strcmp(argv[1], "--overlap")) return overlap(std::atoi(argv[2]));
     if (argc > 2 && !std::strcmp(argv[1], "--idle")) return idle_bench(std::atoi(argv[2]));
     if (argc > 1 && !std::strcmp(argv[1], "--throw")) return throw_test();
+    if (argc > 1 && !std::strcmp(argv[1], "--badpacket")) return bad_packet_test();
     const bool only_thread = argc > 2 && !std::strcmp(argv[1], "--only") && !std::strcmp(argv[2], "thread");
 
     const std::vector<Call> ref = run(frame, rec::OFF, false);

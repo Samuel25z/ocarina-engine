@@ -700,6 +700,20 @@ def chunk_costs(gen):
         return {}
 
 
+def vk_opt_flags(link=False):
+    """(Ocarina Engine) the Vulkan back end's optional optimizations, from the environment: RX_VK_LTO=1 ThinLTO; RX_VK_PGO_GEN=1 a
+    profiling build (gpu/vk/vk_main.cpp writes ocarina-vk.profraw beside the exe every 30 s, the bench kills the game);
+    RX_VK_PGO_USE=<.profdata> the profile it gave, merged with llvm-profdata. Compile flags, or with link the link's"""
+    f = []
+    if os.environ.get("RX_VK_LTO") == "1":
+        f.append("-flto=thin")
+    if os.environ.get("RX_VK_PGO_GEN") == "1":
+        f += ["-fprofile-generate"] + ([] if link else ["-DOCARINA_PGO_GEN"])
+    elif os.environ.get("RX_VK_PGO_USE") and not link:
+        f.append("-fprofile-use=" + os.environ["RX_VK_PGO_USE"])
+    return f
+
+
 def compile_cost(src, costs):
     """A file's compile time, roughly (see HOT_COST)"""
     name = os.path.basename(src)
@@ -925,7 +939,7 @@ def main():
             "-I" + os.path.join(vk, "sirit", "include"), "-I" + os.path.join(vk, "sirit", "src"),
             "-I" + os.path.join(spirv_headers, "include"), "-I" + os.path.join(spirv_headers, "include", "spirv", "unified1"),
             "-I" + os.path.join(vk_headers, "include"), "-I" + os.path.join(vma_headers, "include"),
-            "-I" + vk, "-I" + gen_dir]
+            "-I" + vk, "-I" + gen_dir] + vk_opt_flags()
         # (NVIDIA DLSS, a local build's option: scripts/ngx_sdk.py. Only vk_dlss.cpp sees NVIDIA's headers; without them
         # it is the stubs that say DLSS is not there)
         ngx_flags = ["-DHOOKSHOT_NGX", "-I" + os.path.join(NGX_SDK, "include")] if NGX_SDK else []
@@ -1145,7 +1159,7 @@ def main():
         else:
             link = [cc] + toolchain.native_target() + toolchain.native_link() + \
                 ["-shared", "-o", vdll, toolchain.link_opt("/map:" + vdll[:-4] + ".map"), "@" + vrsp, "-luser32",
-                 "-lwinhttp"] +                 (["-lc++", "-lunwind"] if toolchain.mingw() else []) + ngx_link(NGX_SDK, toolchain.mingw())
+                 "-lwinhttp"] +                 (["-lc++", "-lunwind"] if toolchain.mingw() else []) + ngx_link(NGX_SDK, toolchain.mingw()) +                 vk_opt_flags(link=True)
         r = subprocess.run(link, capture_output=True, text=True)
         if r.returncode:
             undefined = sorted({l.strip() for l in (r.stdout + r.stderr).splitlines() if "undefined symbol" in l})

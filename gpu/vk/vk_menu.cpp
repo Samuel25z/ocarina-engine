@@ -34,6 +34,7 @@
 #include "oot_cheat_items.h"
 #include "vk_progress.h"   // (StartupView, version_text: the start-up screen)
 #include "vk_ui.h"
+#include "ocarina_ui.h"   // (ocarina: the Ocarina Engine's look of the start-up screen and the menu)
 #include "vk_menu_keys.h"   // (which gamepad buttons confirm and go back: those A and B are bound to)         // (how it looks: Dear ImGui, vk_imgui.h)
 #include "vk_dlss.h"
 #include "../../host/hos_wide_size.h"   // (the widescreen picture's size, as host/hos_main.c works it out)
@@ -47,6 +48,9 @@
 #include "menu_restart.h"
 #include "ocarina_brand.h"   // (ocarina: the banner's name and icon, the start-up screen's)
 #include "ocarina_update.h"  // (ocarina: the Gameplay tab's update rows)
+#include "ocarina_report.h"  // (ocarina: the Gameplay tab's report rows, the note after an automatic report)
+#include "vk_menu_pt.h"      // (ocarina: the menu in Portuguese, T below)
+#include <unordered_map>
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 #ifndef HOOKSHOT_VERSION   // (nx2/build.py gives it to this file: nx2/version.py)
 #define HOOKSHOT_VERSION "unknown"
@@ -101,6 +105,7 @@ const char* tx_framegen(int v) {
     return t[v];
 }
 const char* tx_onoff(int v) { return v ? "On" : "Off"; }
+const char* tx_ligado(int v) { return v ? "Ligado" : "Desligado"; }   // (ocarina: the Portuguese rows)
 // (ocarina) The Gameplay tab's update rows (ocarina_update.h): no value of their own; told apart by their names' addresses.
 // Their hint, under the help, is what the update says now (variant -1), or its longest lines (measure_help)
 const char kUpdateHeading[] = "Ocarina Engine v" OCARINA_VERSION;
@@ -110,6 +115,15 @@ const char* update_hint(int, int variant) {
     if (variant >= 0) return ocarina_update::sample(variant);
     static std::string now;
     now = ocarina_update::view().detail;
+    return now.empty() ? nullptr : now.c_str();
+}
+// (ocarina) The report's rows (ocarina_report.h), told apart the same way; their hint is the report's line now, or its longest
+const char kReportRow[] = "Relatório";
+const char kReportFolderRow[] = "Pasta do relatório";
+const char* report_hint(int, int variant) {
+    if (variant >= 0) return ocarina_report::sample(variant);
+    static std::string now;
+    now = ocarina_report::view().detail;
     return now.empty() ? nullptr : now.c_str();
 }
 const char* tx_profile(int v) { return v ? "Handheld" : "Docked"; }   // (opts.handheld: the Profile row)
@@ -658,6 +672,19 @@ const char* tx_wide_menus(int v) {
 MENU_HINTS(hn_wide_menus, 0, "The menus stretched over the whole screen, as before.",
            "The menus in the middle 16:9; beside them, what the game draws there, out of focus.",
            "The menus in the middle 16:9; black beside them.")
+/// (ocarina) Vivid colors by level (fg_scale.comp vivid: its vibrance and contrast); an older file's 1, the old On, is Light
+const char* tx_vivid(int v) {
+    static const char* const t[] = {"Off", "Light", "Medium", "Strong"};
+    return t[std::clamp(v, 0, 3)];
+}
+MENU_HINTS(hn_vivid, 0, "The picture as the game draws it.", "A touch more colour: the old On.",
+           "Clearly more colour and contrast.", "Much more colour and contrast.")
+/// (ocarina) The menu's language: Auto follows the game's (game_pt), else Portuguese or English (menu_pt)
+const char* tx_menu_language(int v) {
+    static const char* const t[] = {"Auto", "Português", "English"};
+    return t[std::clamp(v, 0, 2)];
+}
+MENU_HINTS(hn_menu_language, 0, "The game's language: Portuguese when the game is in Portuguese, else English.", nullptr, nullptr)
 MENU_HINTS(hn_robust, 0, "On, on every card.", "Can be faster on some NVIDIA cards.", "Always on.")
 MENU_HINTS(hn_mesh_mode, 0, "The GPU's own mesh shaders where it has them, the compute path where it has not.",
            "The GPU's own mesh shaders for every draw. A GPU without them still uses the compute path.",
@@ -731,9 +758,9 @@ Row rows[] = {
      "How the finished picture is scaled to the window, when its size differs from the Output resolution.", hn_filter},
     {TAB_GRAPHICS, "Sharpness", &opts.sharpness, 0, 100, 10, tx_percent,
      "Sharpens the picture as it goes to the window, with any filter. Too much shows halos around edges.", hn_sharpness},
-    {TAB_GRAPHICS, "Vivid colors", &opts.vivid, 0, 1, 1, tx_onoff,
-     "A little more colour and contrast as the picture goes to the window, like emulators' Vivid filter. Skin and colours "
-     "already strong are left as they are. Not with HDR.", nullptr},
+    {TAB_GRAPHICS, "Vivid colors", &opts.vivid, 0, 3, 1, tx_vivid,
+     "More colour and contrast as the picture goes to the window, like emulators' Vivid filter. Skin and colours already "
+     "strong are left as they are. Not with HDR.", hn_vivid},
     {TAB_GRAPHICS, "Anisotropic filtering", &opts.anisotropy, 0, 4, 1, tx_anisotropy,
      "Keeps textures sharp on surfaces seen at a slant, such as the ground ahead: higher is sharper in the distance, for a "
      "little GPU time. Game's is the console's own (1x or 2x).", nullptr},
@@ -760,7 +787,9 @@ Row rows[] = {
     {TAB_AUDIO, "Audio output", &opts.audio_output, 0, 2, 1, tx_audio_output,
      "The speakers the game mixes its sound for. Applies after a restart.", hn_audio_output, true, true},
 
-    // Gameplay
+    // Gameplay (ocarina: the menu's language first, in both languages, so it can be found whichever is shown)
+    {TAB_GAMEPLAY, "Idioma / Language", &opts.menu_language, 0, 2, 1, tx_menu_language,
+     "The language of this menu.", hn_menu_language, false, true},
     {TAB_GAMEPLAY, "FPS counter", &opts.show_fps, 0, 1, 1, tx_onoff, "Frames per second in the top right corner.", hn_fps,
      false, true},
     {TAB_GAMEPLAY, "Menu size", &opts.menu_size, 1, 3, 1, tx_menu_size,
@@ -876,6 +905,27 @@ Row rows[] = {
     {TAB_GAMEPLAY, kUpdateButtonRow, nullptr, 0, 0, 0, nullptr,
      "Procurar atualização pergunta ao GitHub agora. Com uma versão nova, Atualizar baixa a hookshot_vk.dll, confere se ela serve "
      "para este jogo e a coloca no lugar; ela vale a partir do próximo início.", update_hint, false, true},
+    // (ocarina) the problem report: the button, then the folder (vk_menu.cpp is_report_row)
+    {TAB_GAMEPLAY, kReportRow, nullptr, 0, 0, 0, nullptr,
+     "Gerar relatório junta num arquivo .zip, na pasta do jogo, o que precisamos para entender um problema: os logs do jogo, uma "
+     "foto da tela, o tempo de cada quadro dos últimos 3 minutos e das travadas, os bugs marcados com F9, suas opções, o "
+     "hookshot_env.txt, a placa de vídeo, o processador, a memória e o Windows. Com Enviar relatórios automaticamente ligado, ele "
+     "também vai sozinho para o Ocarina Engine; desligado, é você quem anexa o arquivo. Seu nome de usuário e suas pastas pessoais "
+     "ficam de fora.",
+     report_hint, false, true},
+    {TAB_GAMEPLAY, kReportFolderRow, nullptr, 0, 0, 0, nullptr,
+     "Abre a pasta do jogo no Explorador com o último relatório selecionado. Viu um bug na tela? Aperte F9 na hora: a foto e o "
+     "momento vão no próximo relatório (RX_VK_BUG_KEY troca a tecla; 0 desliga).",
+     report_hint, false, true},
+    {TAB_GAMEPLAY, "Relatórios automáticos", &opts.auto_report, 0, 1, 1, tx_ligado,
+     "Ligado: quando o jogo fecha com erro (travou, a placa de vídeo parou ou foi fechado à força), o próximo início salva um "
+     "relatório .zip na pasta do jogo e avisa na tela; ficam no máximo 5. Se ele vai pela internet é a opção de baixo. Desligado: "
+     "nenhum relatório automático; Gerar relatório continua funcionando.", nullptr, false, true},
+    {TAB_GAMEPLAY, "Enviar relatórios automaticamente", &opts.report_upload, 0, 1, 1, tx_ligado,
+     "Ligado: cada relatório (o automático, depois de um erro, e o do Gerar relatório) vai pela internet para o Ocarina Engine, "
+     "para o erro chegar a quem corrige sem você precisar anexar nada. Vão só os arquivos do relatório, sem seu nome de usuário, "
+     "o nome do computador ou suas pastas pessoais. Sem internet, ele vai no próximo início. Desligado: nada é enviado; os "
+     "relatórios ficam só na pasta do jogo.", nullptr, false, true},
     // (Restart and Quit stay the table's last two: kRestartRow and kQuitRow count back from its end)
     {TAB_GAMEPLAY, "Restart", nullptr, 0, 0, 0, nullptr,
      "Starts the game again. Save your progress first. Press Enter or A twice to restart. Esc or B "
@@ -889,6 +939,8 @@ const Row* pending = nullptr;   // (Restart or Quit: shows Confirm until its sec
 bool cheats_env = false;   // (HOS_OOT_CHEATS=1: on whatever the Debug tab says)
 /// (ocarina) The update's version row or its button (not the heading)
 bool is_update_row(const Row& r) { return r.name == kUpdateVersionRow || r.name == kUpdateButtonRow; }
+/// (ocarina) The report's button or its folder
+bool is_report_row(const Row& r) { return r.name == kReportRow || r.name == kReportFolderRow; }
 /// The debug tools: the Debug tab's row, or HOS_OOT_CHEATS=1
 bool cheats_on() { return cheats_env || opts.debug_tools; }
 std::atomic<int> protect_hearts{-1};
@@ -1095,6 +1147,10 @@ std::string restart_list(const char* last) {
     return mr::names(restart_names, restart_state.n, restart_pending(), ", ", last);
 }
 int ask_sel = 0;   // (the restart question's choice: 0 Later, 1 Restart now)
+int save_sel = 0;   // (ocarina: the save question's choice, page 6: 0 Yes, 1 No, 2 Back)
+bool saved_yes = false;   // (ocarina: Yes chosen, the restart question after it: its Later closes with the saved note)
+int64_t saved_note_until = 0;   // (ocarina: the note after Yes, "Settings saved", shown until then, prof_now's ns)
+bool saved_note_restart = false;   // (and whether it says that some take effect after a restart)
 
 /// A row on its tab: the debug tools only with them on; a row for what this PC cannot run not at all (Reflex and Anti-Lag 2
 /// only where the driver has them, the Upscaler only where more than the game's own runs, the DLSS model only where DLSS
@@ -1158,6 +1214,12 @@ const char* ini_key(const Row& r) {
     if (r.value == &opts.dlss) return "dlss";   // (as opts.dlss and RX_VK_DLSS)
     if (r.value == &opts.handheld) return "handheld_profile";   // (the Profile row; host/nn_applet.c reads it at the start)
     if (r.value == &opts.mesh_mode) return "mesh_shaders";   // (gpu/vk/vk_main.cpp reads it as the device is made)
+    if (r.value == &opts.auto_report) return "auto_report";   // (ocarina: its name has letters a key cannot)
+    if (r.value == &opts.report_upload) return "report_upload";   // (ocarina: the same)
+    if (r.value == &opts.menu_language) return "menu_language";   // (ocarina: the same, "Idioma / Language")
+    // (ocarina) Vivid colors by level under a key of its own: an older file's vivid_colors=1 was the old default, not a choice, and
+    // now opens at the new default (Strong); its vivid_colors=0, a choice, stays off (read below)
+    if (r.value == &opts.vivid) return "vivid_level";
     static char k[32];
     size_t n = 0;
     for (const char* p = r.name; *p && n + 1 < sizeof k; p++) k[n++] = *p == ' ' ? '_' : (char)tolower(*p);
@@ -1249,6 +1311,9 @@ void mic_chosen() {
     mic_row_ends();
     mic_tell_host();
 }
+// (ocarina) the reports' notice: the level the file says was shown (0 none, 1 saved, 2 also sent), and one shown now, to be saved
+// by menu_tick (0 none)
+std::atomic<int> report_notice{0}, report_notice_now{0};
 void save() {
     // (hookshot) the lines that are not the menu's are kept: the controls, pad_ and key_ (host/nn_hid.c)
     // (and every other line the menu does not write, such as discord_app_id=: they were dropped at the next save)
@@ -1263,7 +1328,7 @@ void save() {
             const char* eq = strchr(line, '=');
             if (!eq || eq == line) continue;
             const std::string key(line, (size_t)(eq - line));
-            bool mine = key == "microphone_device" || key == "options_version";
+            bool mine = key == "microphone_device" || key == "options_version" || key == "ocarina_report_notice";
             for (const Row& r : rows)
                 if (!mine && r.value && key == ini_key(r)) mine = true;
             if (!mine) others += line, others += others.back() == '\n' ? "" : "\n";
@@ -1280,6 +1345,7 @@ void save() {
             }
         }
         if (!mic_want.empty()) fprintf(f, "microphone_device=%s\n", mic_want.c_str());   // (hookshot: also while it is unplugged)
+        if (report_notice.load()) fprintf(f, "ocarina_report_notice=%d\n", report_notice.load());   // (ocarina: the reports' notice was shown)
         // (2: game_speed below 2 was only ever the old default, see menu_init; 3: the mouse's buttons are bindings, see
         // host/nn_hid.c binds_load; 4: Descriptor reuse on by default, see menu_init and vk_draw.cpp desc_slotgen_on)
         // (5, zero-travadas: Descriptor reuse and Sampler cache both on by default, see menu_init and vk_draw.cpp)
@@ -1340,6 +1406,65 @@ void set_row(Row& r, int v, int dir, bool keep = true) {
         restart_state.note(now);
     }
     if (keep) save();
+}
+
+// ---- (ocarina) the options as the menu opened: closing with any changed asks "Save the changes?" (page 6). Yes saves them (each
+// change is applied, and saved, as it is made: Yes saves once more and says so), No puts every one back as it was and saves that,
+// Back stays in the menu. The rows' values, the memory limits a preset sets, the microphone by its name and the controls ----
+struct OpenState {
+    int vals[kRows];
+    int vram, mirror;
+    std::string mic;
+    bool binds;   // (the controls read: the host could bind)
+    int pad[HOS_SW_N];
+    int key[HOS_KEY_N][2];
+} opened;
+void options_note_open() {
+    for (int i = 0; i < kRows; i++) opened.vals[i] = rows[i].value ? *rows[i].value : 0;
+    opened.vram = opts.vram_mb, opened.mirror = opts.mirror_mb, opened.mic = mic_want;
+    opened.binds = can_bind();
+    for (int i = 0; i < HOS_KEY_N && opened.binds; i++) {
+        if (i < HOS_SW_N) opened.pad[i] = host->binding(HOS_BIND_PAD, i, 0);
+        for (int k = 0; k < 2; k++) opened.key[i][k] = host->binding(HOS_BIND_KEY, i, k);
+    }
+}
+bool options_changed() {
+    for (int i = 0; i < kRows; i++)
+        if (rows[i].value && *rows[i].value != opened.vals[i]) return true;
+    if (mic_want != opened.mic) return true;
+    for (int i = 0; i < HOS_KEY_N && opened.binds && can_bind(); i++) {
+        if (i < HOS_SW_N && host->binding(HOS_BIND_PAD, i, 0) != opened.pad[i]) return true;
+        for (int k = 0; k < 2; k++)
+            if (host->binding(HOS_BIND_KEY, i, k) != opened.key[i][k]) return true;
+    }
+    return false;
+}
+/// No: every option back as the menu opened, applied and saved
+void options_revert() {
+    for (int i = 0; i < kRows; i++)
+        if (rows[i].value) *rows[i].value = opened.vals[i];
+    opts.vram_mb = opened.vram, opts.mirror_mb = opened.mirror;
+    mic_want = opened.mic;
+    refresh_mics();   // (the microphone by its name, told to the host)
+    for (int i = 0; i < HOS_KEY_N && opened.binds && can_bind(); i++) {
+        if (i < HOS_SW_N) host->bind(HOS_BIND_PAD, i, 0, opened.pad[i]);
+        for (int k = 0; k < 2; k++) host->bind(HOS_BIND_KEY, i, k, opened.key[i][k]);
+    }
+    samplers_changed();   // (anisotropy, the upscaler's LOD bias: as set_row does)
+    int now[mr::kMax];
+    restart_values(now);
+    restart_state.note(now);
+    save();
+}
+/// The note after Yes, for about 2 s once the menu is closed
+void saved_note_show() {
+    saved_note_until = prof_now() + 2200000000LL;
+    saved_note_restart = restart_pending() != 0;
+}
+/// (ocarina) Whether Left and Right change something on this row (a value, a debug tool that chooses or switches); on any other
+/// (a page, a button, Restart, Quit, the update's and the report's) they change the tab
+bool lr_changes(const Row& r) {
+    return r.value || (r.cheat >= 0 && (r.cheat <= 1 || r.cheat == 7 || cheat_chooses(r.cheat) || age_shown(r.cheat)));
 }
 
 // ---- (hookshot) the Controls page: what presses each of the Switch's buttons, a gamepad input and up to two keys ----
@@ -1474,10 +1599,68 @@ int scrolled_to[TAB_MOTION + 2] = {-1, -1, -1, -1, -1, -1};   // (the selection 
 float scroll_want[TAB_MOTION + 2];   // (where scroll_at is going: the wheel moves it, a new selection too)
 float ease_step = 0;     // (this drawing's share of the way: the time since the last one)
 
+/// (ocarina) The game's language is Portuguese (HOS_LANGUAGE, else language.txt beside the game, host/nn_applet.c's rule: its
+/// first line that is not blank or a comment): the start-up screen then speaks Portuguese. Read once
+bool game_pt() {
+    static const bool pt = [] {
+        std::string code;
+        if (const char* e = getenv("HOS_LANGUAGE"); e && *e) code = e;
+        else {
+            char exe[MAX_PATH];
+            const DWORD n = game_module_path(exe, MAX_PATH);
+            std::string path(exe, n);
+            path = path.substr(0, path.find_last_of("\\/") + 1) + "language.txt";
+            if (FILE* f = fopen(path.c_str(), "r")) {
+                // (a whole line at a time: the file's first comment is longer than 80 characters, and its rest, read as a
+                // line of its own, was taken for the code: the start-up screen spoke English to a pt-BR game)
+                char line[1024];
+                while (code.empty() && fgets(line, sizeof line, f)) {
+                    if (!strchr(line, 10) && !feof(f)) {   // (longer still: skip to its end, it is no code)
+                        int ch;
+                        while ((ch = fgetc(f)) != EOF && ch != 10) {}
+                        continue;
+                    }
+                    const char* q = line;
+                    if ((unsigned char)q[0] == 0xEF && (unsigned char)q[1] == 0xBB && (unsigned char)q[2] == 0xBF) q += 3;
+                    while (*q == ' ' || *q == '\t') q++;
+                    if (*q == '#' || *q == '\r' || *q == '\n' || !*q) continue;
+                    code = q;
+                }
+                fclose(f);
+            }
+        }
+        return code.size() >= 2 && (code[0] == 'p' || code[0] == 'P') && (code[1] == 't' || code[1] == 'T');
+    }();
+    return pt;
+}
+/// (ocarina) The menu in Portuguese: the Language row's Português, or its Auto with the game in Portuguese
+bool menu_pt() { return opts.menu_language == 1 || (opts.menu_language != 2 && game_pt()); }
+/// (ocarina) A text of the menu's own, as shown: in Portuguese its translation (vk_menu_pt.h: whole, or part by part), else
+/// as it is. A text the table cannot translate (a GPU's or a microphone's name, a text already in Portuguese) as it is too.
+/// What it returns lasts: each text is translated once and kept (a few hundred at most)
+const char* T(const char* en) {
+    if (!en || !*en || !menu_pt()) return en;
+    static std::unordered_map<std::string, std::string> done;
+    if (const auto it = done.find(en); it != done.end()) return it->second.c_str();
+    if (done.size() >= 4096) return en;   // (never: a guard against texts made anew without end)
+    std::string pt;
+    if (!menu_lang::translate(en, &pt)) pt = en;
+    return done.emplace(en, std::move(pt)).first->second.c_str();
+}
+/// (ocarina) A text written here in both languages
+const char* L(const char* pt, const char* en) { return menu_pt() ? pt : en; }
+
 ui::Ctx ui_ctx(uint32_t w, uint32_t h) {
+    if (brand_on()) ui::use_ocarina_style();   // (ocarina: its palette, once)
     ui::Ctx c{ImGui::GetForegroundDrawList(), ui::fonts(), 1, (float)w, (float)h, 0, pad_last};
     c.confirm_dot = menu_keys::dot(pad_confirm), c.back_dot = menu_keys::dot(pad_back);
     c.s = ui::unit((float)h, opts.menu_size, &c.safe);
+    // (ocarina) the shoulder buttons by the controller's names (the tabs' prompt: LB and RB, L1 and R1, L and R), and the restart
+    // note in the menu's language
+    const char* l = pad_name(HOS_PAD_LSHOULDER);
+    const char* r = pad_name(HOS_PAD_RSHOULDER);
+    c.tab_l = strchr(l, '/') ? "LB" : l, c.tab_r = strchr(r, '/') ? "RB" : r;   // (by place, "L1 / LB": LB)
+    c.restart_note = T("Takes effect after a restart");
     return c;
 }
 /// The banner's height
@@ -1489,10 +1672,10 @@ float measure_help(ui::Ctx& c, float width) {
     float most = 0;
     for (const Row& r : rows) {
         float hint = 0;
-        for (int v = r.lo; (r.value || is_update_row(r)) && r.hint && v <= r.hi; v++)   // (ocarina: the update's, lo = hi = 0)
+        for (int v = r.lo; (r.value || is_update_row(r) || is_report_row(r)) && r.hint && v <= r.hi; v++)   // (ocarina: the update's, lo = hi = 0)
             for (int k = 0; const char* t = r.hint(v, k); k++)
-                hint = std::max(hint, ui::para(c, c.f.body, 16 * c.s, ImVec2(), 0, t, width - 18 * c.s, false));
-        if (r.help) most = std::max(most, ui::para(c, c.f.body, 18 * c.s, ImVec2(), 0, r.help, width, false) + (hint ? 14 * c.s + hint : 0));
+                hint = std::max(hint, ui::para(c, c.f.body, 16 * c.s, ImVec2(), 0, T(t), width - 18 * c.s, false));
+        if (r.help) most = std::max(most, ui::para(c, c.f.body, 18 * c.s, ImVec2(), 0, T(r.help), width, false) + (hint ? 14 * c.s + hint : 0));
     }
     return most;
 }
@@ -1556,6 +1739,11 @@ float scroll_rows(int slot, int n, int sel, float top, float bottom, float pitch
 void scroll_bar(ui::Ctx& c, float x, float top, float bottom, int n, int shown, float first) {
     if (n <= shown) return;
     const float s = c.s, span = bottom - top, y0 = top + span * first / n, y1 = top + span * (first + shown) / n;
+    if (ui::ocarina_style) {   // (ocarina: a hairline of stone, the part shown in gold)
+        c.d->AddRectFilled(ImVec2(x - 0.75f * s, top), ImVec2(x + 0.75f * s, bottom), ui::alpha(ui::kStone, 0.3f));
+        c.d->AddRectFilled(ImVec2(x - 1.25f * s, y0), ImVec2(x + 1.25f * s, y1), ui::kFairy, 1.25f * s);
+        return;
+    }
     c.d->AddRectFilled(ImVec2(x - 2 * s, top), ImVec2(x + 2 * s, bottom), ui::rgba(0, 0, 0, 140), 2 * s);
     c.d->AddRectFilled(ImVec2(x - 2 * s, y0), ImVec2(x + 2 * s, y1), ui::kAccent, 2 * s);
 }
@@ -1588,7 +1776,7 @@ void help_box(ui::Ctx& c, float x0, float x1, float y0, const char* title, const
     if (title) ui::text(c, c.f.heading, 21 * s, ImVec2(x0 + 24 * s, y), ui::kInk, title), y += 32 * s;
     if (after_restart) {   // (this row's change applies at the next start: said here, not in the row, where it would cut the name)
         ui::diamond(c, ImVec2(x0 + 29 * s, y + 10 * s), 4 * s, ui::kGoldHi);
-        ui::text_mid(c, c.f.strong, 16 * s, x0 + 42 * s, y + 10 * s, ui::kGoldHi, "Takes effect after a restart");
+        ui::text_mid(c, c.f.strong, 16 * s, x0 + 42 * s, y + 10 * s, ui::kGoldHi, c.restart_note);
         y += note;
     }
     if (help) ui::para(c, c.f.body, 18 * s, ImVec2(x0 + 24 * s, y), ui::kInk, help, w);
@@ -1626,6 +1814,12 @@ void column(ui::Ctx& c, float x0, float x1, float top) {
 /// (the help says it in words)
 void name_cell(ui::Ctx& c, ImVec2 a, ImVec2 b, const char* name, bool sel, bool pending = false, float px = 18.5f) {
     const float s = c.s, mid = (a.y + b.y) * 0.5f;
+    name = T(name);   // (ocarina: in the menu's language)
+    if (ui::ocarina_style) {   // (ocarina: no box; a fairy's light before the selected name, a gold line under its row)
+        const std::string shown = fit(c, sel ? c.f.strong : c.f.body, px * s, ui::row_name_room(c, a, b, pending), name, false);
+        ui::row_name(c, a, b, shown.c_str(), sel, pending, px * s);
+        return;
+    }
     c.d->AddRectFilled(a, b, sel ? ui::kCellNameSel : ui::kCellName);
     c.d->AddRect(a, b, ui::kEdge, 0, std::max(1.0f, s));
     if (sel) c.d->AddRectFilled(a, ImVec2(a.x + 4 * s, b.y), ui::kGoldHi);
@@ -1639,8 +1833,16 @@ void name_cell(ui::Ctx& c, ImVec2 a, ImVec2 b, const char* name, bool sel, bool 
     ui::text_mid(c, f, px * s, a.x + 20 * s, mid, sel ? ui::kInkBright : ui::kInk, shown.c_str());
 }
 /// A value cell: a choice with arrows at its ends (left, right: whether it can go that way), gold when selected
-void choice_cell(ui::Ctx& c, ImVec2 a, ImVec2 b, const std::string& value, bool sel, bool left, bool right, bool fixed = false) {
+/// (as_is: a name, a GPU's or a microphone's, shown as it is in either language)
+void choice_cell(ui::Ctx& c, ImVec2 a, ImVec2 b, const std::string& text, bool sel, bool left, bool right, bool fixed = false,
+                 bool as_is = false) {
     const float s = c.s, mid = (a.y + b.y) * 0.5f, in = 4 * s, px = 18 * s;
+    const std::string value = as_is ? text : T(text.c_str());   // (ocarina: in the menu's language)
+    if (ui::ocarina_style) {   // (ocarina: the value alone, discreet arrows at its ends)
+        const std::string shown = fit(c, sel && !fixed ? c.f.strong : c.f.body, px, ui::row_value_room(c, a, b, left || right), value, sel);
+        ui::row_choice(c, a, b, shown.c_str(), sel, left, right, fixed);
+        return;
+    }
     c.d->AddRectFilled(a, b, ui::kCellDark);
     c.d->AddRect(a, b, ui::kEdge, 0, std::max(1.0f, s));
     if (sel && !fixed) ui::gold(c, a + ImVec2(in, in), b - ImVec2(in, in));
@@ -1654,6 +1856,8 @@ void choice_cell(ui::Ctx& c, ImVec2 a, ImVec2 b, const std::string& value, bool 
 }
 /// A value cell of two halves (a row of two values: On and Off), the chosen one filled
 void halves_cell(ui::Ctx& c, ImVec2 a, ImVec2 b, const char* lo, const char* hi, bool high, bool sel, bool fixed) {
+    lo = T(lo), hi = T(hi);   // (ocarina: in the menu's language)
+    if (ui::ocarina_style) return ui::row_halves(c, a, b, lo, hi, high, sel, fixed);   // (ocarina: both words, the chosen one bright)
     const float s = c.s, mid = (a.y + b.y) * 0.5f, in = 4 * s, px = 18 * s, xm = (a.x + b.x) * 0.5f;
     c.d->AddRectFilled(a, b, ui::kCellDark);
     c.d->AddRect(a, b, ui::kEdge, 0, std::max(1.0f, s));
@@ -1667,6 +1871,7 @@ void halves_cell(ui::Ctx& c, ImVec2 a, ImVec2 b, const char* lo, const char* hi,
 }
 /// A slider's value cell: the value, a track with its knob along the cell's foot; *t0, *t1 the track (for the mouse)
 void slider_cell(ui::Ctx& c, ImVec2 a, ImVec2 b, const char* value, int permille, bool sel, float* t0, float* t1) {
+    if (ui::ocarina_style) return ui::row_slider(c, a, b, value, permille, sel, t0, t1);   // (ocarina: a fine track, a small knob)
     const float s = c.s, mid = (a.y + b.y) * 0.5f, in = 4 * s, px = 18 * s;
     c.d->AddRectFilled(a, b, ui::kCellDark);
     c.d->AddRect(a, b, ui::kEdge, 0, std::max(1.0f, s));
@@ -1682,6 +1887,12 @@ void slider_cell(ui::Ctx& c, ImVec2 a, ImVec2 b, const char* value, int permille
     if (sel) ui::glow(c, a, b);
     *t0 = x0, *t1 = x1;
 }
+/// (ocarina) The rows of mask by name, as shown (the menu's language), "A, B and C"
+std::string restart_names_shown(unsigned mask, const char* sep = ", ", const char* last = ", ") {
+    const char* shown[mr::kMax];
+    for (int i = 0; i < restart_state.n; i++) shown[i] = T(restart_names[i]);
+    return mr::names(shown, restart_state.n, mask, sep, last);
+}
 /// "Restart needed: " and the pending rows, on one line of width: the last ones as "and N more" when they do not fit
 std::string restart_line(ui::Ctx& c, float px, float width) {
     const unsigned all = restart_pending();
@@ -1691,13 +1902,21 @@ std::string restart_line(ui::Ctx& c, float px, float width) {
         int named = 0, more = 0;
         for (int i = 0; i < restart_state.n; i++)
             if ((all >> i) & 1) (named < keep ? (shown |= 1u << i, named++) : more++);
-        line = "Restart needed: " + mr::names(restart_names, restart_state.n, shown);
-        if (more) line += (named ? " and " : "") + std::to_string(more) + (named ? " more" : more > 1 ? " settings" : " setting");
+        line = L("Precisa reiniciar: ", "Restart needed: ") + restart_names_shown(shown);
+        if (more)
+            line += (named ? L(" e ", " and ") : "") + std::to_string(more) +
+                    (named ? L(" a mais", " more") : more > 1 ? L(" opções", " settings") : L(" opção", " setting"));
         if (ui::size_of(c.f.strong, px, line.c_str()).x <= width) break;
     }
     return line;
 }
 
+/// (ocarina) A debug tool's button, in the menu's language ("" a tool with a value)
+const char* debug_button(int i) {
+    static const char* const en[kCheatRows] = {"", "", "Mark", "Return", "", "", "", "", "Choose map", "Switch", "Edit items", ""};
+    static const char* const pt[kCheatRows] = {"", "", "Marcar", "Voltar", "", "", "", "", "Escolher mapa", "Trocar", "Editar itens", ""};
+    return i >= 0 && i < kCheatRows ? (menu_pt() ? pt : en)[i] : "";
+}
 /// (hookshot) The Debug tab's order: the tools' rows by their group (Row::cheat), Up and Down walking them so; Inventory item
 /// and Change quantity are not shown (the Inventory page edits every amount)
 struct DebugGroup { const char* title; int from, to; };   // (debug_tools_order[from, to))
@@ -1744,21 +1963,20 @@ void draw_debug_rows(ui::Ctx& c, float cx0, float cx1, float top, float bottom, 
     const int n = debug_rows(order, &dev, &dev_head);
     // (two columns only when each fits its longest name whole (name_cell's room, the selected's bold) and its value cells at
     // their narrowest; the cells then as wide as the room lets them, up to what they ask)
-    const float halves_w = 2 * std::max(ui::size_of(c.f.strong, px, "Off").x, ui::size_of(c.f.strong, px, "On").x);
+    const float halves_w = 2 * std::max(ui::size_of(c.f.strong, px, T("Off")).x, ui::size_of(c.f.strong, px, T("On")).x);
     auto need = [&](const Row& r, bool tight) {
         const float pad = (tight ? 36 : 64) * s;
         if (r.cheat == 9 && age_shown(9))
-            return 2 * std::max(ui::size_of(c.f.strong, px, "Kid").x, ui::size_of(c.f.strong, px, "Adult").x) + pad;
+            return 2 * std::max(ui::size_of(c.f.strong, px, T("Kid")).x, ui::size_of(c.f.strong, px, T("Adult")).x) + pad;
         if (r.cheat == 0 || r.cheat == 1 || r.cheat == 7 || r.value) return halves_w + pad;
         const std::string v = r.cheat == 11 ? "1.25x" : cheat_value(r.cheat);   // (Movement speed: its widest, the cell kept still)
-        const char* const says[kCheatRows] = {"", "", "Mark", "Return", "", "", "", "", "Choose map", "Switch", "Edit items", ""};
-        return ui::size_of(c.f.strong, px, v.empty() ? says[r.cheat] : v.c_str()).x + (cheat_chooses(r.cheat) ? 68 : tight ? 56 : 60) * s;   // (choice_cell keeps 48 for arrows either way)
+        return ui::size_of(c.f.strong, px, v.empty() ? debug_button(r.cheat) : v.c_str()).x + (cheat_chooses(r.cheat) ? 68 : tight ? 56 : 60) * s;   // (choice_cell keeps 48 for arrows either way)
     };
     float name_need[2] = {0, 0}, cell_full[2] = {halves_w + 64 * s, halves_w + 64 * s}, cell_tight[2] = {halves_w + 36 * s, halves_w + 36 * s};
     for (int i = 1; i < dev; ++i) {
         const Row& r = rows[tab_row_to_global(TAB_DEBUG, order[i])];
         const int col = i - 1 >= debug_groups[0].to ? 1 : 0;   // (Player in the first, the rest in the second)
-        name_need[col] = std::max(name_need[col], ui::size_of(c.f.strong, 18.5f * s, r.name).x + 40 * s);
+        name_need[col] = std::max(name_need[col], ui::size_of(c.f.strong, 18.5f * s, T(r.name)).x + 40 * s);
         cell_full[col] = std::max(cell_full[col], need(r, false)), cell_tight[col] = std::max(cell_tight[col], need(r, true));
     }
     const float col_w = (right - left - gap) * .5f;
@@ -1795,14 +2013,15 @@ void draw_debug_rows(ui::Ctx& c, float cx0, float cx1, float top, float bottom, 
     auto heading = [&](float x0, float x1, int row, const char* title) {   // (as the list's Developer heading: gold, a rule after)
         const float y = top + (row - first) * pitch, ty = y + rh * 0.62f, tw = ui::size_of(c.f.heading, 19 * s, title).x;
         if (y + pitch <= top || y >= bottom) return;
+        if (ui::ocarina_style) return ui::row_heading(c, x0, x1, y, rh, title);   // (ocarina: serif, stone light)
         ui::text_mid(c, c.f.heading, 19 * s, x0 + 2 * s, ty, ui::kGoldHi, title);
         if (x0 + tw + 16 * s < x1) c.d->AddLine(ImVec2(x0 + tw + 16 * s, ty), ImVec2(x1, ty), ui::alpha(ui::kEdge, 0.9f), std::max(1.0f, s));
     };
     c.d->PushClipRect(ImVec2(cx0, top), ImVec2(cx1, std::max(top, bottom)), true);
     for (int g = 0; tools && g < kDebugGroups; ++g)
-        heading(head_col[g] ? mid + gap * .5f : left, !two || head_col[g] ? right : mid - gap * .5f, head_row[g], debug_groups[g].title);
-    if (dev_head >= 0 && n > dev) heading(left, right, dev_row, rows[tab_row_to_global(TAB_DEBUG, dev_head)].name);
-    const char* const buttons[kCheatRows] = {"", "", "Mark", "Return", "", "", "", "", "Choose map", "Switch", "Edit items", ""};
+        heading(head_col[g] ? mid + gap * .5f : left, !two || head_col[g] ? right : mid - gap * .5f, head_row[g],
+                g == 1 ? L("Viagem", "Travel") : T(debug_groups[g].title));   // ("Travel" alone is the prompt's Viajar)
+    if (dev_head >= 0 && n > dev) heading(left, right, dev_row, T(rows[tab_row_to_global(TAB_DEBUG, dev_head)].name));
     for (int i = 0; i < n; ++i) {
         const int k = order[i];
         const Row& r = rows[tab_row_to_global(TAB_DEBUG, k)];
@@ -1824,26 +2043,158 @@ void draw_debug_rows(ui::Ctx& c, float cx0, float cx1, float top, float bottom, 
             halves_cell(c, va, vb, "Kid", "Adult", link_age.load(std::memory_order_relaxed) == 1, selected, false);
         } else {
             const std::string v = cheat_value(r.cheat);
-            choice_cell(c, va, vb, v.empty() ? buttons[r.cheat] : v, selected, cheat_chooses(r.cheat), cheat_chooses(r.cheat), r.cheat == 9);
+            choice_cell(c, va, vb, v.empty() ? debug_button(r.cheat) : v, selected, cheat_chooses(r.cheat), cheat_chooses(r.cheat), r.cheat == 9);
         }
         hits.add(x0, std::max(y, top), x1, std::min(y + rh, bottom), menu_hit::kRow, k, va.x, vb.x);
     }
     c.d->PopClipRect();
 }
 
+/// (ocarina) A row whose value now is a name (the GPU device's, the Microphone's): never translated, only the "(not connected)"
+/// after it
+bool names_value(const Row& r) {
+    return (r.value == &opts.mic && *r.value >= 2) || (r.value == &opts.gpu_device && *r.value >= 1);
+}
+std::string named_value(const Row& r) {
+    std::string v = r.text(*r.value);
+    static const std::string gone = " (not connected)";
+    if (v.size() > gone.size() && v.compare(v.size() - gone.size(), gone.size(), gone) == 0)
+        v = v.substr(0, v.size() - gone.size()) + L(" (desconectado)", gone.c_str());
+    return v;
+}
+/// (ocarina) Prompts in the menu's language
+void prompts_shown(ui::Prompt* list, int n) {
+    for (int i = 0; i < n; i++) list[i].what = T(list[i].what);
+}
+/// The options' prompts for the selected row (both looks: draw_options, draw_options_ocarina); their count
+int option_prompts(const Row& selr, ui::Prompt* prompt_list) {
+    // (a row that opens a page (Motion, Controls, Open debug tools): A or Enter opens it; Restart and Quit: A or Enter twice)
+    const bool confirms = &selr == &rows[kRestartRow] || &selr == &rows[kQuitRow];
+    const ui::Prompt base[4] = {{ui::kUpDown, "Choose"}, {ui::kLeftRight, "Change"}, {ui::kTabs, "Tabs"}, {ui::kBack, "Close"}};
+    for (int i = 0; i < 4; i++) prompt_list[i] = base[i];
+    int prompts_n = cur_tab == TAB_MOTION ? 3 : 4;
+    if (!selr.value) prompt_list[1] = {ui::kConfirm, confirms ? (pending == &selr ? "Confirm" : selr.name) : "Open"};
+    static std::string update_prompt;   // (ocarina: the update's button says what it does now)
+    if (is_update_row(selr) || is_report_row(selr)) {
+        if (is_update_row(selr)) {
+            const ocarina_update::View u = ocarina_update::view();
+            update_prompt = u.can_press ? u.button : "";
+        } else {   // (ocarina: Gerar relatório, Abrir pasta)
+            const ocarina_report::View u = ocarina_report::view();
+            const bool button = selr.name == kReportRow;
+            update_prompt = (button ? u.can_press : u.can_open) ? (button ? u.button : u.folder) : "";
+        }
+        if (update_prompt.empty()) prompts_n--, prompt_list[1] = prompt_list[2], prompt_list[2] = prompt_list[3];   // (nothing to press)
+        else prompt_list[1] = {ui::kConfirm, update_prompt.c_str()};
+    }
+    if (cur_tab == TAB_MOTION) prompt_list[2] = {ui::kBack, "Back"};   // (Esc: to Controls)
+    if (selr.cheat >= 0) {   // (a debug tool: Change when Left and Right do something, then what confirm does)
+        prompts_n = 1;
+        if (selr.cheat <= 1 || selr.cheat == 7 || cheat_chooses(selr.cheat) || age_shown(selr.cheat))
+            prompt_list[prompts_n++] = {ui::kLeftRight, "Change"};
+        if (const char* says = cheat_confirm(selr.cheat))   // (Switch age's "Switch": Trocar, not the console's name)
+            prompt_list[prompts_n++] = {ui::kConfirm, selr.cheat == 9 ? L("Trocar", "Switch") : says};
+        prompt_list[prompts_n++] = {ui::kTabs, "Tabs"}, prompt_list[prompts_n++] = {ui::kBack, "Close"};
+    }
+    for (int i = 0; i < prompts_n; i++) prompt_list[i].what = T(prompt_list[i].what);   // (ocarina: in the menu's language)
+    return prompts_n;
+}
+/// The options' rows of the tab shown, from top to bottom between rx0 and rx1 (the names to split, the values after), clipped
+/// to cx0 to cx1, their scroll bar at bar_x (both looks)
+void option_rows(ui::Ctx& c, float cx0, float cx1, float rx0, float rx1, float split, float top, float bottom, float rh, float pitch,
+                 int count, int sel, float bar_x, float clip_pad) {
+    const float s = c.s;
+    int shown = 0;
+    const float first = scroll_rows(cur_tab, count, sel, top, bottom, pitch, &shown);
+    scroll_bar(c, bar_x, top, top + shown * pitch - (pitch - rh), count, shown, first);
+    marquee_max = 0;   // (set again below while the selected row's value is too long)
+    c.d->PushClipRect(ImVec2(cx0, top - 8 * s), ImVec2(cx1, bottom + clip_pad));
+    for (int i = 0; i < count; i++) {
+        const float y = top + (i - first) * pitch;
+        if (y + rh < top - 8 * s || y > bottom + clip_pad) continue;
+        const Row& r = rows[tab_row_to_global(cur_tab, i)];
+        if (r.heading) {   // (a section's title: gold, a rule after it to the column's end; no cell, nothing to click)
+            const char* title = T(r.name);
+            if (ui::ocarina_style) {   // (ocarina: serif, stone light)
+                ui::row_heading(c, rx0, rx1, y, rh, title);
+                continue;
+            }
+            const float ty = y + rh * 0.62f, tw = ui::size_of(c.f.heading, 19 * s, title).x;
+            ui::text_mid(c, c.f.heading, 19 * s, rx0 + 2 * s, ty, ui::kGoldHi, title);
+            c.d->AddLine(ImVec2(rx0 + tw + 16 * s, ty), ImVec2(rx1, ty), ui::alpha(ui::kEdge, 0.9f), std::max(1.0f, s));
+            continue;
+        }
+        const bool selected = i == sel;
+        name_cell(c, ImVec2(rx0, y), ImVec2(split, y + rh), r.name, selected, restart_changed(r));
+        const ImVec2 va(split, y), vb(rx1, y + rh);
+        float t0 = 0, t1 = 0;
+        const std::string tool = r.cheat >= 0 ? cheat_value(r.cheat) : "";
+        const bool tool_toggle = r.cheat == 0 || r.cheat == 1 || r.cheat == 7;   // (On and Off: halves, as the tabs' toggles)
+        if (r.cheat >= 0 && tool_toggle) {
+            halves_cell(c, va, vb, "Off", "On", tool == "On", selected, false);
+        } else if (r.cheat >= 0 && !tool.empty()) {   // (a debug tool with a value: arrows when Left and Right choose it)
+            choice_cell(c, va, vb, tool, selected, cheat_chooses(r.cheat), cheat_chooses(r.cheat));
+        } else if (is_update_row(r)) {   // (ocarina: the version and what GitHub has; the button, labelled with what it does now)
+            const ocarina_update::View u = ocarina_update::view();
+            if (r.name == kUpdateButtonRow) ui::button(c, va, vb, u.button.c_str(), selected);
+            else choice_cell(c, va, vb, u.status, selected, false, false);
+        } else if (is_report_row(r)) {   // (ocarina: Gerar relatório (Gerando... while it works), Abrir pasta)
+            const ocarina_report::View u = ocarina_report::view();
+            ui::button(c, va, vb, (r.name == kReportRow ? u.button : u.folder).c_str(), selected);
+        } else if (!r.value) {   // (a page, or Restart and Quit: Confirm until the second press)
+            if (pending == &r) choice_cell(c, va, vb, "Press again to confirm", selected, false, false);
+            else {
+                choice_cell(c, va, vb, "", selected, false, false);
+                ui::triangle(c, ImVec2(vb.x - 15 * s, y + rh * 0.5f), ui::ocarina_style ? 8 * s : 10 * s, 1,
+                             selected ? (ui::ocarina_style ? ui::kFairy : ui::kGoldInk) : ui::kInk);
+            }
+        } else {
+            const bool fixed = row_fixed(r.value);
+            const std::string lo = T(r.text(r.lo)), hi = T(r.text(r.hi));   // (ocarina: as shown, measured in the menu's language)
+            const float half = (vb.x - va.x) * 0.5f - 18 * s;
+            if (is_slider(r)) {
+                slider_cell(c, va, vb, r.text(*r.value), menu_hit::slider_permille(*r.value, r.lo, r.hi), selected, &t0, &t1);
+            } else if (r.hi - r.lo == r.step && !fixed && ui::size_of(c.f.strong, 18 * s, lo.c_str()).x <= half &&
+                       ui::size_of(c.f.strong, 18 * s, hi.c_str()).x <= half) {
+                halves_cell(c, va, vb, lo.c_str(), hi.c_str(), *r.value == r.hi, selected, fixed);
+            } else {
+                const bool output_row = r.value == &opts.output_res;
+                const bool left = !fixed && (!output_row || step_output_choice(*r.value, -1) != *r.value) && (!stops_at_ends(r) || *r.value > r.lo);
+                const bool right = !fixed && (!output_row || step_output_choice(*r.value, 1) != *r.value) && (!stops_at_ends(r) || *r.value < r.hi);
+                const bool named = names_value(r);   // (ocarina: a GPU's or a microphone's name: as it is)
+                choice_cell(c, va, vb, named ? named_value(r) : std::string(r.text(*r.value)), selected, left, right, fixed, named);
+            }
+        }
+        hits.add(rx0, std::max(y, top - 8 * s), rx1, std::min(y + rh, bottom + clip_pad), menu_hit::kRow, i, va.x, vb.x, t0, t1);
+    }
+    c.d->PopClipRect();
+}
+
+/// The selected row's hint now (Row::hint), the update's and the report's too
+const char* selected_hint(const Row& r) {
+    return r.value && r.hint ? r.hint(*r.value, -1) : is_update_row(r) || is_report_row(r) ? r.hint(0, -1) : nullptr;
+}
+/// (ocarina) As shown: in the menu's language (the update's and the report's are Portuguese already, and change as they work)
+const char* shown_hint(const Row& r) { return is_update_row(r) || is_report_row(r) ? selected_hint(r) : T(selected_hint(r)); }
+/// (ocarina) The tabs' titles in the menu's language
+void tab_titles_shown(const char** out) {
+    static const char* const tab_titles[TAB_COUNT] = {"Graphics", "Audio", "Gameplay", "Controls", "Debug"};
+    for (int i = 0; i < TAB_COUNT; i++) out[i] = T(tab_titles[i]);
+}
 void draw_options(ui::Ctx& c) {
     const float s = c.s, hh = banner_h(c);
     ui::banner(c, hh);
     // the tabs in the banner: dark ink on the tan, the shown one light on a dark inset; the tab keys at their ends (a click there
     // is the previous or the next tab)
-    const char* const tab_titles[TAB_COUNT] = {"Graphics", "Audio", "Gameplay", "Controls", "Debug"};
+    const char* tab_titles[TAB_COUNT];
+    tab_titles_shown(tab_titles);
     float tw[TAB_COUNT], total = 0;
     for (int i = 0; i < TAB_COUNT; i++) tw[i] = ui::size_of(c.f.heading, 23 * s, tab_titles[i]).x + 56 * s, total += tw[i];
     float x = (c.w - total) * 0.5f;
     const float ty = hh * 0.5f + s;
-    const char* const keys[2] = {c.pad ? "L" : "Q", c.pad ? "R" : "E"};
+    const char* const keys[2] = {c.pad ? c.tab_l : "Q", c.pad ? c.tab_r : "E"};   // (ocarina: LB and RB on an Xbox pad)
     for (int i = 0; i < 2; i++) {
-        const float cw = 26 * s, cx = i ? x + total + 22 * s : x - 22 * s - cw;
+        const float cw = std::max(26 * s, ui::size_of(c.f.strong, 14 * s, keys[i]).x + 10 * s), cx = i ? x + total + 22 * s : x - 22 * s - cw;
         const bool hover = hover_tab == TAB_COUNT + i;
         c.d->AddRectFilled(ImVec2(cx, ty - 13 * s), ImVec2(cx + cw, ty + 13 * s), hover ? ui::kTabInset : ui::kBannerInk, 3 * s);
         ui::text_mid_centre(c, c.f.strong, 14 * s, cx + cw * 0.5f, ty, ui::kInk, keys[i]);
@@ -1899,30 +2250,15 @@ void draw_options(ui::Ctx& c) {
     column(c, cx0, cx1, hh);
     const int count = tab_row_count(cur_tab), sel = tab_selected[cur_tab];
     const Row& selr = rows[tab_row_to_global(cur_tab, sel)];
-    const char* hint = selr.value && selr.hint ? selr.hint(*selr.value, -1) : is_update_row(selr) ? selr.hint(0, -1) : nullptr;
+    const char* hint = shown_hint(selr);
+    const char *sel_name = T(selr.name), *sel_help = T(selr.help);   // (ocarina: in the menu's language)
     const std::string pending_line = (cur_tab == TAB_GRAPHICS || cur_tab == TAB_DEBUG) && restart_pending() ? restart_line(c, 16 * s, hx1 - hx0 - 66 * s) : "";
     static float help_tall = 0, help_tall_w = 0;
-    if (help_tall_w != hx1 - hx0) help_tall_w = hx1 - hx0, help_tall = measure_help(c, hx1 - hx0 - 48 * s);
-    // (a row that opens a page (Motion, Controls, Open debug tools): A or Enter opens it; Restart and Quit: A or Enter twice)
-    const bool confirms = &selr == &rows[kRestartRow] || &selr == &rows[kQuitRow];
-    ui::Prompt prompt_list[5] = {{ui::kUpDown, "Choose"}, {ui::kLeftRight, "Change"}, {ui::kTabs, "Tabs"}, {ui::kBack, "Close"}};
-    int prompts_n = cur_tab == TAB_MOTION ? 3 : 4;
-    if (!selr.value) prompt_list[1] = {ui::kConfirm, confirms ? (pending == &selr ? "Confirm" : selr.name) : "Open"};
-    static std::string update_prompt;   // (ocarina: the update's button says what it does now)
-    if (is_update_row(selr)) {
-        const ocarina_update::View u = ocarina_update::view();
-        update_prompt = u.can_press ? u.button : "";
-        if (update_prompt.empty()) prompts_n--, prompt_list[1] = prompt_list[2], prompt_list[2] = prompt_list[3];   // (nothing to press)
-        else prompt_list[1] = {ui::kConfirm, update_prompt.c_str()};
-    }
-    if (cur_tab == TAB_MOTION) prompt_list[2] = {ui::kBack, "Back"};   // (Esc: to Controls)
-    if (selr.cheat >= 0) {   // (a debug tool: Change when Left and Right do something, then what confirm does)
-        prompts_n = 1;
-        if (selr.cheat <= 1 || selr.cheat == 7 || cheat_chooses(selr.cheat) || age_shown(selr.cheat))
-            prompt_list[prompts_n++] = {ui::kLeftRight, "Change"};
-        if (const char* says = cheat_confirm(selr.cheat)) prompt_list[prompts_n++] = {ui::kConfirm, says};
-        prompt_list[prompts_n++] = {ui::kTabs, "Tabs"}, prompt_list[prompts_n++] = {ui::kBack, "Close"};
-    }
+    static bool help_tall_pt = false;   // (measured in that language)
+    if (help_tall_w != hx1 - hx0 || help_tall_pt != menu_pt())
+        help_tall_w = hx1 - hx0, help_tall_pt = menu_pt(), help_tall = measure_help(c, hx1 - hx0 - 48 * s);
+    ui::Prompt prompt_list[5];
+    const int prompts_n = option_prompts(selr, prompt_list);
     const float bar_top = ui::prompt_bar_top(c);   // (the strip itself drawn last, over all: below)
     float bottom = std::min(c.h - c.safe, bar_top) - 10 * s;   // (the rows end above the prompts)
     const bool after = restart_changed(selr);
@@ -1930,10 +2266,10 @@ void draw_options(ui::Ctx& c) {
         const float help_h = std::min(22 * s + 32 * s + help_tall + (after ? 30 * s : 0) + (pending_line.empty() ? 0 : 52 * s) + 22 * s,
                                       (bottom - hh) * 0.5f);
         bottom = std::min(bar_top, c.h - c.safe) - help_h - 16 * s;
-        help_box(c, hx0, hx1, bottom + 8 * s, selr.name, selr.help, hint, pending_line.empty() ? nullptr : pending_line.c_str(), help_tall,
+        help_box(c, hx0, hx1, bottom + 8 * s, sel_name, sel_help, hint, pending_line.empty() ? nullptr : pending_line.c_str(), help_tall,
                  after, bottom + 8 * s, bar_top - 10 * s);
     } else {
-        help_box(c, hx0, hx1, std::max(hh + 26 * s, c.h * 0.30f), selr.name, selr.help, hint,
+        help_box(c, hx0, hx1, std::max(hh + 26 * s, c.h * 0.30f), sel_name, sel_help, hint,
                  pending_line.empty() ? nullptr : pending_line.c_str(), help_tall, after, hh + 18 * s, bar_top - 12 * s);
     }
     const float rh = 40 * s, pitch = 48 * s, top = hh + 24 * s, rx0 = cx0 + 44 * s, rx1 = cx1 - 44 * s, split = rx0 + (rx1 - rx0) * 0.55f;
@@ -1943,85 +2279,111 @@ void draw_options(ui::Ctx& c) {
         ui::prompt_bar(c, prompt_list, prompts_n);
         return;
     }
-    int shown = 0;
-    const float first = scroll_rows(cur_tab, count, sel, top, bottom, pitch, &shown);
-    scroll_bar(c, cx0 + 20 * s, top, top + shown * pitch - (pitch - rh), count, shown, first);
-    marquee_max = 0;   // (set again below while the selected row's value is too long)
-    c.d->PushClipRect(ImVec2(cx0, top - 8 * s), ImVec2(cx1, bottom + 8 * s));
-    for (int i = 0; i < count; i++) {
-        const float y = top + (i - first) * pitch;
-        if (y + rh < top - 8 * s || y > bottom + 8 * s) continue;
-        const Row& r = rows[tab_row_to_global(cur_tab, i)];
-        if (r.heading) {   // (a section's title: gold, a rule after it to the column's end; no cell, nothing to click)
-            const float ty = y + rh * 0.62f, tw = ui::size_of(c.f.heading, 19 * s, r.name).x;
-            ui::text_mid(c, c.f.heading, 19 * s, rx0 + 2 * s, ty, ui::kGoldHi, r.name);
-            c.d->AddLine(ImVec2(rx0 + tw + 16 * s, ty), ImVec2(rx1, ty), ui::alpha(ui::kEdge, 0.9f), std::max(1.0f, s));
-            continue;
-        }
-        const bool selected = i == sel;
-        name_cell(c, ImVec2(rx0, y), ImVec2(split, y + rh), r.name, selected, restart_changed(r));
-        const ImVec2 va(split, y), vb(rx1, y + rh);
-        float t0 = 0, t1 = 0;
-        const std::string tool = r.cheat >= 0 ? cheat_value(r.cheat) : "";
-        const bool tool_toggle = r.cheat == 0 || r.cheat == 1 || r.cheat == 7;   // (On and Off: halves, as the tabs' toggles)
-        if (r.cheat >= 0 && tool_toggle) {
-            halves_cell(c, va, vb, "Off", "On", tool == "On", selected, false);
-        } else if (r.cheat >= 0 && !tool.empty()) {   // (a debug tool with a value: arrows when Left and Right choose it)
-            choice_cell(c, va, vb, tool, selected, cheat_chooses(r.cheat), cheat_chooses(r.cheat));
-        } else if (is_update_row(r)) {   // (ocarina: the version and what GitHub has; the button, labelled with what it does now)
-            const ocarina_update::View u = ocarina_update::view();
-            if (r.name == kUpdateButtonRow) ui::button(c, va, vb, u.button.c_str(), selected);
-            else choice_cell(c, va, vb, u.status, selected, false, false);
-        } else if (!r.value) {   // (a page, or Restart and Quit: Confirm until the second press)
-            if (pending == &r) choice_cell(c, va, vb, "Press again to confirm", selected, false, false);
-            else {
-                choice_cell(c, va, vb, "", selected, false, false);
-                ui::triangle(c, ImVec2(vb.x - 15 * s, y + rh * 0.5f), 10 * s, 1, selected ? ui::kGoldInk : ui::kInk);
-            }
-        } else {
-            const bool fixed = row_fixed(r.value);
-            const std::string lo = r.text(r.lo), hi = r.text(r.hi);
-            const float half = (vb.x - va.x) * 0.5f - 18 * s;
-            if (is_slider(r)) {
-                slider_cell(c, va, vb, r.text(*r.value), menu_hit::slider_permille(*r.value, r.lo, r.hi), selected, &t0, &t1);
-            } else if (r.hi - r.lo == r.step && !fixed && ui::size_of(c.f.strong, 18 * s, lo.c_str()).x <= half &&
-                       ui::size_of(c.f.strong, 18 * s, hi.c_str()).x <= half) {
-                halves_cell(c, va, vb, lo.c_str(), hi.c_str(), *r.value == r.hi, selected, fixed);
-            } else {
-                const bool output_row = r.value == &opts.output_res;
-                const bool left = !fixed && (!output_row || step_output_choice(*r.value, -1) != *r.value) && (!stops_at_ends(r) || *r.value > r.lo);
-                const bool right = !fixed && (!output_row || step_output_choice(*r.value, 1) != *r.value) && (!stops_at_ends(r) || *r.value < r.hi);
-                choice_cell(c, va, vb, r.text(*r.value), selected, left, right, fixed);
-            }
-        }
-        hits.add(rx0, std::max(y, top - 8 * s), rx1, std::min(y + rh, bottom + 8 * s), menu_hit::kRow, i, va.x, vb.x, t0, t1);
-    }
-    c.d->PopClipRect();
+    option_rows(c, cx0, cx1, rx0, rx1, split, top, bottom, rh, pitch, count, sel, cx0 + 20 * s, 8 * s);
     ui::prompt_bar(c, prompt_list, prompts_n);   // (the prompts, on top of the help and the rows)
+}
+
+/// (ocarina) The options in the Ocarina Engine's look (ocarina_ui.h): the ocarina and the name at the top, the sections in a
+/// column at the left (a row under the header on a narrow window), the rows at the right with no boxes, the help in one strip
+/// along the foot, the prompts small in the corner. The same rows, keys, mouse hits and prompts as draw_options
+void draw_options_ocarina(ui::Ctx& c) {
+    const float s = c.s;
+    const char* tab_titles[TAB_COUNT];
+    tab_titles_shown(tab_titles);
+    const ui::MenuFrame f = ui::menu_frame(c, banner_h(c), tab_titles, TAB_COUNT);
+    {
+        float aspect = 1;
+        ImTextureData* icon = ui::brand_logo(&aspect);
+        const std::string sub = std::string("v") + OCARINA_VERSION + ", " + (menu_pt() ? kBrandCredit : "based on Hookshot");
+        ui::menu_header(c, f, icon, aspect, kBrandName, sub.c_str());
+    }
+    const int shown_tab = cur_tab == TAB_MOTION ? TAB_CONTROLS : cur_tab;   // (the Motion page: under Controls)
+    float row_x = 0, row_gap = 34 * s;   // (the sections in a row: their centres from row_x on)
+    if (!f.side) {
+        float total = -row_gap;
+        for (int i = 0; i < TAB_COUNT; i++) total += ui::size_of(c.f.heading, 22 * s, tab_titles[i]).x + row_gap;
+        row_x = (f.rx0 + f.rx1 - total) * 0.5f;
+    }
+    for (int i = 0; i < TAB_COUNT; i++) {
+        ImVec2 a, b;
+        if (f.side) {
+            ui::menu_section(c, f, f.sec_x0, f.sec_top + f.sec_pitch * (i + 0.5f), tab_titles[i], i == shown_tab, i == hover_tab, &a, &b);
+        } else {
+            const float tw = ui::size_of(c.f.heading, 22 * s, tab_titles[i]).x;
+            ui::menu_section(c, f, row_x + tw * 0.5f, f.hh + 30 * s, tab_titles[i], i == shown_tab, i == hover_tab, &a, &b);
+            row_x += tw + row_gap;
+        }
+        hits.add(a.x, a.y, b.x, b.y, menu_hit::kTab, i);
+    }
+    if (f.side && c.pad) {   // (ocarina: with a controller, under the sections: the shoulder buttons change them, "LB / RB")
+        const std::string keys = std::string(c.tab_l) + " / " + c.tab_r;
+        const float y = f.sec_top + f.sec_pitch * TAB_COUNT + 6 * s;
+        const float kw = ui::size_of(c.f.strong, 15 * s, keys.c_str()).x;
+        ui::text_mid(c, c.f.strong, 15 * s, f.sec_x0 + 18 * s, y, ui::kStoneLight, keys.c_str());
+        ui::text_mid(c, c.f.body, 15 * s, f.sec_x0 + 18 * s + kw + 8 * s, y, ui::kStone, L("trocar aba", "change tab"));
+    }
+    const int count = tab_row_count(cur_tab), sel = tab_selected[cur_tab];
+    const Row& selr = rows[tab_row_to_global(cur_tab, sel)];
+    const char* hint = shown_hint(selr);
+    const char* sel_help = T(selr.help);   // (ocarina: in the menu's language)
+    // (the help strip: along the foot, under the sections and the rows alike)
+    const float hx0 = f.side ? f.sec_x0 : f.rx0, hx1 = f.rx1, hw = hx1 - hx0;
+    const std::string pending_line = (cur_tab == TAB_GRAPHICS || cur_tab == TAB_DEBUG) && restart_pending() ? restart_line(c, 15.5f * s, hw - 20 * s) : "";
+    const char* gold_line = pending_line.empty() ? nullptr : pending_line.c_str();
+    static float help_tall = 0, help_tall_w = 0;   // (the tallest help of any row at this width: the strip keeps its height)
+    static bool help_tall_pt = false;   // (measured in that language)
+    if (help_tall_w != hw || help_tall_pt != menu_pt())
+        help_tall_w = hw, help_tall_pt = menu_pt(), help_tall = measure_help(c, ui::help_wrap(c, hw));
+    ui::Prompt prompt_list[5];
+    const int prompts_n = option_prompts(selr, prompt_list);
+    const float bar_top = ui::prompt_bar_top(c);
+    const bool after = restart_changed(selr);
+    const float room = bar_top - f.top;
+    // (its height kept whichever row is chosen, up to 40% of the room; a longer help grows it up over the last rows)
+    const float kept = std::min(ui::help_strip_h(c, hw, nullptr, nullptr, after, gold_line, help_tall), room * 0.4f);
+    const float need = std::min(ui::help_strip_h(c, hw, sel_help, hint, after, gold_line, 0), room * 0.65f);
+    const float strip_y1 = bar_top - 4 * s, strip_y0 = strip_y1 - std::max(kept, need);
+    const float bottom = strip_y1 - kept - 14 * s;   // (the rows end above the strip's kept height)
+    ui::menu_section_rule(c, f, bottom);
+    const float rh = 40 * s, pitch = 48 * s, top = f.top, rx0 = f.rx0, rx1 = f.rx1, split = rx0 + (rx1 - rx0) * 0.55f;
+    // (the rows' room cut to whole rows, and clipped there: no sliver of the next row's letters over the strip; a row the wheel
+    // scrolls part-way is cut at the edge as it slides)
+    const float rows_bottom = top + std::max(1.0f, std::floor((bottom - top + pitch - rh) / pitch)) * pitch;
+    if (cur_tab == TAB_DEBUG) {   // (the Debug tab: its own layout of the same rows, its insets as the other look's)
+        marquee_max = 0;
+        draw_debug_rows(c, rx0 - 44 * s, rx1 + 44 * s, top, rows_bottom, sel);
+    } else {
+        option_rows(c, rx0 - 20 * s, rx1 + 8 * s, rx0, rx1, split, top, rows_bottom, rh, pitch, count, sel, rx0 - 12 * s, 0);
+    }
+    if (need > kept)   // (a help taller than the strip's kept height: over the rows' foot, on the night blue)
+        c.d->AddRectFilled(ImVec2(hx0 - 8 * s, strip_y0 - 10 * s), ImVec2(hx1 + 8 * s, strip_y1), ui::alpha(ui::kNight, 0.97f));
+    ui::help_strip(c, hx0, hx1, strip_y0, strip_y1, sel_help, hint, after, gold_line);
+    ui::prompt_bar(c, prompt_list, prompts_n);
 }
 
 void draw_controls(ui::Ctx& c) {
     // (the page's own rows first, kTop of them (the layout preset, the button prompts), then a row per control and Reset to
     // defaults: one list, csel its selection)
-    const float s = c.s, hh = title_banner(c, "Controls", nullptr);
+    const float s = c.s, hh = title_banner(c, T("Controls"), nullptr);
     float cx0, cx1, hx0, hx1;
     bool narrow;
     columns(c, &cx0, &cx1, &hx0, &hx1, &narrow);
     column(c, cx0, cx1, hh);
     const int n = kTop + kControls + 1, sel_i = csel - kTop;   // (sel_i: the control's, kControls Reset; negative: a page row)
-    const ui::Prompt idle[] = {{ui::kUpDown, "Choose"}, {ui::kLeftRight, "Column"}, {ui::kConfirm, "Bind"}, {ui::kKey, "Clear", "Del"},
-                               {ui::kBack, "Back"}};
-    const ui::Prompt option[] = {{ui::kUpDown, "Choose"}, {ui::kLeftRight, "Change"}, {ui::kBack, "Back"}};
-    const ui::Prompt wait[] = {{ui::kBack, "Cancel"}};
+    ui::Prompt idle[] = {{ui::kUpDown, "Choose"}, {ui::kLeftRight, "Column"}, {ui::kConfirm, "Bind"}, {ui::kKey, "Clear", "Del"},
+                         {ui::kBack, "Back"}};
+    ui::Prompt option[] = {{ui::kUpDown, "Choose"}, {ui::kLeftRight, "Change"}, {ui::kBack, "Back"}};
+    ui::Prompt wait[] = {{ui::kBack, "Cancel"}};
+    prompts_shown(idle, 5), prompts_shown(option, 3), prompts_shown(wait, 1);   // (ocarina: in the menu's language)
     const float bar_top = ui::prompt_bar_top(c);   // (the strip itself drawn last, over all: below)
     const Row* page_row = sel_i < 0 ? &rows[tab_row_to_global(TAB_PAGE, csel)] : nullptr;
-    const char* title = page_row ? page_row->name : sel_i < kControls ? controls[sel_i].name : "Reset to defaults";
-    const char* help = listening ? (listening == 1 ? "Press the gamepad button to use. Esc cancels." : "Press the key to use. Esc cancels.")
+    const char* title = T(page_row ? page_row->name : sel_i < kControls ? controls[sel_i].name : "Reset to defaults");
+    const char* help = T(listening ? (listening == 1 ? "Press the gamepad button to use. Esc cancels." : "Press the key to use. Esc cancels.")
                        : page_row ? page_row->help
                                   : "Which gamepad button and which keys press each of the Switch's buttons. Enter binds the one "
-                                    "selected; Delete clears it. The game's button icons follow after a restart.";
-    const char* hint = page_row ? (page_row->hint ? page_row->hint(*page_row->value, -1) : nullptr)
-                                : "Gamepad: the D-pad moves, A binds, B goes back.";
+                                    "selected; Delete clears it. The game's button icons follow after a restart.");
+    const char* hint = T(page_row ? (page_row->hint ? page_row->hint(*page_row->value, -1) : nullptr)
+                                  : "Gamepad: the D-pad moves, A binds, B goes back.");
     float bottom = std::min(c.h - c.safe, bar_top) - 10 * s;   // (the rows end above the prompts)
     if (narrow) {
         bottom = std::min(bar_top, c.h - c.safe) - 200 * s;
@@ -2033,9 +2395,9 @@ void draw_controls(ui::Ctx& c) {
     }
     const float rx0 = cx0 + 44 * s, rx1 = cx1 - 44 * s, pad_x = rx0 + (rx1 - rx0) * 0.36f, key_x = rx0 + (rx1 - rx0) * 0.68f;
     float top = hh + 22 * s;
-    ui::text_mid(c, c.f.body, 15 * s, rx0 + 20 * s, top + 10 * s, ui::kDim, "Button");
-    ui::text_mid(c, c.f.body, 15 * s, pad_x + 14 * s, top + 10 * s, ui::kDim, "Gamepad");
-    ui::text_mid(c, c.f.body, 15 * s, key_x + 14 * s, top + 10 * s, ui::kDim, "Keyboard");
+    ui::text_mid(c, c.f.body, 15 * s, rx0 + 20 * s, top + 10 * s, ui::kDim, T("Button"));
+    ui::text_mid(c, c.f.body, 15 * s, pad_x + 14 * s, top + 10 * s, ui::kDim, T("Gamepad"));
+    ui::text_mid(c, c.f.body, 15 * s, key_x + 14 * s, top + 10 * s, ui::kDim, T("Keyboard"));
     top += 26 * s;
     const float rh = 36 * s, pitch = 42 * s;
     int shown = 0;
@@ -2058,7 +2420,7 @@ void draw_controls(ui::Ctx& c) {
             continue;
         }
         if (i == kControls) {
-            ui::button(c, ImVec2(rx0, y), ImVec2(pad_x - 8 * s, y + rh), "Reset to defaults", sel);
+            ui::button(c, ImVec2(rx0, y), ImVec2(pad_x - 8 * s, y + rh), T("Reset to defaults"), sel);
             hits.add(rx0, y0, pad_x - 8 * s, y1, menu_hit::kCtlRow, i);
             continue;
         }
@@ -2076,7 +2438,7 @@ void draw_controls(ui::Ctx& c) {
                 c.d->AddRect(va, vb, ui::kEdge, 0, std::max(1.0f, s));
                 c.d->AddRectFilled(va + ImVec2(in, in), vb - ImVec2(in, in), ui::kListen);
                 ui::text_mid_centre(c, c.f.strong, 16.5f * s, (a + b) * 0.5f, y + rh * 0.5f, ui::kInkBright,
-                                    col == 0 ? "Press a button..." : "Press a key...");
+                                    T(col == 0 ? "Press a button..." : "Press a key..."));
                 ui::glow(c, va, vb);
             } else {
                 choice_cell(c, va, vb, v, here, false, false, col == 0 && keys_only(i));
@@ -2114,14 +2476,15 @@ void draw_inventory(ui::Ctx& c) {
     bool loaded = false;   // (a save's counts reported: -1 for all until the game side has a save to read)
     for (int i = 0; i < kItems && !loaded; ++i) loaded = item_counts[i].load(std::memory_order_relaxed) >= 0;
     char count_text[48];
-    snprintf(count_text, sizeof count_text, "%d items", end - begin);
-    const float hh = title_banner(c, "Inventory", count_text);
+    snprintf(count_text, sizeof count_text, L("%d itens", "%d items"), end - begin);
+    const float hh = title_banner(c, T("Inventory"), count_text);
     const int have = item_counts[item_choice].load(std::memory_order_relaxed);
-    const char* edit = item_kinds[item_choice] ? (inventory_amount ? "Done" : "Edit amount") : (have ? "Relock" : "Unlock");
+    const char* edit = T(item_kinds[item_choice] ? (inventory_amount ? "Done" : "Edit amount") : (have ? "Relock" : "Unlock"));
     ui::Prompt prompts[5] = {{ui::kUpDown, "Move"}, {ui::kLeftRight, inventory_amount ? "Amount" : "Move"}, {ui::kTabs, "Section"}};
     int prompts_n = 3;
     if (have >= 0) prompts[prompts_n++] = {ui::kConfirm, edit};
     prompts[prompts_n++] = {ui::kBack, inventory_amount ? "Done" : "Back"};
+    prompts_shown(prompts, prompts_n);   // (ocarina: in the menu's language)
     float cx0, cx1, hx0, hx1;
     bool narrow;
     columns(c, &cx0, &cx1, &hx0, &hx1, &narrow);
@@ -2134,7 +2497,7 @@ void draw_inventory(ui::Ctx& c) {
     float tpx = 16 * s, tpad = 26 * s, tgap = 8 * s;
     auto tabs_w = [&] {
         float w = 0;
-        for (int i = 0; i <= kItemSections; ++i) w += ui::size_of(c.f.strong, tpx, i ? item_sections.s[i - 1].name : "All").x + tpad + tgap;
+        for (int i = 0; i <= kItemSections; ++i) w += ui::size_of(c.f.strong, tpx, T(i ? item_sections.s[i - 1].name : "All")).x + tpad + tgap;
         return w - tgap;
     };
     if (tabs_w() > right - left) tpad = 16 * s, tgap = 6 * s;
@@ -2144,7 +2507,7 @@ void draw_inventory(ui::Ctx& c) {
     }
     float x = left, y = hh + 18 * s;
     for (int i = 0; i <= kItemSections; ++i) {
-        const char* label = i ? item_sections.s[i - 1].name : "All";
+        const char* label = T(i ? item_sections.s[i - 1].name : "All");
         const float w = ui::size_of(c.f.strong, tpx, label).x + tpad;
         if (x > left && x + w > right) x = left, y += 36 * s;
         const ImVec2 a(x, y), b(std::min(x + w, right), y + 30 * s);
@@ -2160,12 +2523,12 @@ void draw_inventory(ui::Ctx& c) {
     const float pitch = (loaded ? 62 : 46) * s;   // (the title screen: the names alone, no line under them)
     if (!loaded) {   // (the title screen: one note for the page, not "Load a save" on every card)
         ui::diamond(c, ImVec2(left + 5 * s, top - 2 * s), 4 * s, ui::kGoldHi);
-        ui::text_mid(c, c.f.body, 16 * s, left + 18 * s, top - 2 * s, ui::kSoft, "Load a save to edit the inventory.");
+        ui::text_mid(c, c.f.body, 16 * s, left + 18 * s, top - 2 * s, ui::kSoft, T("Load a save to edit the inventory."));
         top += 30 * s;
     }
     const float strip = 58 * s, detail = bar - 14 * s - strip, grid_bottom = std::max(top, detail - 8 * s);
-    const char* help = have < 0 ? "Load a save to edit this item." : item_kinds[item_choice] ?
-        "Choose Edit amount, then use Left and Right to change the quantity." : "Unlock or relock this item.";
+    const char* help = T(have < 0 ? "Load a save to edit this item." : item_kinds[item_choice] ?
+        "Choose Edit amount, then use Left and Right to change the quantity." : "Unlock or relock this item.");
     if (!narrow)
         help_box(c, hx0, hx1, std::max(hh + 26 * s, c.h * .30f), item_names[item_choice], help, nullptr, nullptr, 0, false,
                  hh + 18 * s, bar - 12 * s);
@@ -2194,9 +2557,9 @@ void draw_inventory(ui::Ctx& c) {
         c.d->PushClipRect(a + ImVec2(8 * s, 0), b - ImVec2(8 * s, 0), true);
         ui::text_mid(c, c.f.strong, 15.5f * s, a.x + 13 * s, loaded ? a.y + 17 * s : (a.y + b.y) * 0.5f, count < 0 ? ui::kDim : ui::kInkBright, item_names[i]);
         char amount[40];
-        if (count < 0) snprintf(amount, sizeof amount, "%s", loaded ? "Unavailable" : "");
-        else if (item_kinds[i]) snprintf(amount, sizeof amount, "Quantity %d", count);
-        else snprintf(amount, sizeof amount, "%s", count ? "Unlocked" : "Locked");
+        if (count < 0) snprintf(amount, sizeof amount, "%s", loaded ? T("Unavailable") : "");
+        else if (item_kinds[i]) snprintf(amount, sizeof amount, L("Quantidade %d", "Quantity %d"), count);
+        else snprintf(amount, sizeof amount, "%s", T(count ? "Unlocked" : "Locked"));
         const float ly = a.y + 37 * s;
         if (editing) {   // (the amount being changed: its arrows, gold)
             ui::triangle(c, ImVec2(a.x + 18 * s, ly), 8 * s, 0, ui::kGoldHi);
@@ -2219,7 +2582,7 @@ void draw_inventory(ui::Ctx& c) {
             page_arrow(c, ImVec2(px0, my - side * 0.5f), side, 0, at > 0);
             hits.add(px0, my - side * 0.5f, px0 + side, my + side * 0.5f, menu_hit::kButton, 2);
             char page_text[32];
-            snprintf(page_text, sizeof page_text, "Page %d of %d", at + 1, pages);
+            snprintf(page_text, sizeof page_text, L("Página %d de %d", "Page %d of %d"), at + 1, pages);
             const float tw = ui::size_of(c.f.strong, 17 * s, page_text).x;
             ui::text_mid(c, c.f.strong, 17 * s, px0 + side + 12 * s, my, ui::kInkBright, page_text);
             const float nx = px0 + side + 24 * s + tw;
@@ -2228,10 +2591,10 @@ void draw_inventory(ui::Ctx& c) {
             px0 = nx + side + 18 * s;
         }
         char range[64];
-        snprintf(range, sizeof range, "%d–%d of %d", first - begin + 1, std::min(end, first + inventory_capacity) - begin, end - begin);
+        snprintf(range, sizeof range, L("%d–%d de %d", "%d–%d of %d"), first - begin + 1, std::min(end, first + inventory_capacity) - begin, end - begin);
         ui::text_mid(c, c.f.body, 15 * s, px0, my, ui::kSoft, range);
         if (have >= 0) {
-            const float bw = ui::size_of(c.f.strong, 18 * s, "Edit amount").x + 36 * s;
+            const float bw = ui::size_of(c.f.strong, 18 * s, T("Edit amount")).x + 36 * s;
             const ImVec2 a(right - bw, my - 17 * s), b(right, my + 17 * s);
             ui::button(c, a, b, edit, false);
             hits.add(a.x, a.y, b.x, b.y, menu_hit::kButton, 0);
@@ -2250,22 +2613,23 @@ void draw_inventory(ui::Ctx& c) {
 void draw_teleport(ui::Ctx& c) {
     const float s = c.s;
     char count[32];
-    snprintf(count, sizeof count, "%d of %d", teleport_choice + 1, kTeleports);
-    const float hh = title_banner(c, "Teleport", count);
+    snprintf(count, sizeof count, L("%d de %d", "%d of %d"), teleport_choice + 1, kTeleports);
+    const float hh = title_banner(c, T("Teleport"), count);
     float cx0, cx1, hx0, hx1;
     bool narrow;
     columns(c, &cx0, &cx1, &hx0, &hx1, &narrow);
     column(c, cx0, cx1, hh);
-    const ui::Prompt prompts[] = {{ui::kUpDown, "Move"}, {ui::kLeftRight, "Move"}, {ui::kTabs, "Section"},
+    ui::Prompt prompts[] = {{ui::kUpDown, "Move"}, {ui::kLeftRight, "Move"}, {ui::kTabs, "Section"},
         {ui::kConfirm, "Travel"}, {ui::kBack, "Back"}};
+    prompts_shown(prompts, 5);   // (ocarina: in the menu's language)
     const float bar = ui::prompt_bar_top(c);   // (the strip itself drawn last, over all: below)
     const float left = cx0 + 24 * s, right = cx1 - 24 * s, top = hh + 16 * s;
     const float strip = 58 * s, detail = bar - 14 * s - strip;
     const float bottom = std::max(top, detail - 6 * s), gap = 10 * s, pitch = 48 * s, head = 40 * s;
-    const char* const note = teleport_notes[teleport_choice];
+    const char* const note = T(teleport_notes[teleport_choice]);
     if (!narrow)
         help_box(c, hx0, hx1, std::max(hh + 26 * s, c.h * .30f), teleport_names[teleport_choice],
-                 "Select a destination, then Travel (or Enter) to go to its map entrance. Link keeps his current age.", note, nullptr, 0,
+                 T("Select a destination, then Travel (or Enter) to go to its map entrance. Link keeps his current age."), note, nullptr, 0,
                  false, hh + 18 * s, bar - 12 * s);
     // (as many columns as fit the longest name and its tag, at most 4; each section under its heading, the cards scrolled to
     // keep the selected one in view)
@@ -2274,7 +2638,7 @@ void draw_teleport(ui::Ctx& c) {
         card_s = s, card_w = 0;
         for (int i = 0; i < kTeleports; ++i)
             card_w = std::max(card_w, ui::size_of(c.f.body, 17 * s, teleport_names[i]).x +
-                                          (teleport_notes[i] ? card_tag(c, 0, 0, teleport_notes[i], false) + 12 * s : 0));
+                                          (teleport_notes[i] ? card_tag(c, 0, 0, T(teleport_notes[i]), false) + 12 * s : 0));
     }
     teleport_columns = std::clamp((int)((right - left + gap) / (card_w + 36 * s + gap)), 1, 4);
     const int cols = teleport_columns;
@@ -2314,8 +2678,8 @@ void draw_teleport(ui::Ctx& c) {
     for (int k = 0; k < kTeleportSections; ++k) {
         const float hy = top + section_y[k] - at + head * 0.5f;
         if (hy > bottom + head || hy < top - head) continue;
-        ui::text_mid(c, c.f.heading, 20 * s, left, hy, ui::kInkBright, teleport_sections[k].name);
-        const float tw = ui::size_of(c.f.heading, 20 * s, teleport_sections[k].name).x;
+        ui::text_mid(c, c.f.heading, 20 * s, left, hy, ui::kInkBright, T(teleport_sections[k].name));
+        const float tw = ui::size_of(c.f.heading, 20 * s, T(teleport_sections[k].name)).x;
         char n_text[16];
         snprintf(n_text, sizeof n_text, "%d", teleport_section_end(k) - teleport_sections[k].first);
         const float nw = ui::size_of(c.f.body, 15 * s, n_text).x;
@@ -2333,7 +2697,7 @@ void draw_teleport(ui::Ctx& c) {
         c.d->AddRect(a, b, ui::kEdge, 3 * s, std::max(1.0f, s));
         if (selected) c.d->AddRectFilled(a, ImVec2(a.x + 4 * s, b.y), ui::kGoldHi);
         float name_end = b.x - 10 * s;
-        if (teleport_notes[i]) name_end -= card_tag(c, b.x - 8 * s, (a.y + b.y) * 0.5f, teleport_notes[i]) + 8 * s;
+        if (teleport_notes[i]) name_end -= card_tag(c, b.x - 8 * s, (a.y + b.y) * 0.5f, T(teleport_notes[i])) + 8 * s;
         c.d->PushClipRect(a, ImVec2(name_end, b.y), true);
         ui::text_mid(c, selected ? c.f.strong : c.f.body, 17 * s, a.x + 16 * s, (a.y + b.y) * 0.5f, selected ? ui::kInkBright : ui::kInk,
                      teleport_names[i]);
@@ -2345,41 +2709,78 @@ void draw_teleport(ui::Ctx& c) {
     if (detail >= top) {   // (the selection, its section and note, and Travel: what Enter does)
         c.d->AddLine(ImVec2(left, detail), ImVec2(right, detail), ui::alpha(ui::kEdge, 0.8f));
         const float my = detail + strip * 0.5f + 2 * s;
-        const float bw = ui::size_of(c.f.strong, 20 * s, "Travel").x + 56 * s;
+        const float bw = ui::size_of(c.f.strong, 20 * s, T("Travel")).x + 56 * s;
         const ImVec2 a(right - bw, my - 18 * s), b(right, my + 18 * s);
         c.d->PushClipRect(ImVec2(left, detail), ImVec2(a.x - 12 * s, detail + strip), true);
         ui::text_mid(c, c.f.strong, 18 * s, left, my - 10 * s, ui::kInkBright, teleport_names[teleport_choice]);
         char where[64];
-        snprintf(where, sizeof where, note ? "%s · %s" : "%s", teleport_sections[teleport_section_of(teleport_choice)].name, note);
+        snprintf(where, sizeof where, note ? "%s · %s" : "%s", T(teleport_sections[teleport_section_of(teleport_choice)].name), note);
         ui::text_mid(c, c.f.body, 15 * s, left, my + 12 * s, ui::kAccent, where);
         c.d->PopClipRect();
-        ui::button(c, a, b, "Travel", false);
+        ui::button(c, a, b, T("Travel"), false);
         hits.add(a.x, a.y, b.x, b.y, menu_hit::kButton, 0);
     }
     ui::prompt_bar(c, prompts, 5);   // (the prompts, on top of the help and the cards)
 }
 
+/// A question's box, W x H in the middle, its title strip hb high (the restart question, the save question)
+void ask_frame(ui::Ctx& c, ImVec2 p, ImVec2 q, float hb) {
+    const float s = c.s;
+    if (ui::ocarina_style) {   // (ocarina: night blue, a fine stone frame, a fine gold line under the title)
+        c.d->AddRectFilled(p, q, ui::alpha(ui::kNight, 0.98f), 4 * s);
+        c.d->AddRect(p, q, ui::alpha(ui::kStone, 0.5f), 4 * s, std::max(1.0f, s));
+        c.d->AddRectFilledMultiColor(ImVec2(p.x + 24 * s, p.y + hb - 1 * s), ImVec2(q.x - 24 * s, p.y + hb), ui::alpha(ui::kFairy, 0.1f),
+                                     ui::alpha(ui::kFairy, 0.1f), ui::kFairy, ui::kFairy);
+    } else {
+        ui::shadow(c, p, q, 30 * s, 1.0f, 8 * s);
+        c.d->AddRectFilled(p, q, ui::rgba(36, 28, 19, 250));
+        c.d->AddRect(p, q, ui::rgba(122, 98, 64, 230), 0, 2 * s);
+        c.d->AddRectFilledMultiColor(p, ImVec2(q.x, p.y + hb), ui::kBannerTop, ui::kBannerTop, ui::kBanner, ui::kBanner);
+        c.d->AddRectFilled(ImVec2(p.x, p.y + hb - 3 * s), ImVec2(q.x, p.y + hb), ui::kBannerEdge);
+    }
+}
 void draw_ask(ui::Ctx& c) {
     const float s = c.s, W = 560 * s, H = 232 * s;
     const ImVec2 p((c.w - W) * 0.5f, (c.h - H) * 0.5f), q = p + ImVec2(W, H);
-    ui::shadow(c, p, q, 30 * s, 1.0f, 8 * s);
-    c.d->AddRectFilled(p, q, ui::rgba(36, 28, 19, 250));
-    c.d->AddRect(p, q, ui::rgba(122, 98, 64, 230), 0, 2 * s);
     const float hb = 50 * s;   // (a tan title strip, as the banner, its title in dark ink)
-    c.d->AddRectFilledMultiColor(p, ImVec2(q.x, p.y + hb), ui::kBannerTop, ui::kBannerTop, ui::kBanner, ui::kBanner);
-    c.d->AddRectFilled(ImVec2(p.x, p.y + hb - 3 * s), ImVec2(q.x, p.y + hb), ui::kBannerEdge);
-    ui::text_mid_centre(c, c.f.heading, 23 * s, (p.x + q.x) * 0.5f, p.y + hb * 0.5f, ui::kBannerInk, "Restart Needed");
-    const std::string ask = "Restart to apply " + restart_list(" and ") + "?";
+    ask_frame(c, p, q, hb);
+    ui::text_mid_centre(c, c.f.heading, 23 * s, (p.x + q.x) * 0.5f, p.y + hb * 0.5f, ui::kBannerInk, T("Restart Needed"));
+    const std::string ask = L("Reiniciar para aplicar ", "Restart to apply ") + restart_names_shown(restart_pending(), ", ", L(" e ", " and ")) + "?";
     ui::para(c, c.f.body, 19 * s, ImVec2(p.x + 28 * s, p.y + 64 * s), ui::kInk, ask.c_str(), W - 56 * s);
-    ui::text_mid(c, c.f.body, 16 * s, p.x + 28 * s, p.y + 124 * s, ui::kSoft, "Progress since your last save is lost.");
+    ui::text_mid(c, c.f.body, 16 * s, p.x + 28 * s, p.y + 124 * s, ui::kSoft, T("Progress since your last save is lost."));
     const float bw = 210 * s, bh = 46 * s, gap = 24 * s, by = p.y + 160 * s, x0 = (p.x + q.x) * 0.5f - bw - gap * 0.5f;
-    const char* labels[2] = {"Later", "Restart Now"};
+    const char* labels[2] = {T("Later"), T("Restart Now")};
     for (int i = 0; i < 2; i++) {
         const ImVec2 a(x0 + i * (bw + gap), by), b = a + ImVec2(bw, bh);
         ui::button(c, a, b, labels[i], i == ask_sel);
         hits.add(a.x, a.y, b.x, b.y, menu_hit::kButton, i);
     }
-    const ui::Prompt prompt_list[] = {{ui::kLeftRight, "Choose"}, {ui::kConfirm, "Confirm"}, {ui::kBack, "Later"}};
+    ui::Prompt prompt_list[] = {{ui::kLeftRight, "Choose"}, {ui::kConfirm, "Confirm"}, {ui::kBack, "Later"}};
+    prompts_shown(prompt_list, 3);
+    ui::prompt_bar(c, prompt_list, 3);
+}
+/// (ocarina) The save question (page 6): Yes, No, Back
+void draw_save_ask(ui::Ctx& c) {
+    const float s = c.s, W = 600 * s, H = 222 * s;
+    const ImVec2 p((c.w - W) * 0.5f, (c.h - H) * 0.5f), q = p + ImVec2(W, H);
+    const float hb = 50 * s;
+    ask_frame(c, p, q, hb);
+    ui::text_mid_centre(c, c.f.heading, 23 * s, (p.x + q.x) * 0.5f, p.y + hb * 0.5f, ui::kBannerInk,
+                        L("Salvar as alterações?", "Save the changes?"));
+    ui::para(c, c.f.body, 18 * s, ImVec2(p.x + 28 * s, p.y + 66 * s), ui::kInk,
+             L("Você mudou opções neste menu. Sim guarda e aplica; Não volta tudo como estava quando o menu abriu.",
+               "You changed options in this menu. Yes keeps and applies them; No puts everything back as it was when the menu "
+               "opened."),
+             W - 56 * s);
+    const float bw = 168 * s, bh = 46 * s, gap = 20 * s, by = p.y + 150 * s, x0 = (p.x + q.x) * 0.5f - bw * 1.5f - gap;
+    const char* labels[3] = {L("Sim", "Yes"), L("Não", "No"), L("Voltar", "Back")};
+    for (int i = 0; i < 3; i++) {
+        const ImVec2 a(x0 + i * (bw + gap), by), b = a + ImVec2(bw, bh);
+        ui::button(c, a, b, labels[i], i == save_sel);
+        hits.add(a.x, a.y, b.x, b.y, menu_hit::kButton, i);
+    }
+    ui::Prompt prompt_list[] = {{ui::kLeftRight, "Choose"}, {ui::kConfirm, "Confirm"}, {ui::kBack, "Back"}};
+    prompts_shown(prompt_list, 3);
     ui::prompt_bar(c, prompt_list, 3);
 }
 
@@ -2396,9 +2797,12 @@ void prebake(const ui::Ctx& c) {
     if (c.s == prebaked[0] && c.w == prebaked[1]) return;
     prebaked[0] = c.s, prebaked[1] = c.w;
     static const float points[] = {12, 12.5f, 13, 13.6f, 14, 14.28f, 14.5f, 15, 15.5f, 16, 16.5f, 17, 18, 18.5f, 19, 20, 21, 23, 24};
-    constexpr int n = sizeof points / sizeof points[0];
-    float px[n];
-    for (int i = 0; i < n; i++) px[i] = points[i] * c.s;
+    static const float ocarina_points[] = {13.5f, 22, 26};   // (ocarina: its header's credit, its sections' sizes)
+    constexpr int n0 = sizeof points / sizeof points[0], n1 = sizeof ocarina_points / sizeof ocarina_points[0];
+    float px[n0 + n1];
+    for (int i = 0; i < n0; i++) px[i] = points[i] * c.s;
+    const int n = ui::ocarina_style ? n0 + n1 : n0;
+    for (int i = n0; i < n; i++) px[i] = ocarina_points[i - n0] * c.s;
     ui::prebake(px, n);
     if (open_now.load(std::memory_order_relaxed)) return;
     // (and the page itself drawn once into a list of its own, thrown away: what the first open would measure and bake (the
@@ -2436,16 +2840,19 @@ float menu_ox = 0;   // (the menu's column's left edge in the window: more than 
 /// middle (a window of 16:9 or narrower: the whole of it). The pages draw from 0 as on 16:9; their vertices and clip
 /// rectangles are moved over after, and menu_tick moves the mouse back by menu_ox before it tests the hits
 void draw_menu(ui::Ctx& c) {
-    c.d->AddRectFilled(ImVec2(0, 0), ImVec2(c.w, c.h), ui::rgba(8, 5, 2, ui::kDimAlpha));   // (the game behind, dimmed)
+    if (ui::ocarina_style) ui::menu_backdrop(c);   // (ocarina: the game behind in night blue, a vignette)
+    else c.d->AddRectFilled(ImVec2(0, 0), ImVec2(c.w, c.h), ui::rgba(8, 5, 2, ui::kDimAlpha));   // (the game behind, dimmed)
     ui::Ctx k = c;
     k.w = std::min(c.w, std::floor(c.h * 16.0f / 9.0f + 0.5f));
     menu_ox = std::floor((c.w - k.w) * 0.5f);
     const int vtx0 = c.d->VtxBuffer.Size, cmd0 = c.d->CmdBuffer.Size;
     hits.clear(0, 0, k.w, k.h);
     if (page == 5) draw_ask(k);
+    else if (page == 6) draw_save_ask(k);
     else if (page == 1) draw_controls(k);
     else if (page == 3) draw_teleport(k);
     else if (page == 4) draw_inventory(k);
+    else if (ui::ocarina_style) draw_options_ocarina(k);
     else draw_options(k);
     if (menu_ox <= 0) return;
     for (int i = vtx0; i < c.d->VtxBuffer.Size; i++) c.d->VtxBuffer[i].pos.x += menu_ox;
@@ -2481,10 +2888,27 @@ void draw_fps(ui::Ctx& c, bool under_banner) {
     // (the window's top right corner, where it is in play; under the banner while the menu is open, unless the window is so
     // much wider than 16:9 that the counter fits beside the centred column's banner, in the corner)
     const bool beside = menu_ox >= bw + 2 * c.safe;
-    const float right = c.w - c.safe, top = under_banner && page != 5 && !beside ? banner_h(c) + 10 * s : c.safe;
+    const float right = c.w - c.safe, top = under_banner && page != 5 && page != 6 && !beside ? banner_h(c) + 10 * s : c.safe;
     outlined_right(c, c.f.strong, small, right, top + 14 * s, green, "FPS");
     outlined_right(c, c.f.strong, big, right - lw - 4 * s, top, green, fps_text);
     if (fps_sub[0]) outlined_right(c, c.f.strong, small, right, top + 32 * s, ui::rgba(226, 232, 226), fps_sub);
+}
+
+/// (ocarina) The report's note (ocarina_report.h toast): after an automatic report, ~10 s, the line and where to find the report;
+/// after a bug mark, a moment. A box at the top's middle, as wide as its text. Not drawn while the menu is open
+void draw_report_note(ui::Ctx& c, const std::string& line, const std::string& sub) {
+    // (no sub: the one-line notice, given room to stay one line)
+    const float s = c.s, px = 17 * s, sp = 14 * s, room = std::min(c.w - 2 * c.safe - 40 * s, (sub.empty() ? 1200 : 860) * s);
+    const char* how = sub.c_str();
+    const float wrap = std::min(room, std::max(ui::size_of(c.f.strong, px, line.c_str()).x, ui::size_of(c.f.body, sp, how).x) + 2 * s);
+    const float h1 = ui::para(c, c.f.strong, px, ImVec2(), 0, line.c_str(), wrap, false);
+    const float h2 = sub.empty() ? -10 * s : ui::para(c, c.f.body, sp, ImVec2(), 0, how, wrap, false);
+    const float bw = wrap + 36 * s, bh = h1 + h2 + 44 * s, x0 = (c.w - bw) * 0.5f, y0 = c.safe + 12 * s;
+    c.d->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + bw, y0 + bh), ui::kBox);
+    c.d->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + 5 * s, y0 + bh), ui::kGold);
+    c.d->AddRect(ImVec2(x0, y0), ImVec2(x0 + bw, y0 + bh), ui::kBannerEdge, 0, std::max(1.0f, s));
+    ui::para(c, c.f.strong, px, ImVec2(x0 + 20 * s, y0 + 14 * s), ui::kInk, line.c_str(), wrap);
+    if (!sub.empty()) ui::para(c, c.f.body, sp, ImVec2(x0 + 20 * s, y0 + 24 * s + h1), ui::kAccent, how, wrap);
 }
 
 /// The start-up screen: the logo, the wordmark, what the start is doing, a bar, on a warm dark. A little below the middle; what
@@ -2496,6 +2920,24 @@ void draw_startup(ui::Ctx& c) {
         v = startup;
     }
     const float s = c.s, w = c.w, h = c.h, cx = w * 0.5f, k = s * 0.86f;   // (k: the scale of what is under the logo)
+    if (ui::ocarina_style) {   // (ocarina: the ocarina, the name, the staff of notes lighting up, one line of words; ocarina_ui.h)
+        static const bool still = [] {   // (RX_VK_UI_STILL=1: nothing moves, the staff's tip stays half lit)
+            const char* e = getenv("RX_VK_UI_STILL");
+            return e && atoi(e) != 0;
+        }();
+        const BrandStartupText t = brand_startup_text(v, menu_pt());   // (ocarina: the menu's language, Auto the game's)
+        ui::OcarinaStartup o;
+        o.line = t.line, o.eta = t.eta, o.hint = t.hint;
+        o.version = std::string(kBrandName) + " v" + OCARINA_VERSION;
+        o.staff = v.finished ? !v.title.empty() : v.fraction >= 0;
+        o.fraction = v.finished ? 1.0 : v.fraction;
+        float aspect = 1;
+        ImTextureData* logo = ui::brand_logo(&aspect);
+        ui::ocarina_startup(c, o, logo, aspect, ImGui::GetTime(), !still);
+        if (const float f = startup_fade.load(std::memory_order_relaxed); f > 0)   // (the end: to black, the game's first frame next)
+            c.d->AddRectFilled(ImVec2(0, 0), ImVec2(w, h), ui::rgba(0, 0, 0, (int)(std::min(f, 1.0f) * 255 + 0.5f)));
+        return;
+    }
     c.d->AddRectFilled(ImVec2(0, 0), ImVec2(w, h), ui::rgba(14, 10, 6));
     const float lh = 112 * s, top = h * 0.5f - 176 * s;
     for (int i = 40; i >= 1; i--) c.d->AddCircleFilled(ImVec2(cx, top + lh * 0.5f + 70 * s), h * 0.021f * i, ui::rgba(46, 33, 18, 4), 128);
@@ -2604,6 +3046,8 @@ void menu_init() {
         bool v2 = false;
         int version = 0;
         int old_dynres = -1;   // (the row before Resolution: 0, the full scale, is its 100%; 1 is Auto)
+        int old_vivid = -1;            // (ocarina: vivid_colors, the On/Off before the levels)
+        bool has_vivid_level = false;
         bool menu_auto = false;   // (menu_size=0, the Menu size Auto there was before: Medium, not the Small the row's clamp gives)
         while (fgets(line, sizeof line, f)) {
             char* eq = strchr(line, '=');
@@ -2619,12 +3063,16 @@ void menu_init() {
             if (!strcmp(line, "options_version")) version = atoi(eq + 1);
             if (!strcmp(line, "dynamic_resolution")) old_dynres = atoi(eq + 1);
             if (!strcmp(line, "menu_size") && atoi(eq + 1) == 0) menu_auto = true;
+            if (!strcmp(line, "vivid_colors")) old_vivid = atoi(eq + 1);   // (ocarina: the key before the levels)
+            if (!strcmp(line, "vivid_level")) has_vivid_level = true;
+            if (!strcmp(line, "ocarina_report_notice")) report_notice.store(std::clamp(atoi(eq + 1), 0, 2));   // (ocarina)
             if (!strcmp(line, "microphone_device")) {   // (hookshot: the microphone, by its name)
                 mic_want = mic_key(eq + 1);
                 while (!mic_want.empty() && (mic_want.back() == '\n' || mic_want.back() == '\r')) mic_want.pop_back();
             }
         }
         fclose(f);
+        if (!has_vivid_level && old_vivid == 0) opts.vivid = 0;   // (ocarina: Vivid colors turned off before the levels stays off)
         // (the saved microphone by its name, not its place; the host told the row's choice. Off or the default: no list, no SDL
         // audio at the start)
         if (!mic_want.empty()) refresh_mics();
@@ -2659,7 +3107,7 @@ void menu_init() {
     if (const char* e = getenv("RX_VK_UPSCALE"))
         for (Row& r : rows)
             if (r.value == &opts.upscale) *r.value = std::min(std::max(atoi(e), r.lo), r.hi);
-    if (const char* e = getenv("RX_VK_VIVID")) opts.vivid = atoi(e) != 0;   // (A/B of Vivid colors)
+    if (const char* e = getenv("RX_VK_VIVID")) opts.vivid = std::clamp(atoi(e), 0, 3);   // (A/B of Vivid colors, by level)
     if (const char* e = getenv("HOS_REALTIME_STEP")) opts.realtime = atoi(e) != 0;
     if (const char* e = getenv("HOS_DYNRES")) opts.resolution = atoi(e) != 0 ? 0 : 1;
     if (const char* e = getenv("HOS_OUTPUT_RES")) opts.output_res = parse_output(e);
@@ -2850,8 +3298,13 @@ void cheat_press(int i, const bool* press, bool& changed) {
     }
 }
 
+bool menu_report_notice_seen(int level) { return report_notice.load() >= level; }
+void menu_report_notice_done(int level) { report_notice_now.store(level); }
+
 void menu_tick() {
     fullscreen_tick();
+    if (const int now = report_notice_now.exchange(0); now > report_notice.load())   // (ocarina: the reports' notice shown: not again)
+        report_notice.store(now), save();
     enum { K_N = 17 };
     static bool held[K_N];
     static const int keys[K_N] = {VK_INSERT, VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_ESCAPE, VK_F1,   // (F1: for keyboards without Insert)
@@ -2872,6 +3325,18 @@ void menu_tick() {
         press[i] = enabled && (host && host->take_key_press ? mine && queued : down && !held[i]);
         held[i] = down;
         if (press[i]) pad_last = false;   // (the keys: their names in the prompts)
+    }
+    bool repeat_only[5] = {};   // (ocarina: an arrow pressed again by holding it, not a new press: the tab change below skips it)
+    {   // (ocarina) the bug key (F9, RX_VK_BUG_KEY): a mark for the problem report (ocarina_report.h), the menu open or not; not
+        // while a key is being bound. The game reads only the keys bound to its buttons, F9 none of them unless the player binds it
+        static const int bug = ocarina_report::bug_key();
+        static bool bug_held = false;
+        if (bug > 0) {
+            const bool down = mine && (GetAsyncKeyState(bug) & 0x8000) != 0;
+            const bool hit = host && host->take_key_press ? host->take_key_press(bug) && mine : down && !bug_held;
+            bug_held = down;
+            if (hit && listening == 0) ocarina_report::mark_bug();
+        }
     }
     // (hookshot) the gamepads, by position: Home, or Select and Start together, as Insert; the D-pad as the arrows; the
     // buttons the Switch's A and B are bound to as Enter and Esc, as in the game (vk_menu_keys.h; with the Nintendo layout A
@@ -2902,6 +3367,7 @@ void menu_tick() {
             if (!down) { held_since[i] = 0; continue; }
             if (!held_since[i]) { held_since[i] = t, next_repeat[i] = t + 350000000LL; continue; }
             if (t >= next_repeat[i] && open_now.load() && listening == 0) {
+                if (!press[i]) repeat_only[i] = true;
                 press[i] = true;
                 next_repeat[i] = t + (t - held_since[i] > 1500000000LL ? 33000000LL : 83000000LL);
             }
@@ -2958,6 +3424,7 @@ void menu_tick() {
         restart_values(now);
         restart_state.choose_later(now);
         open_now = false, page = 0, changed = true;
+        if (std::exchange(saved_yes, false)) saved_note_show();   // (ocarina: after the save question's Yes)
     };
     // (Menu shortcut "Insert, F1 or Esc": Esc on a closed menu opens it, the keyboard's alone (the
     // gamepad's back is Esc only while it is open, above). The press that opened it does not go back a page below. No
@@ -2966,6 +3433,10 @@ void menu_tick() {
     if (esc_opens) press[5] = false;
     if ((press[0] || press[6]) && open_now.load() && page == 5) {
         later();
+    } else if ((press[0] || press[6]) && open_now.load() && page == 6) {   // (ocarina: on the save question, as Back)
+        page = 0, changed = true;
+    } else if ((press[0] || press[6]) && open_now.load() && options_changed()) {   // (ocarina: the save question first)
+        page = 6, save_sel = 0, listening = 0, changed = true;
     } else if ((press[0] || press[6]) && open_now.load() && restart_ask()) {
         page = 5, ask_sel = 0, listening = 0, changed = true;
     } else if (press[0] || press[6] || esc_opens) {
@@ -2976,8 +3447,30 @@ void menu_tick() {
         if (open_now.load()) opts.pad_layout = detect_pad_layout();
         if (open_now.load()) dlss_probe(), fsr4_probe();   // (whether the Upscaler row can offer DLSS and FSR here: asked once)
         if (open_now.load()) refresh_mics();   // (the microphones as they are now)
+        if (open_now.load()) options_note_open(), saved_yes = false, saved_note_until = 0;   // (ocarina: what No goes back to)
     }
-    if (open_now.load() && page == 5) {   // (hookshot) the restart question: Later (the default) or Restart now
+    if (open_now.load() && page == 6) {   // (ocarina) the save question: Yes (the default), No, Back
+        if (mouse) {   // (a button under the cursor chosen, a click on it pressed, a right click is Back)
+            const menu_hit::Hit hit = hits.at((float)mx, (float)my);
+            if (hit.part == menu_hit::kButton && (moved || ptr.pressed) && hit.index != save_sel) save_sel = hit.index, changed = true;
+            if ((ptr.pressed & HOS_MOUSE_LEFT) && hit.part == menu_hit::kButton) press[7] = true;
+            if (ptr.pressed & HOS_MOUSE_RIGHT) press[5] = true;
+        }
+        if (press[1] || press[3] || tab_left) save_sel = (save_sel + 2) % 3, changed = true;
+        else if (press[2] || press[4] || tab_right) save_sel = (save_sel + 1) % 3, changed = true;
+        if (press[5] || (press[7] && save_sel == 2)) {   // (Back: the menu as it was)
+            page = 0, changed = true;
+        } else if (press[7] && save_sel == 1) {   // (No: everything back as the menu opened, saved so)
+            options_revert();
+            logf("menu: closed without saving: the options as they were");
+            open_now = false, page = 0, changed = true;
+        } else if (press[7]) {   // (Yes: saved; then the restart question when a change takes one)
+            save();
+            options_note_open();
+            if (restart_ask()) page = 5, ask_sel = 0, saved_yes = true, changed = true;
+            else open_now = false, page = 0, changed = true, saved_note_show();
+        }
+    } else if (open_now.load() && page == 5) {   // (hookshot) the restart question: Later (the default) or Restart now
         if (mouse) {   // (a button under the cursor chosen, a click on it pressed, a right click is Later; no list: the wheel does nothing)
             const menu_hit::Hit hit = hits.at((float)mx, (float)my);
             if (hit.part == menu_hit::kButton && (moved || ptr.pressed) && hit.index != ask_sel) ask_sel = hit.index, changed = true;
@@ -2988,6 +3481,7 @@ void menu_tick() {
         if (press[5] || (press[7] && ask_sel == 0)) {
             later();
         } else if (press[7]) {   // (Restart now: everything saved, then the window closes as the player would close it)
+            saved_yes = false;
             logf("menu: restart now, to apply %s", restart_list(", ").c_str());
             save();
             pipeline_cache_save(true);
@@ -3176,8 +3670,20 @@ void menu_tick() {
         if (press[5] && cur_tab == TAB_MOTION) cur_tab = TAB_CONTROLS, press[5] = false, changed = true;   // (back)
         if (press[5] && pending) pending = nullptr, changed = true;   // (a Restart or Quit waiting for its second press: cancelled)
         else if (press[5] && cur_tab == TAB_MOTION) cur_tab = TAB_CONTROLS, press[5] = false, changed = true;   // (back)
+        else if (press[5] && options_changed()) page = 6, save_sel = 0, changed = true;   // (ocarina: the save question first)
         else if (press[5] && restart_ask()) page = 5, ask_sel = 0, changed = true;   // (the restart question first)
         else if (press[5]) open_now = false;
+        // (ocarina) Left and Right on a row where they change nothing (a page, a button, Restart, Quit, the update's and the
+        // report's rows): the previous or next tab, at a new press only (held, it does not run on through the tabs and into a
+        // value there). Not on the Motion page, whose rows all change
+        if (cur_tab != TAB_MOTION && (press[3] || press[4]) && tab_row_count(cur_tab) > 0) {
+            const Row& at = rows[tab_row_to_global(cur_tab, std::min(tab_selected[cur_tab], tab_row_count(cur_tab) - 1))];
+            if (!lr_changes(at)) {
+                const bool new_left = press[3] && !repeat_only[3], new_right = press[4] && !repeat_only[4];
+                if (new_left != new_right) (new_left ? tab_left : tab_right) = true;
+                press[3] = press[4] = false;
+            }
+        }
         // (the tabs: LB and RB, Q and E, or Tab; from the Motion page, as from Controls)
         if ((tab_left || tab_right) && cur_tab == TAB_MOTION) cur_tab = TAB_CONTROLS;
         if (tab_left) cur_tab = (cur_tab + TAB_COUNT - 1) % TAB_COUNT, changed = true;
@@ -3226,6 +3732,9 @@ void menu_tick() {
         else if (press[7] && is_update_row(r)) {   // (ocarina: Atualizar or Procurar atualização; nothing while it works)
             if (!press[5]) ocarina_update::press();
             press[7] = false, changed = true;
+        } else if (press[7] && is_report_row(r)) {   // (ocarina: the report made on its own thread; the folder in Explorer)
+            if (!press[5]) r.name == kReportRow ? ocarina_report::press() : ocarina_report::open_folder();
+            press[7] = false, changed = true;
         } else if (press[7] && is_motion_row(r)) cur_tab = TAB_MOTION, tab_selected[TAB_MOTION] = 0, press[7] = false, changed = true;
         else if (press[7] && !r.value && can_bind()) page = 1, csel = 0, ccol = 0, changed = true;
         if ((press[3] || press[4] || press[7]) && r.value) {   // (Enter, or A, as Right)
@@ -3272,7 +3781,10 @@ void menu_record(VkCommandBuffer cmd, uint32_t index, uint32_t w, uint32_t h) {
     const bool start = startup_on.load(std::memory_order_acquire);
     const bool fps = opts.show_fps && !start;   // (no game frames yet: not "0 FPS" over the start-up screen)
     const bool open = open_now.load(std::memory_order_relaxed);
-    if (!start && !fps && !open) {   // (nothing shows: no ImGui frame, no render pass)
+    static std::string report_note, report_sub;   // (ocarina: the automatic report's note, ~10 s once the start-up screen is gone; a bug mark's)
+    const bool note = !start && !open && ocarina_report::toast(&report_note, &report_sub);
+    const bool saved = !start && !open && !note && prof_now() < saved_note_until;   // (ocarina: after the save question's Yes)
+    if (!start && !fps && !open && !note && !saved) {   // (nothing shows: no ImGui frame, no render pass)
         // (but a new window size or Menu size since the last bake: one frame with nothing drawn that bakes the menu's glyphs
         // and measures its page for the new size, so the next open has no hitch whatever was resized while nothing showed)
         if (prebake_needed(w, h) && ui::begin(w, h)) {
@@ -3296,6 +3808,10 @@ void menu_record(VkCommandBuffer cmd, uint32_t index, uint32_t w, uint32_t h) {
     prebake(c);   // (the menu's glyphs at this size, before it opens: no hitch then)
     if (start) draw_startup(c);   // (under the menu)
     if (open) draw_menu(c);
+    if (note) draw_report_note(c, report_note, report_sub);
+    if (saved)
+        draw_report_note(c, saved_note_restart ? L("Salvas: algumas valem depois de reiniciar o jogo", "Saved: some take effect after restarting the game")
+                                               : L("Configurações salvas", "Settings saved"), "");
     if (fps) draw_fps(c, open);
     ::mkwvk::rec::boundary(::mkwvk::rec::B_DIRECT);   // (Dear ImGui records into cmd directly, its backend through its own pointers: what this thread recorded through vk_work.h reaches cmd first)
     ui::record(cmd, index, w, h);

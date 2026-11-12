@@ -18,14 +18,17 @@
 
 extern "C" __declspec(dllimport) void* __stdcall GetStdHandle(unsigned long);
 extern "C" __declspec(dllimport) int __stdcall WriteFile(void*, const void*, unsigned long, unsigned long*, void*);
-/// (made before the recorder's global, so destroyed after it: its line shows the DLL's destructors all ran)
+/// (made before the recorder's global, so destroyed after it: its line shows the DLL's destructors all ran). (Ocarina Engine) Its
+/// order is forced: g_rec is an inline variable, whose dynamic initialization is not ordered against this file's own statics,
+/// and llvm-mingw made it first, so this line was printed before the broken variant's destructor ended the process and the check
+/// passed it. init_priority makes the sentinel before every ordinary global and so destroys it after them
 static struct Sentinel {
     ~Sentinel() {
         static const char line[] = "DLL detach: the global destructors ran to the end\n";
         unsigned long n;
         WriteFile(GetStdHandle((unsigned long)-11), line, sizeof line - 1, &n, nullptr);
     }
-} g_sentinel;
+} g_sentinel __attribute__((init_priority(101)));
 
 #include "vk_work.h"
 

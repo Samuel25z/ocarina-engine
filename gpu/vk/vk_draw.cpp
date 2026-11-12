@@ -112,7 +112,9 @@ const char* const kFineT[] = {"banks", "c1", "user uniform buffers", "storage bu
 enum FineC { FC_DRAWS, FC_BUILDS, FC_DESCS, FC_WRITES, FC_BANK_CALLS, FC_BANK_GEN, FC_BANK_FILLS, FC_BANK_FILL_BYTES, FC_BANK_SAME,
              FC_BANK_NEW, FC_BANK_NEW_BYTES, FC_C1_CALLS, FC_UBO_CALLS, FC_UBO_OVERLAY, FC_UBO_STREAM, FC_PUSH_FULL, FC_PUSH_DELTA,
              FC_PUSH_NONE, FC_PUSH_WRITES, FC_PUSH_DESCS, FC_BIND_PIPE, FC_DYN_FAST, FC_DYN_FULL, FC_DYN_CALLS, FC_VBIND, FC_IBIND,
-             FC_PUSHC, FC_PIPE_FAST, FC_PIPE_MAP, FC_POOL_SETS, FC_POOL_DESCS, FC_SSBO_DESCS, FC_COUNT };
+             FC_PUSHC, FC_PIPE_FAST, FC_PIPE_MAP, FC_POOL_SETS, FC_POOL_DESCS, FC_SSBO_DESCS, FC_BC_UBO, FC_BC_SSBO, FC_BC_TEX,
+             FC_BC_CHECKED, FC_BC_DIFF, FC_PUSH_CROSS, FC_IB_CMDS, FC_IB_REBASED, FC_PROG_PAIR, FC_PROG_GEN, FC_PROG_SAME,
+             FC_PROG_OTHER, FC_PROG_PICK, FC_PROG_CHECKED, FC_PROG_DIFF, FC_COUNT };
 const char* const kFineC[] = {"draws", "descriptor builds", "descriptors", "descriptor writes", "bank calls",
                                       "bank kept by its stage's generation", "bank fills", "bank bytes filled", "bank refills equal",
                                       "bank copies into the stream", "bank bytes copied", "c1 calls", "user uniform buffer calls",
@@ -121,8 +123,16 @@ const char* const kFineC[] = {"draws", "descriptor builds", "descriptors", "desc
                                       "writes pushed", "descriptors pushed", "pipeline binds", "dynamic state from the draw before",
                                       "dynamic state worked out", "dynamic state commands", "vertex stream binds", "index buffer binds",
                                       "push constants", "pipeline keys from the fast pair", "pipeline keys from the thread's map",
-                                      "sets allocated (over the push limit)", "descriptors in them", "storage buffer descriptors built"};
+                                      "sets allocated (over the push limit)", "descriptors in them", "storage buffer descriptors built",
+                                      "uniform buffers kept by the bind cache", "storage buffers kept by the bind cache",
+                                      "textures kept by the bind cache", "bindings checked (bind cache =check)",
+                                      "bindings that differed (bind cache =check)", "pushes of changed writes after another program (shared layout)",
+                                      "index buffer bind commands", "indexed draws given firstIndex instead of a bind",
+                                      "program picks from the pair", "program picks kept by their counters", "program picks of the same handles",
+                                      "program picks of other textures, same types", "program picks in full", "program picks checked (=check)",
+                                      "program picks that differed (=check)"};
 static_assert(std::size(kFineT) == FT_COUNT && std::size(kFineC) == FC_COUNT, "every section and count is named");
+static_assert(FC_PROG_DIFF - FC_PROG_PAIR + 1 == PPN_COUNT, "program_for's counts, in vk_shader.h's order");
 const bool g_fine = getenv("RX_VK_PROF_FINE") != nullptr;
 int64_t fine_ns[FT_COUNT], fine_n[FC_COUNT];
 struct FineScope {
@@ -140,6 +150,7 @@ struct FineScope {
 void fine_report(double frames) {
     if (!g_fine) return;
     static int64_t last_ns[FT_COUNT], last_n[FC_COUNT];
+    for (int i = 0; i < PPN_COUNT; i++) fine_n[FC_PROG_PAIR + i] = prog_pick_n[i];   // (program_for's, since the start: vk_shader.cpp)
     char line[900];
     int k = snprintf(line, sizeof line, "vk: a frame (fine): ms:");
     for (int i = 0; i < FT_COUNT; i++) {
@@ -649,6 +660,36 @@ VkFormat supported_vertex_format(VkFormat f) {
 // (+ the guest page table's address, a task draw's first, and the fallback's two buffer addresses)
 constexpr uint32_t kPushSize = Shader::Backend::SPIRV::MESH_FALLBACK_PUSH_END;
 
+// (Ocarina Engine) RX_VK_LAYOUT_SHARE (on; =0: as before): the pushed state (bind_descriptors) stood only for the program's own
+// pipeline layout, and a draw of any other program pushed its whole set (about a third of the draws). Layouts defined alike (the
+// same bindings, flags and push range) are compatible, and pushed descriptors stand across them (the push descriptors' state is
+// disturbed only by an incompatible layout): such a draw pushes the bindings that changed. Each program keeps its own layout
+// (borrowed programs destroy theirs); a layout's shape is known by its handle, written again when a handle comes back
+std::mutex layout_shape_mu;
+std::map<std::vector<uint64_t>, uint64_t> layout_shape_ids;   // (a shape -> its number, from 1)
+std::unordered_map<uint64_t, uint64_t> layout_shape_by_handle;
+void layout_shape_note(VkPipelineLayout layout, std::vector<uint64_t> shape) {
+    try {
+        std::lock_guard lk(layout_shape_mu);
+        const auto it = layout_shape_ids.emplace(std::move(shape), layout_shape_ids.size() + 1).first;
+        layout_shape_by_handle[(uint64_t)layout] = it->second;
+    } catch (const std::exception&) {   // (only a saving: unknown, the whole set is pushed)
+    }
+}
+void layout_shape_forget(VkPipelineLayout layout) {
+    std::lock_guard lk(layout_shape_mu);
+    layout_shape_by_handle.erase((uint64_t)layout);
+}
+/// Whether pipeline layouts a and b are defined alike (a == b, or both of one shape)
+bool layouts_compatible(VkPipelineLayout a, VkPipelineLayout b) {
+    if (a == b) return true;
+    static const bool share = !getenv("RX_VK_LAYOUT_SHARE") || atoi(getenv("RX_VK_LAYOUT_SHARE")) != 0;
+    if (!share || !a || !b) return false;
+    std::lock_guard lk(layout_shape_mu);
+    const auto ia = layout_shape_by_handle.find((uint64_t)a), ib = layout_shape_by_handle.find((uint64_t)b);
+    return ia != layout_shape_by_handle.end() && ib != layout_shape_by_handle.end() && ia->second == ib->second;
+}
+
 void ensure_layout(Program& p) {
     if (p.layout) return;
     std::vector<VkDescriptorSetLayoutBinding> bindings;
@@ -669,13 +710,13 @@ void ensure_layout(Program& p) {
         add(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, st.vk_stage, st.info.image_descriptors);
     }
     p.push = dev.push_descriptor && vkCmdPushDescriptorSetKHR && total <= dev.max_push_descriptors;
+    VkShaderStageFlags stages = 0;
+    for (const Stage& st : p.stages) stages |= st.vk_stage;
     VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     if (p.push) li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
     li.bindingCount = (uint32_t)bindings.size();
     li.pBindings = bindings.data();
     vkCreateDescriptorSetLayout(dev.device, &li, nullptr, &p.set_layout);
-    VkShaderStageFlags stages = 0;
-    for (const Stage& st : p.stages) stages |= st.vk_stage;
     const VkPushConstantRange range{stages, 0, kPushSize};
     VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     pi.setLayoutCount = 1;
@@ -684,6 +725,14 @@ void ensure_layout(Program& p) {
     pi.pPushConstantRanges = &range;
     VkPipelineLayout layout = VK_NULL_HANDLE;
     vkCreatePipelineLayout(dev.device, &pi, nullptr, &layout);
+    if (layout) {   // (Ocarina Engine, RX_VK_LAYOUT_SHARE: its shape, by which bind_descriptors knows a compatible layout)
+        std::vector<uint64_t> shape;
+        shape.reserve(bindings.size() * 2 + 1);
+        shape.push_back((uint64_t)p.push << 32 | stages);
+        for (const VkDescriptorSetLayoutBinding& b : bindings)
+            shape.push_back((uint64_t)b.binding << 32 | (uint32_t)b.descriptorType), shape.push_back((uint64_t)b.descriptorCount << 32 | b.stageFlags);
+        layout_shape_note(layout, std::move(shape));
+    }
     p.push_stages = stages;
     for (const Stage& st : p.stages) p.uses_render_area |= st.info.uses_render_area;
     p.uses_push = p.uses_render_area;
@@ -1544,10 +1593,14 @@ void state_list_prepare(void (*progress)(size_t done, size_t total)) {
         rec_program[i] = it->second;
     }
     std::atomic<size_t> next{0}, made{0}, missing{0};
-    const auto worker = [&] {
+    const auto worker = [&](unsigned me, unsigned of) {
         ub_thread_off();   // (a background thread: see ub_thread_off; the pipeline state list's builds raced the replay's updates)
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         for (;;) {
+            while (!prep_worker_may_run(me, of) && next.load() < want.size()) {   // (Ocarina Engine: the RAM guard, vk_memory.cpp)
+                if (prepare_stopped()) return;
+                Sleep(50);
+            }
             const size_t i = next++;
             if (i >= want.size()) return;
             const StateRec& r = *want[i].r;
@@ -1566,7 +1619,8 @@ void state_list_prepare(void (*progress)(size_t done, size_t total)) {
     };
     std::vector<std::thread> threads;
     const unsigned cpus = std::max(1u, std::thread::hardware_concurrency());
-    for (unsigned i = 0; i < std::clamp(cpus / 2, 1u, 32u); i++) threads.emplace_back(worker);
+    const unsigned nthreads = std::clamp(cpus / 2, 1u, 32u);
+    for (unsigned i = 0; i < nthreads; i++) threads.emplace_back(worker, i, nthreads);
     for (std::thread& t : threads) t.join();
     // then each pipeline, noted as a draw would note it
     std::unordered_set<uint64_t> keys;
@@ -1587,9 +1641,13 @@ void state_list_prepare(void (*progress)(size_t done, size_t total)) {
     }
     std::atomic<size_t> variants_made{0};
     next = 0;
-    const auto variant_worker = [&] {
+    const auto variant_worker = [&](unsigned me, unsigned of) {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         for (;;) {
+            while (!prep_worker_may_run(me, of) && next.load() < variant_of.size()) {   // (Ocarina Engine: the RAM guard, vk_memory.cpp)
+                if (prepare_stopped()) return;
+                Sleep(50);
+            }
             const size_t i = next++;
             if (i >= variant_of.size()) return;
             const StateRec& r = recs[variant_of[i]];
@@ -1605,7 +1663,7 @@ void state_list_prepare(void (*progress)(size_t done, size_t total)) {
         }
     };
     threads.clear();
-    for (unsigned i = 0; i < std::clamp(cpus / 2, 1u, 32u); i++) threads.emplace_back(variant_worker);
+    for (unsigned i = 0; i < nthreads; i++) threads.emplace_back(variant_worker, i, nthreads);
     for (std::thread& t : threads) t.join();
     size_t noted_n = 0, no_variant = 0, noted_mesh = 0, noted_fallback = 0;
     auto s = std::make_unique<NvnState>();
@@ -2537,6 +2595,92 @@ VkImageView texture_view_of(uint32_t handle, VkImageViewType want, ViewUse use, 
     return view;
 }
 
+// ---- (Ocarina Engine) RX_VK_BIND_CACHE: each binding of a recent program kept as it was resolved, with what it was resolved from ----
+// A draw that is not the same as the one before (nearly every one: OoT binds a uniform buffer for each) resolved all of its ~13
+// descriptors again: the buffers' pools looked up, the uniform updates searched for an overlay, the textures' handles found in the
+// thread's map. Now, for the last 8 programs, each slot keeps its sources (a uniform buffer's address and size, a storage buffer's
+// words, a texture's handle) and what they gave, with the generations that answer could change by. The same sources and no
+// generation moved: the answer is taken as it is.
+//   uniform buffers: only ones bound in their pool (not an overlay copy, not one copied into the stream), whose answer
+//     gpu_buffer_bind keeps itself (gpu_bind_was_memo); good while bind_cache_stamp() (pools, mirrors, the submission) and
+//     ub_bind_stamp() (the uniform updates an overlay is made from) stand
+//   storage buffers: only ones the program does not write (a written one marks the pool written, a write-back, stamps); the same
+//     words (address, size, the native bounds' word) and bind_cache_stamp(); not a table entry shrunk to fit, nor a wide binding
+//   textures (sampled): the same handle, its slot's version, the samplers' generation, no texture gone since (or this one outlived
+//     those, as texture_view_of's own map has it); touched once a submission as that map does
+// Each recording begins with an empty cache. 0: off. check: every slot kept is resolved again too and compared: "vk: bind cache
+// check" lines count what differed (and the first 40 differences are logged). Off where a diagnostic wants every resolution.
+int bind_cache_mode() {
+    static const int mode = [] {
+        const char* e = getenv("RX_VK_BIND_CACHE");
+        int m = 1;
+        if (e) m = !strcmp(e, "check") ? 2 : atoi(e) != 0 ? 1 : 0;
+        static const char* const diagnostics[] = {"RX_VK_DRAW_STATS", "RX_VK_WATCH_PROG", "RX_VK_SLOW_DESC", "RX_VK_PEEK_PROG",
+                                                  "RX_VK_TRACE_TEX", "RX_VK_LOG_IMG", "RX_VK_UB_SNAPSHOT", "RX_VK_DUMP_SSBO",
+                                                  "RX_VK_DUMP_SAMPLED"};
+        const char* off_for = nullptr;
+        if (m)
+            for (const char* d : diagnostics)
+                if (getenv(d)) off_for = d, m = 0;
+        if (off_for) logf("vk: bind cache off: %s wants every binding resolved", off_for);
+        else logf("vk: bind cache %s (RX_VK_BIND_CACHE: 0 off, check: compared)", m == 2 ? "on, checked" : m ? "on" : "off");
+        return m;
+    }();
+    return mode;
+}
+struct BindSlot {
+    uint64_t epoch = 0;          // (bind_cache_epoch when kept; any other: empty)
+    uint64_t src0 = 0, src1 = 0; // (its sources: address and size, or the handle)
+    uint64_t stamp = 0, stamp2 = 0;
+    VkDescriptorBufferInfo buf{};
+    VkImageView view = VK_NULL_HANDLE;   // (as texture_view_of answered: null for the dummy)
+    VkSampler sampler = VK_NULL_HANDLE;
+    Texture* tex = nullptr;
+    uint64_t dgen = 0;
+    uint32_t version = 0, tex_epoch = 0;
+    int8_t pointer = -1;         // (a texture: handle_is_storage_pointer's answer for the slot, a constant of the program)
+};
+struct ProgBinds {
+    const Program* p = nullptr;
+    uint64_t key = 0, used = 0;
+    std::vector<BindSlot> ubo, ssbo, tex;   // (in build_descriptors' order: every constant buffer, storage buffer, texture)
+};
+TLS_OBJECT(prog_binds, std::array<ProgBinds, 8>)
+thread_local uint64_t bind_cache_epoch = 1, bind_cache_tick = 0;
+std::atomic<int64_t> st_bc_checked{0}, st_bc_diff[3]{};
+ProgBinds* prog_binds_for(const Program& p, size_t nubo, size_t nssbo, size_t ntex) {
+    auto& all = prog_binds();
+    ProgBinds* lru = &all[0];
+    for (ProgBinds& b : all) {
+        if (b.p == &p && b.key == p.key && b.ubo.size() == nubo && b.ssbo.size() == nssbo && b.tex.size() == ntex) {
+            b.used = ++bind_cache_tick;
+            return &b;
+        }
+        if (b.used < lru->used) lru = &b;
+    }
+    lru->p = &p, lru->key = p.key, lru->used = ++bind_cache_tick;
+    lru->ubo.assign(nubo, BindSlot{}), lru->ssbo.assign(nssbo, BindSlot{}), lru->tex.assign(ntex, BindSlot{});
+    return lru;
+}
+/// (=check) a kept slot against its resolution now
+void bind_check(int kind, const Program* p, size_t slot, bool same, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t b0,
+                uint64_t b1, uint64_t b2) {
+    FINE_N(FC_BC_CHECKED, 1);
+    st_bc_checked.fetch_add(1, std::memory_order_relaxed);
+    if (same) return;
+    FINE_N(FC_BC_DIFF, 1);
+    st_bc_diff[kind].fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<int> told{0};
+    if (told++ < 40)
+        logf("vk: bind cache check: program %016llx %s %zu kept %#llx %#llx %#llx, resolved now %#llx %#llx %#llx (frame %llu)",
+             (unsigned long long)(p ? p->key : 0), kind == 0 ? "uniform buffer" : kind == 1 ? "storage buffer" : "texture", slot,
+             (unsigned long long)a0, (unsigned long long)a1, (unsigned long long)a2, (unsigned long long)b0, (unsigned long long)b1,
+             (unsigned long long)b2, (unsigned long long)texture_frame_no());
+}
+bool same_buf(const VkDescriptorBufferInfo& a, const VkDescriptorBufferInfo& b) {
+    return a.buffer == b.buffer && a.offset == b.offset && a.range == b.range;
+}
+
 /// A uniform buffer's descriptor range: the bank uploaded (driver banks, c1) or the user buffer in its pool
 struct BankCache {
     const Program* prog = nullptr;
@@ -2558,7 +2702,8 @@ thread_local bool grid_patch_want = false;
 thread_local uint64_t grid_patch_at = UINT64_MAX;
 thread_local VkBuffer grid_patch_buf = VK_NULL_HANDLE;   // (the stream c0 went to: PR 585's streams can move on)
 
-VkDescriptorBufferInfo uniform_range(const NvnState& s, const Stage& st, uint32_t index) {
+/// (bs: the bind cache's slot for a uniform buffer of the program, RX_VK_BIND_CACHE; null: resolved as always)
+VkDescriptorBufferInfo uniform_range(const NvnState& s, const Stage& st, uint32_t index, BindSlot* bs = nullptr) {
     VkDescriptorBufferInfo bi{VK_NULL_HANDLE, 0, VK_WHOLE_SIZE};
     const uint64_t align = std::max<uint64_t>(dev.props.limits.minUniformBufferOffsetAlignment, 16);
     uint32_t used = index < Shader::Info::MAX_CBUFS ? st.info.constant_buffer_used_sizes[index] : 0;
@@ -2643,24 +2788,56 @@ VkDescriptorBufferInfo uniform_range(const NvnState& s, const Stage& st, uint32_
         const uint64_t want = used ? std::max<uint64_t>(used, 16) : std::max<uint64_t>(u.size, 16);
         const uint64_t n = std::min<uint64_t>(std::min<uint64_t>(want, u.size ? std::max<uint64_t>(u.size, 16) : want),
                                               dev.props.limits.maxUniformBufferRange);
+        // (Ocarina Engine, RX_VK_BIND_CACHE) the same range, the same uniform updates, the same pools and submission: as kept
+        // (the stamps read first: a change while it is resolved below makes the next draw resolve it again)
+        uint64_t ub_stamp = 0, b_stamp = 0;
+        bool check_hit = false;
+        VkDescriptorBufferInfo kept{};
+        if (u.addr >= (1ull << 40)) bs = nullptr;   // (a virtual pool's: gpu_buffer_bind asks the host's page table each time)
+        if (bs) {
+            ub_stamp = ub_bind_stamp(), b_stamp = bind_cache_stamp();
+            if (bs->epoch == bind_cache_epoch && bs->src0 == u.addr && bs->src1 == n && bs->stamp == ub_stamp &&
+                bs->stamp2 == b_stamp) {
+                if (bind_cache_mode() == 1) {
+                    FINE_N(FC_BC_UBO, 1);
+                    return bs->buf;
+                }
+                check_hit = true, kept = bs->buf;
+            }
+            bs->epoch = 0;   // (kept again below only when this resolution may be)
+        }
+        auto checked = [&](VkDescriptorBufferInfo r) {
+            if (check_hit) bind_check(0, nullptr, index, same_buf(kept, r), (uint64_t)kept.buffer, kept.offset, kept.range,
+                                      (uint64_t)r.buffer, r.offset, r.range);
+            return r;
+        };
         // (updates the stream made to this range in this submission or ones still in flight: a copy with them in)
         // (room first: the overlay copies into the stream's mapping, which a move to a bigger stream in the middle would change)
         if (stream_reserve(n, align))
             if (const uint64_t at = ub_overlay(u.addr, n, cur->mapped, [&](uint64_t bytes) { return stream_alloc(bytes, align); });
                 at != UINT64_MAX) {
                 FINE_N(FC_UBO_OVERLAY, 1);
-                return {cur->stream, at, n};
+                return checked({cur->stream, at, n});
             }
         // (RX_VK_UB_SNAPSHOT=1: the contents as they are now, in the stream, not the pool the GPU reads later)
         static const bool snapshot = getenv("RX_VK_UB_SNAPSHOT") != nullptr;
         BufferRef b{};
+        bool memo = false;
         if (!snapshot) {   // (zero-travadas: its pool's import under way: nothing, and the copy below is what the draw reads)
             ImportCopyOk meanwhile(desc_copy_ok ? 2 : 0);
             b = gpu_buffer_bind(u.addr, n, false);
+            memo = gpu_bind_was_memo();
         }
-        if (b && b.offset % align == 0) return {b.buffer, b.offset, n};
+        if (b && b.offset % align == 0) {
+            const VkDescriptorBufferInfo r{b.buffer, b.offset, n};
+            if (bs && memo) {   // (RX_VK_BIND_CACHE: an answer gpu_buffer_bind keeps itself, under the stamps read above)
+                bs->epoch = bind_cache_epoch, bs->src0 = u.addr, bs->src1 = n, bs->stamp = ub_stamp, bs->stamp2 = b_stamp;
+                bs->buf = r;
+            }
+            return checked(r);
+        }
         const uint64_t at = stream_alloc(n, align);   // (unaligned or outside the pools: copied into the stream)
-        if (at == UINT64_MAX) return bi;
+        if (at == UINT64_MAX) return checked(bi);
         FINE_N(FC_UBO_STREAM, 1);
         // (as the submission had it, not as the game has rewritten it since: the captures' pages)
         memory_read_as_submitted(u.addr, cur->mapped + at, n);
@@ -2668,7 +2845,7 @@ VkDescriptorBufferInfo uniform_range(const NvnState& s, const Stage& st, uint32_
         if (++copied % 5000 == 1)
             logf("vk: uniform buffer %#llx +%#llx copied into the stream (%s; %lld so)", (unsigned long long)u.addr,
                  (unsigned long long)n, b ? "unaligned" : "outside the pools", (long long)copied);
-        return {cur->stream, at, n};
+        return checked({cur->stream, at, n});
     }
     return bi;
 }
@@ -2885,17 +3062,21 @@ void build_descriptors(const NvnState& s, const Program& p) {
     draw_sampled().clear();
     dump_written().clear();
     dump_inputs().clear();
-    size_t nbuf = 0, nimg = 0, nview = 0;
+    size_t nbuf = 0, nimg = 0, nview = 0, ncb = 0, nsb = 0, ntex = 0;
     for (const Stage& st : p.stages) {
-        for (const auto& d : st.info.constant_buffer_descriptors) nbuf += d.count;
-        for (const auto& d : st.info.storage_buffers_descriptors) nbuf += d.count;
+        for (const auto& d : st.info.constant_buffer_descriptors) nbuf += d.count, ncb += d.count;
+        for (const auto& d : st.info.storage_buffers_descriptors) nbuf += d.count, nsb += d.count;
         for (const auto& d : st.info.texture_buffer_descriptors) nview += d.count;
         for (const auto& d : st.info.image_buffer_descriptors) nview += d.count;
-        for (const auto& d : st.info.texture_descriptors) nimg += d.count;
+        for (const auto& d : st.info.texture_descriptors) nimg += d.count, ntex += d.count;
         for (const auto& d : st.info.image_descriptors) nimg += d.count;
     }
     dw().bufs.reserve(nbuf), dw().imgs.reserve(nimg), dw().views.reserve(nview);   // (stable pointers below)
     FINE_N(FC_DESCS, (int64_t)(nbuf + nimg + nview));
+    // (Ocarina Engine, RX_VK_BIND_CACHE: the kept bindings of this program; none in a dump, which logs every resolution)
+    const int bc_mode = bind_cache_mode();
+    ProgBinds* pb = bc_mode && !dump_on() ? prog_binds_for(p, ncb, nsb, ntex) : nullptr;
+    size_t cb_i = 0, sb_i = 0, tex_i = 0;   // (the slot of each descriptor in it)
     uint32_t binding = 0;
     auto write = [&](VkDescriptorType type, uint32_t count) {
         VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -2911,9 +3092,10 @@ void build_descriptors(const NvnState& s, const Program& p) {
         for (const auto& d : info.constant_buffer_descriptors) {
             VkWriteDescriptorSet w = write(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, d.count);
             const size_t first = dw().bufs.size();
-            for (uint32_t k = 0; k < d.count; k++) {
+            for (uint32_t k = 0; k < d.count; k++, cb_i++) {
                 const auto t0 = slow_desc_timing() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-                dw().bufs.push_back(uniform_range(s, st, d.index + k));
+                BindSlot* bs = pb && d.index + k >= 3 && cb_i < pb->ubo.size() ? &pb->ubo[cb_i] : nullptr;
+                dw().bufs.push_back(uniform_range(s, st, d.index + k, bs));
                 if (slow_desc_timing()) slow_descriptor(t0, "uniform buffer", d.index + k, dw().bufs.back().range);
             }
             w.pBufferInfo = &dw().bufs[first];
@@ -2924,7 +3106,7 @@ void build_descriptors(const NvnState& s, const Program& p) {
             FINE_N(FC_SSBO_DESCS, d.count);
             VkWriteDescriptorSet w = write(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, d.count);
             const size_t first = dw().bufs.size();
-            for (uint32_t k = 0; k < d.count; k++) {
+            for (uint32_t k = 0; k < d.count; k++, sb_i++) {
                 const uint32_t off = d.cbuf_offset + k * 16;
                 if (d.count == 1 && d.cbuf_index == 0 && d.cbuf_offset == 0xff0) {   // (EvilOOT, RX_VK_MISS_LOG)
                     dw().bufs.push_back(miss_binding(p.key));
@@ -2936,6 +3118,28 @@ void build_descriptors(const NvnState& s, const Program& p) {
                 const uint64_t addr = stage_cbuf_word(s, st, d.cbuf_index, off) |
                                       (uint64_t)stage_cbuf_word(s, st, d.cbuf_index, off + 4) << 32;
                 uint64_t size = stage_cbuf_word(s, st, d.cbuf_index, off + 8);
+                // (Ocarina Engine, RX_VK_BIND_CACHE) one the program only reads: the same words, pools, mirrors and submission, as
+                // kept. A written one is resolved every time: its binding marks the pool written, queues its write-back and stamps it
+                // (and below 1 TB, where the address is the guest's: a virtual pool's binding asks the host's page table each time)
+                BindSlot* bs = pb && !d.is_written && addr < (1ull << 40) && sb_i < pb->ssbo.size() ? &pb->ssbo[sb_i] : nullptr;
+                uint64_t sb_src1 = 0, sb_stamp = 0;
+                bool sb_check = false;
+                VkDescriptorBufferInfo sb_kept{};
+                if (bs) {
+                    const uint64_t w12 = info.native_global_bounds && d.count == 1 && d.cbuf_index != 0
+                                             ? stage_cbuf_word(s, st, d.cbuf_index, off + 12) : 0;
+                    sb_src1 = size | w12 << 32, sb_stamp = bind_cache_stamp();
+                    if (bs->epoch == bind_cache_epoch && bs->src0 == addr && bs->src1 == sb_src1 && bs->stamp == sb_stamp) {
+                        if (bc_mode == 1) {
+                            FINE_N(FC_BC_SSBO, 1);
+                            dw().bufs.push_back(bs->buf);
+                            continue;
+                        }
+                        sb_check = true, sb_kept = bs->buf;
+                    }
+                    bs->epoch = 0;
+                }
+                bool sb_keep = bs != nullptr;   // (cleared below where the resolution may not be kept)
                 // (EvilOOT) a table entry that is a bare pointer (its size word 0, as OoT's culling setup keeps them): bound up to
                 // 1 MB of its pool, as the mesh pointer table's regions are; the shader takes the binding's length as its end.
                 // Not marked written: the 1 MB is a guess past the real buffer, and its copy back to guest memory overwrote
@@ -2996,12 +3200,15 @@ void build_descriptors(const NvnState& s, const Program& p) {
                 if (addr && plausible) {   // (zero-travadas: one buffer of its own size the program only reads may come from a copy meanwhile)
                     ImportCopyOk meanwhile(desc_copy_ok && !d.is_written && !bare && d.count == 1 ? 1 : 0);
                     b = gpu_buffer_bind(base, n, d.is_written && !bare);
+                    sb_keep = sb_keep && b && gpu_bind_was_memo();   // (RX_VK_BIND_CACHE: only what gpu_buffer_bind keeps itself)
                 }
+                if (wide_n) sb_keep = false;
                 // (AyyBeeDee20738, PR 138) a table entry's region that does not fit its pool this moment bound nothing, and the next
                 // frame bound it again: its reads flipped between the data and 0, the picture between bright and dark. Smaller,
                 // down to 1 MB, rather than nothing (and past what is bound the shaders' search now goes on to the page table)
                 static const bool no_shrink = getenv("RX_VK_NO_TABLE_SHRINK") != nullptr;   // (A/B: unbound as before)
                 if (!b.buffer && d.count > 1 && addr && plausible && !no_shrink) {
+                    sb_keep = false;
                     uint64_t m = n;
                     if (const uint64_t end = gpu_pool_end(base); end > base) m = std::min<uint64_t>(m, end - base);
                     for (; !b.buffer && m >= (1ull << 20); m = (m / 2) & ~3ull) {
@@ -3136,6 +3343,15 @@ void build_descriptors(const NvnState& s, const Program& p) {
                 dw().bufs.push_back(b ? VkDescriptorBufferInfo{b.buffer, b.offset, n}
                                     : VkDescriptorBufferInfo{dev.null_descriptor ? VK_NULL_HANDLE : zero_buffer, 0,
                                                              dev.null_descriptor ? VK_WHOLE_SIZE : 16});
+                if (sb_check) {
+                    const VkDescriptorBufferInfo& r = dw().bufs.back();
+                    bind_check(1, &p, sb_i, same_buf(sb_kept, r), (uint64_t)sb_kept.buffer, sb_kept.offset, sb_kept.range,
+                               (uint64_t)r.buffer, r.offset, r.range);
+                }
+                if (sb_keep) {   // (RX_VK_BIND_CACHE: under the stamp read before it was resolved)
+                    bs->epoch = bind_cache_epoch, bs->src0 = addr, bs->src1 = sb_src1, bs->stamp = sb_stamp;
+                    bs->buf = dw().bufs.back();
+                }
                 {   // (RX_VK_LOG_WRITTEN=1: every storage buffer range a program writes, once, 300 of them)
                     static const bool on = getenv("RX_VK_LOG_WRITTEN") != nullptr;
                     if (on && d.is_written) {
@@ -3185,7 +3401,7 @@ void build_descriptors(const NvnState& s, const Program& p) {
             VkWriteDescriptorSet w = write(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, d.count);
             const size_t first = dw().imgs.size();
             const VkImageViewType vt = view_type(d.type);
-            for (uint32_t k = 0; k < d.count; k++) {
+            for (uint32_t k = 0; k < d.count; k++, tex_i++) {
                 // (Fritchii d603d98bb) A handle word where a storage buffer of the same program keeps its address is not a
                 // handle: OoT's water samples each light's texture with a handle loaded per pixel from the light buffer, and
                 // the translation falls back to the first constant word on its path, c0[0x520], the light buffer's address.
@@ -3194,14 +3410,62 @@ void build_descriptors(const NvnState& s, const Program& p) {
                 // (fragment stages only, the water's case: in other stages (the foliage culling's) the textures went missing and
                 // the foliage was culled whenever Link swung his sword. RX_VK_HANDLE_POINTER_ALL=1: every stage, as before)
                 static const bool all_stages = getenv("RX_VK_HANDLE_POINTER_ALL") != nullptr;
-                const uint32_t handle = ((all_stages || st.vk_stage == VK_SHADER_STAGE_FRAGMENT_BIT) && handle_is_storage_pointer(info, d, k))
-                                            ? 0u : handle_of(s, st, d, k);
+                // (Ocarina Engine, RX_VK_BIND_CACHE: the slot's kept texture. Not with RX_VK_SAMPLER_CACHE=0, whose samplers are
+                // made again at each binding)
+                static const bool tex_keep_ok = !getenv("RX_VK_SAMPLER_CACHE") || atoi(getenv("RX_VK_SAMPLER_CACHE")) != 0;
+                BindSlot* bs = pb && tex_keep_ok && tex_i < pb->tex.size() ? &pb->tex[tex_i] : nullptr;
+                bool pointer;
+                if (bs && bs->pointer >= 0) {
+                    pointer = bs->pointer != 0;   // (the program's own: answered once)
+                } else {
+                    pointer = (all_stages || st.vk_stage == VK_SHADER_STAGE_FRAGMENT_BIT) && handle_is_storage_pointer(info, d, k);
+                    if (bs) bs->pointer = pointer ? 1 : 0;
+                }
+                const uint32_t handle = pointer ? 0u : handle_of(s, st, d, k);
                 desc_fp_note(handle);   // (RX_VK_DESC_SLOTGEN)
+                // (RX_VK_BIND_CACHE) the same handle, its slot not registered anew, the same samplers, no texture gone since (or
+                // this one outlived them): as kept, touched once a submission as texture_view_of's map does
+                uint64_t tx_samp = 0, tx_dgen = 0;
+                uint32_t tx_ver = 0, tx_epoch = 0;
+                bool tx_check = false;
+                VkImageView tx_kept_view = VK_NULL_HANDLE;
+                VkSampler tx_kept_samp = VK_NULL_HANDLE;
+                if (bs) {   // (the generations first: a change while it is resolved below makes the next draw resolve it again)
+                    tx_samp = sampler_registrations_generation(), tx_dgen = texture_destroy_generation(), tx_epoch = texture_epoch();
+                    tx_ver = handle ? texture_slot_version((int)(handle & 0xFFFFF)) : 0;
+                    bool hit = bs->epoch == bind_cache_epoch && bs->src0 == handle && bs->stamp == tx_samp && bs->version == tx_ver;
+                    if (hit && handle && bs->dgen != tx_dgen) {
+                        static const bool gone_exact = !getenv("RX_VK_TEX_GONE_EXACT") || atoi(getenv("RX_VK_TEX_GONE_EXACT")) != 0;
+                        if (gone_exact && bs->tex && bs->view && texture_outlived(bs->tex, bs->dgen)) bs->dgen = tx_dgen;
+                        else hit = false;
+                    }
+                    if (hit && bs->tex && bs->tex_epoch != tx_epoch) {
+                        if (!texture_touch_quick(bs->tex, true)) {
+                            ParLock lk;
+                            texture_touch(bs->tex, true);
+                        }
+                        bs->tex_epoch = tx_epoch;
+                    }
+                    if (hit) {
+                        if (bc_mode == 1) {
+                            FINE_N(FC_BC_TEX, 1);
+                            if (bs->view && bs->tex && bs->tex->gpu_written) draw_sampled().push_back(bs->tex);
+                            VkImageView v = bs->view;
+                            if (!v) v = dummies.view[(int)vt], st_dummy_textures += handle != 0;
+                            dw().imgs.push_back({bs->sampler, v, VK_IMAGE_LAYOUT_GENERAL});
+                            continue;
+                        }
+                        tx_check = true, tx_kept_view = bs->view, tx_kept_samp = bs->sampler;
+                    }
+                    bs->epoch = 0;
+                }
                 Texture* tex = nullptr;
                 upload_defer_ok = st.vk_stage != VK_SHADER_STAGE_COMPUTE_BIT;   // (a draw's: its new ASTC textures may wait a frame)
                 VkImageView view = handle ? texture_view_of(handle, vt, ViewUse::Sample, VK_FORMAT_UNDEFINED, &tex)
                                           : VK_NULL_HANDLE;
                 upload_defer_ok = false;
+                const VkImageView resolved_view = view;   // (RX_VK_BIND_CACHE: before the dummy)
+                Texture* const resolved_tex = tex;
                 if (dump_on()) dump_input('t', (uint32_t)(dw().imgs.size() - 0), handle, view ? tex : nullptr);
                 if (view && tex && trace_tex_wanted(tex)) trace_tex_hit = tex;
                 if (log_img_wanted(p.key)) {
@@ -3228,7 +3492,15 @@ void build_descriptors(const NvnState& s, const Program& p) {
                                (void*)view, view ? "" : " (dummy)");
                 if (view && tex && tex->gpu_written) draw_sampled().push_back(tex);
                 if (!view) view = dummies.view[(int)vt], st_dummy_textures += handle != 0;
-                dw().imgs.push_back({sampler_for((int)(handle >> 20), d.is_depth), view, VK_IMAGE_LAYOUT_GENERAL});
+                const VkSampler samp = sampler_for((int)(handle >> 20), d.is_depth);
+                dw().imgs.push_back({samp, view, VK_IMAGE_LAYOUT_GENERAL});
+                if (tx_check)
+                    bind_check(2, &p, tex_i, tx_kept_view == resolved_view && tx_kept_samp == samp, handle, (uint64_t)tx_kept_view,
+                               (uint64_t)tx_kept_samp, handle, (uint64_t)resolved_view, (uint64_t)samp);
+                if (bs && samp) {   // (a sampler that failed is tried again, as sampler_for does)
+                    bs->epoch = bind_cache_epoch, bs->src0 = handle, bs->stamp = tx_samp, bs->version = tx_ver;
+                    bs->dgen = tx_dgen, bs->tex_epoch = tx_epoch, bs->view = resolved_view, bs->tex = resolved_tex, bs->sampler = samp;
+                }
             }
             w.pImageInfo = &dw().imgs[first];
             dw().writes.push_back(w);
@@ -3278,6 +3550,7 @@ void build_descriptors(const NvnState& s, const Program& p) {
 struct Pushed {
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
+    const Program* prog = nullptr;               // (Ocarina Engine: the program that pushed last, for the fine counts)
     size_t n = 0;                                // (the writes as pushed)
     std::vector<std::vector<uint64_t>> writes;   // (each write's descriptors, as pushed; RX_VK_PUSH_STATE_OLD=1)
     // (hookshot) the same in one vector of words and where each write's begin: a program change was a vector of vectors resized to the
@@ -3293,7 +3566,17 @@ TLS_OBJECT(pushed, std::array<Pushed, 2>)   // [graphics, compute]
 VkResult shared_compute_pipeline(const VkComputePipelineCreateInfo* ci, VkPipeline* out) {
     return cached_compute(ci, out);
 }
-void draw_skip_report(double frames) { skip_report_impl(frames), fine_report(frames); }
+void draw_skip_report(double frames) {
+    skip_report_impl(frames), fine_report(frames);
+    if (bind_cache_mode() == 2) {   // (Ocarina Engine, RX_VK_BIND_CACHE=check: what the kept bindings were worth, since the last line)
+        const int64_t n = st_bc_checked.exchange(0, std::memory_order_relaxed);
+        const int64_t u = st_bc_diff[0].exchange(0, std::memory_order_relaxed), b = st_bc_diff[1].exchange(0, std::memory_order_relaxed),
+                      t = st_bc_diff[2].exchange(0, std::memory_order_relaxed);
+        logf("vk: bind cache check: %lld kept bindings resolved again, %lld differed (uniform buffers %lld, storage buffers %lld, "
+             "textures %lld)%s", (long long)n, (long long)(u + b + t), (long long)u, (long long)b, (long long)t,
+             u + b + t ? " <- NOT the same: RX_VK_BIND_CACHE=0 until it is understood" : "");
+    }
+}
 /// (zero-travadas) Every 600 presents: the resolved handles that outlived other textures' ends, and the ones looked up again
 void draw_zero_report() {
     static const bool gone_exact = !getenv("RX_VK_TEX_GONE_EXACT") || atoi(getenv("RX_VK_TEX_GONE_EXACT")) != 0;
@@ -3380,7 +3663,7 @@ bool bind_descriptors(VkCommandBuffer cmd, VkPipelineBindPoint bp, const Program
     if (p.push) {
         static const bool whole = getenv("RX_VK_PUSH_ALL") != nullptr;   // (A/B: every binding every time)
         static const bool old_state = getenv("RX_VK_PUSH_STATE_OLD") != nullptr;   // (A/B: a vector of words a write, as before)
-        if (whole || ps.cmd != cmd || ps.layout != p.layout || ps.n != dw().writes.size()) {
+        if (whole || ps.cmd != cmd || ps.n != dw().writes.size() || !layouts_compatible(ps.layout, p.layout)) {
             if (g_fine) {
                 fine_n[FC_PUSH_FULL]++, fine_n[FC_PUSH_WRITES] += (int64_t)dw().writes.size();
                 for (const VkWriteDescriptorSet& w : dw().writes) fine_n[FC_PUSH_DESCS] += w.descriptorCount;
@@ -3389,7 +3672,7 @@ bool bind_descriptors(VkCommandBuffer cmd, VkPipelineBindPoint bp, const Program
                 FINE_SCOPE(FT_PUSHCALL);
                 vkCmdPushDescriptorSetKHR(cmd, bp, p.layout, 0, (uint32_t)dw().writes.size(), dw().writes.data());
             }
-            ps.cmd = cmd, ps.layout = p.layout, ps.n = dw().writes.size();
+            ps.cmd = cmd, ps.layout = p.layout, ps.n = dw().writes.size(), ps.prog = &p;
             if (old_state) {
                 ps.writes.resize(dw().writes.size());
                 for (size_t i = 0; i < dw().writes.size(); i++) write_words(dw().writes[i], ps.writes[i]);
@@ -3418,6 +3701,8 @@ bool bind_descriptors(VkCommandBuffer cmd, VkPipelineBindPoint bp, const Program
                 if (!same) changed.push_back(dw().writes[i]);
             }
         }
+        if (g_fine && ps.layout != p.layout) fine_n[FC_PUSH_CROSS]++;   // (another layout's push stood: RX_VK_LAYOUT_SHARE)
+        ps.prog = &p, ps.layout = p.layout;
         if (!changed.empty()) {
             if (g_fine) {
                 fine_n[FC_PUSH_DELTA]++, fine_n[FC_PUSH_WRITES] += (int64_t)changed.size();
@@ -4499,6 +4784,7 @@ void draw_begin_recording(int slot, VkCommandBuffer cmd, uint64_t value) {
     last_dyn_valid = false, last_desc_valid = false, last_vb_valid = false, last_pipeline = VK_NULL_HANDLE;
     vertex_set.on = false, last_ib.on = false;
     descriptors_disturbed();
+    bind_cache_epoch++;   // (Ocarina Engine, RX_VK_BIND_CACHE: each recording begins with nothing kept)
     static thread_local uint64_t hits_value = ~0ull;   // (resolved targets last a submission, through its parts: no CPU write is
     if (value != hits_value) {            // collected between them; resolved handles last while their slot and
         hits_value = value;               // texture do, and are touched again once a submission)
@@ -5929,6 +6215,7 @@ void bind_index(VkCommandBuffer cmd, VkBuffer buffer, VkDeviceSize offset, VkInd
     const uint64_t b = (uint64_t)(uintptr_t)buffer;
     if (index_bind_same(b, (uint64_t)offset, (uint32_t)type, last_ib.buffer, last_ib.offset, last_ib.type, last_ib.on))
         return;
+    FINE_N(FC_IB_CMDS, 1);
     vkCmdBindIndexBuffer(cmd, buffer, offset, type);
     last_ib = {b, (uint64_t)offset, (uint32_t)type, true};
 }
@@ -6651,6 +6938,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     } else if (d.indexed) {
         const uint32_t unit = d.itype == 0 ? 1 : d.itype == 1 ? 2 : 4;
         BufferRef ib;
+        uint32_t first_index = 0;
         {
             FINE_SCOPE(FT_VERTEX);
             {   // (zero-travadas: as the vertex streams above)
@@ -6659,10 +6947,21 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
             }
             if (!ib) SKIP_HERE();
             FINE_N(FC_IBIND, 1);
-            bind_index(cmd, ib.buffer, ib.offset, itype);
+            // (Ocarina Engine) RX_VK_INDEX_BASE (on; =0: as before): the buffer bound from its start and the draw's indices found by
+            // firstIndex. Draws one after another read their indices from the same pool at other places: each was a bind of the
+            // index buffer at its own offset; now the bind stands for every draw out of that pool (and the index type)
+            static const bool rebase = !getenv("RX_VK_INDEX_BASE") || atoi(getenv("RX_VK_INDEX_BASE")) != 0;
+            if (rebase && ib.offset % unit == 0 && ib.offset / unit + (uint64_t)std::max(d.count, 0) <= 0xFFFFFFFFull) {
+                first_index = (uint32_t)(ib.offset / unit);
+                FINE_N(FC_IB_REBASED, 1);
+                bind_index(cmd, ib.buffer, 0, itype);
+            } else {
+                bind_index(cmd, ib.buffer, ib.offset, itype);
+            }
         }
         FINE_SCOPE(FT_DRAWCALL);
-        vkCmdDrawIndexed(cmd, (uint32_t)d.count, (uint32_t)std::max(1, d.instances), 0, d.base_vertex, (uint32_t)d.base_instance);
+        vkCmdDrawIndexed(cmd, (uint32_t)d.count, (uint32_t)std::max(1, d.instances), first_index, d.base_vertex,
+                         (uint32_t)d.base_instance);
     } else {
         FINE_SCOPE(FT_DRAWCALL);
         vkCmdDraw(cmd, (uint32_t)d.count, (uint32_t)std::max(1, d.instances), (uint32_t)d.first, (uint32_t)d.base_instance);
@@ -7385,10 +7684,14 @@ bool warm_libraries(void (*progress)(size_t done, size_t total)) {
             }
         variants++;
     };
-    const auto worker = [&] {
+    const auto worker = [&](unsigned me, unsigned of) {
         ub_thread_off();   // (a background thread: see ub_thread_off)
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);   // (as prepare_run's, and half the CPUs)
         for (;;) {
+            while (!prep_worker_may_run(me, of) && next.load() < total) {   // (Ocarina Engine: the RAM guard, vk_memory.cpp)
+                if (prepare_stopped()) return;
+                Sleep(50);
+            }
             if (prepare_stopped()) return;
             const size_t i = next++;
             if (i >= total) return;
@@ -7402,7 +7705,8 @@ bool warm_libraries(void (*progress)(size_t done, size_t total)) {
     };
     std::vector<std::thread> threads;
     const unsigned cpus = std::max(1u, std::thread::hardware_concurrency());
-    for (unsigned i = 0; i < std::clamp(cpus / 2, 1u, 32u); i++) threads.emplace_back(worker);
+    const unsigned nthreads = std::clamp(cpus / 2, 1u, 32u);
+    for (unsigned i = 0; i < nthreads; i++) threads.emplace_back(worker, i, nthreads);
     while (done.load() < total && !prepare_stopped()) {
         if (progress) progress(done.load(), total);
         Sleep(100);
@@ -7414,6 +7718,7 @@ bool warm_libraries(void (*progress)(size_t done, size_t total)) {
              done.load(), total);
         return false;
     }
+    prep_ram_summary("stage libraries warmed");
     logf("vk: warmed %zu stage libraries of %zu kept shader program variants (%zu programs, the %zu the notes name first) in %.1f s",
          libs.load(), variants.load(), total, named, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     if (gpl_libs_cached()) {
@@ -7525,14 +7830,18 @@ bool prepare_run(void (*progress)(size_t done, size_t total), bool background) {
             libs++;
             pcache_built_since_save++;
         }
-        if (p.layout) vkDestroyPipelineLayout(dev.device, p.layout, nullptr), p.layout = VK_NULL_HANDLE;
+        if (p.layout) layout_shape_forget(p.layout), vkDestroyPipelineLayout(dev.device, p.layout, nullptr), p.layout = VK_NULL_HANDLE;
         if (p.set_layout) vkDestroyDescriptorSetLayout(dev.device, p.set_layout, nullptr), p.set_layout = VK_NULL_HANDLE;
     };
-    const auto worker = [&] {
+    const auto worker = [&](unsigned me, unsigned of) {
         ub_thread_off();   // (a background thread: see ub_thread_off)
         // (below normal, and half the CPUs, below: on all of them at High the driver's compiles froze the whole PC)
         SetThreadPriority(GetCurrentThread(), background ? THREAD_PRIORITY_IDLE : THREAD_PRIORITY_BELOW_NORMAL);
         for (;;) {
+            while (!prep_worker_may_run(me, of) && next.load() < total) {   // (Ocarina Engine: the RAM guard, vk_memory.cpp)
+                if (prepare_stopped()) return;
+                Sleep(50);
+            }
             if (prepare_stopped()) return;
             const size_t i = next++;
             if (i >= total) return;
@@ -7570,7 +7879,7 @@ bool prepare_run(void (*progress)(size_t done, size_t total), bool background) {
     const unsigned cpus = std::max(1u, std::thread::hardware_concurrency());
     // (in play: a quarter of the CPUs, two to four, the game's own threads before them)
     const unsigned workers = background ? std::clamp(cpus / 4, 2u, 4u) : std::clamp(cpus / 2, 1u, 32u);
-    for (unsigned i = 0; i < workers; i++) threads.emplace_back(worker);
+    for (unsigned i = 0; i < workers; i++) threads.emplace_back(worker, i, workers);
     while (done.load() < total && !prepare_stopped()) {
         if (progress) progress(done.load() / 3, programs);   // (in programs, as the log counts them, not programs times variants)
         Sleep(100);
@@ -7587,6 +7896,7 @@ bool prepare_run(void (*progress)(size_t done, size_t total), bool background) {
     }
     int64_t translated = 0, failed = 0;
     shader_stats(&translated, &failed);
+    prep_ram_summary("shader programs prepared");
     logf("vk: prepared %zu shader programs%s (%zu new, %lld failed, %zu compute pipelines; %zu compute variants, %zu programs with "
          "texture variants, %zu at the limit) in %.1f s", programs, background ? " in play" : "", made.load(), (long long)failed, libs.load(), variants.load(),
          asking.load(), capped.load(), std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
@@ -7687,12 +7997,16 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
     pre->notes = std::move(notes), pre->computes = std::move(computes), pre->fallbacks = std::move(fallbacks);
     auto& next = pre->next;
     auto& done = pre->done;
-    const auto worker = [pre, total] {
+    const auto worker = [pre, total](unsigned me, unsigned of) {
         ub_thread_off();   // (a background thread: see ub_thread_off)
         auto& notes = pre->notes;
         auto& computes = pre->computes;
         auto& fallbacks = pre->fallbacks;
         for (;;) {
+            while (!prep_worker_may_run(me, of) && pre->next.load() < total) {   // (Ocarina Engine: the RAM guard, vk_memory.cpp)
+                if (prepare_stopped()) return;
+                Sleep(50);
+            }
             if (prepare_stopped()) return;
             const size_t i = pre->next++;
             if (i >= total) return;
@@ -7748,7 +8062,8 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
     };
     std::vector<std::thread> threads;
     const unsigned cpus = std::max(1u, std::thread::hardware_concurrency());
-    for (unsigned i = 0; i < std::min(cpus, 64u); i++) threads.emplace_back(worker);
+    const unsigned nthreads = std::min(cpus, 64u);
+    for (unsigned i = 0; i < nthreads; i++) threads.emplace_back(worker, i, nthreads);
     static const int stall_s = getenv("RX_VK_PRECOMPILE_STALL_S") ? atoi(getenv("RX_VK_PRECOMPILE_STALL_S")) : 30;
     size_t last_done = 0;
     auto last_change = std::chrono::steady_clock::now();
@@ -7774,6 +8089,7 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
         for (std::thread& t : threads) t.join();
         delete pre;
     }
+    prep_ram_summary("precompile");
     logf("vk: precompile: %zu programs, %zu graphics and %zu compute pipelines, %zu mesh fallback programs in %.0f ms (%.0f ms "
          "of it the caches opened, the notes and programs read)", programs_n, graphics_n, computes_n, fallbacks_n,
          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), read_ms);
@@ -7830,10 +8146,14 @@ void predict_run(void (*progress)(size_t done, size_t total)) {
     // next start), and they take every CPU: nothing else runs before the game
     static const int budget_s = getenv("RX_VK_PREDICT_S") ? atoi(getenv("RX_VK_PREDICT_S")) : 0;
     std::atomic<bool> out_of_time{false};
-    const auto worker = [&] {
+    const auto worker = [&](unsigned me, unsigned of) {
         ub_thread_off();   // (a background thread: see ub_thread_off)
         driver_cache_only = true;
         for (;;) {
+            while (!prep_worker_may_run(me, of) && next.load() < keys.size()) {   // (Ocarina Engine: the RAM guard, vk_memory.cpp)
+                if (prepare_stopped()) return;
+                Sleep(50);
+            }
             if (prepare_stopped()) return;
             if (budget_s > 0 && std::chrono::steady_clock::now() - t0 > std::chrono::seconds(budget_s)) {
                 out_of_time = true;
@@ -7855,7 +8175,8 @@ void predict_run(void (*progress)(size_t done, size_t total)) {
     };
     std::vector<std::thread> threads;
     const unsigned cpus = std::max(1u, std::thread::hardware_concurrency());
-    for (unsigned i = 0; i < std::min(cpus, 64u); i++) threads.emplace_back(worker);
+    const unsigned nthreads = std::min(cpus, 64u);
+    for (unsigned i = 0; i < nthreads; i++) threads.emplace_back(worker, i, nthreads);
     while (next.load() < keys.size() + threads.size() && !prepare_stopped() && !out_of_time.load()) {
         if (progress) progress(done.load(), predicted.size());
         Sleep(100);
@@ -7863,6 +8184,7 @@ void predict_run(void (*progress)(size_t done, size_t total)) {
     for (std::thread& t : threads) t.join();
     if (progress) progress(done.load(), predicted.size());
     const double all_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    prep_ram_summary("predicted pipelines built");
     logf("vk: predicted %zu pipelines from %zu notes for %zu program variants no note names: %zu made in %.1f s (%.1f s deciding them, "
          "%.1f s building them on %zu threads)%s", predicted.size(), notes.size(), programs, made.load(), all_s, decide_s, all_s - decide_s,
          threads.size(),

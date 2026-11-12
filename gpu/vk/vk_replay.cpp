@@ -47,6 +47,7 @@
 #include "vk_xfer.h"
 #include "vk_present_rect.h"
 #include "vk_present_trace.h"
+#include "ocarina_report.h"   // (ocarina: the frame ring of the menu's Gerar relatório)
 
 #include "vk_internal.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
@@ -82,13 +83,25 @@ std::atomic<uint64_t> q_values{0};   // the fence values handed out (a submit or
                                          // a thread recorded is drained before another may take it)
 // (RX_VK_RECORDER=thread: the recorder thread named, and above normal priority as par_worker_main's threads)
 // RX_VK_RECORDER_PIN (experiment): next = the physical core below the reserved one (the replay thread's: hos_reserved_cpus),
-// sibling = the reserved core itself (shares it with the replay thread), or a hex mask; unset: not pinned
+// sibling = the reserved core itself (shares it with the replay thread), or a hex mask.
+// (Ocarina Engine) Unset: every processor of the process but the reserved core's. The recorder runs while the replay thread
+// records, on the reserved core while it replays (ReplayPin); a new thread is given the process's processors, the reserved core
+// among them, and above normal priority the recorder could take that core from the replay it works for
 const bool rec_thread_hook = (::mkwvk::rec::g_thread_start_hook = [] {
     SetThreadDescription(GetCurrentThread(), L"mkw_vk recorder");
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     const char* pin = getenv("RX_VK_RECORDER_PIN");
-    if (!pin || !*pin) return;
     const uint64_t reserved = host && host->reserved_cpus ? host->reserved_cpus() : 0;
+    if (!pin || !*pin) {
+        DWORD_PTR proc = 0, sys = 0;
+        if (!reserved || !GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys)) return;
+        const uint64_t off_reserved = (uint64_t)proc & ~reserved;
+        const bool ok = off_reserved && SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)off_reserved) != 0;
+        ::mkwvk::logf("vk: the recorder thread %s logical processors %#llx, off the replay's reserved %#llx (RX_VK_RECORDER_PIN: "
+                      "a mask of its own)", ok ? "runs on" : "could NOT be kept to", (unsigned long long)off_reserved,
+                      (unsigned long long)reserved);
+        return;
+    }
     uint64_t m = 0;
     if (!strcmp(pin, "next")) m = reserved ? reserved >> __builtin_popcountll(reserved) : 0;
     else if (!strcmp(pin, "sibling")) m = reserved;
@@ -521,6 +534,17 @@ void ub_prune(uint64_t done) {
 
 uint64_t ub_generation() {
     return ub_gen;
+}
+uint64_t ub_bind_stamp() {
+    // (what ub_overlay reads to decide: the updates in [first, lim) of the list. The list changes only by updates added or
+    // the done ones pruned, each of which moves its epoch; this thread's part of it is lim (and first, RX_VK_UB_CUR_ONLY))
+    const size_t lim = ub_limit ? std::min(ub_limit, ub_updates.size()) : 0;
+    static const bool cur_only = getenv("RX_VK_UB_CUR_ONLY") != nullptr;
+    const size_t first = cur_only ? std::min(ub_first_of_recording, lim) : 0;
+    uint64_t h = ub_list_epoch.load(std::memory_order_relaxed) * 0x9E3779B97F4A7C15ull;
+    h ^= (uint64_t)lim + 0x632BE59BD9B4E019ull + (h << 6) + (h >> 2);
+    h ^= (uint64_t)first + 0x85EBCA77C2B2AE63ull + (h << 6) + (h >> 2);
+    return h;
 }
 void ub_thread_off() {
     ub_limit = 0;
@@ -1638,6 +1662,7 @@ void bench_frame(int64_t presents) {
     for (int i = 0; i < times; i++) {
         vkDeviceWaitIdle(dev.device);
         ub_updates.resize(ub_before);   // (the last time's uniform updates are written: as if pruned)
+        ub_list_epoch.fetch_add(1, std::memory_order_relaxed);   // (Ocarina Engine: as a prune does, for ub_bind_stamp)
         const auto t0 = std::chrono::steady_clock::now();
         for (const auto& h : frame_submits) bench_replay(h);
         ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
@@ -2134,8 +2159,39 @@ uint64_t fence_q(uint64_t queue) {
     auto it = q_last.find(queue);
     return it != q_last.end() ? it->second : fence();
 }
+// (Ocarina Engine, rumo aos 60 fps) the game's blocking fence waits, by what they wait for: the replay that has not recorded
+// the fence's work yet, or the GPU running work already recorded. A line every 5 s: "vk: game's fence waits".
+namespace {
+std::atomic<int64_t> gw_ns[2], gw_n[2];
+std::atomic<int64_t> gw_last{0};
+struct GameWaitNote {
+    int kind; int64_t t0;
+    GameWaitNote(int k) : kind(k), t0(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()) {}
+    ~GameWaitNote() {
+        if (kind < 0) return;   // (a poll: not a wait)
+        const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        gw_ns[kind] += now - t0; gw_n[kind]++;
+        int64_t l = gw_last.load();
+        if (!l) { gw_last.compare_exchange_strong(l, now); return; }
+        if (now - l >= 5000000000LL && gw_last.compare_exchange_strong(l, now))
+            logf("vk: game's fence waits in 5 s: for the replay to record %lld (%.0f ms), for the GPU to run recorded work %lld (%.0f ms)",
+                 (long long)gw_n[0].exchange(0), gw_ns[0].exchange(0) / 1e6, (long long)gw_n[1].exchange(0), gw_ns[1].exchange(0) / 1e6);
+    }
+};
+}
 int wait(uint64_t f, uint64_t timeout_ns) {
     if (completed() >= f) return 1;
+    bool recorded_f = false;
+    if (timeout_ns) {
+        std::lock_guard mk(rec_map_mu);
+        recorded_f = value_rec.find(f) != value_rec.end();
+    }
+    GameWaitNote note_(!timeout_ns ? -1 : recorded_f ? 1 : 0);
+    // (Ocarina Engine, EXPERIMENT RX_VK_FENCE_AT_RECORD=1) a blocking wait for work already recorded and submitted is answered at
+    // once: the game runs a frame further ahead of the GPU. Safe only where the GPU reads captured copies, not live guest memory:
+    // an experiment to measure the frame rate held in this wait
+    static const bool at_record = getenv("RX_VK_FENCE_AT_RECORD") && atoi(getenv("RX_VK_FENCE_AT_RECORD")) != 0;
+    if (at_record && timeout_ns && recorded_f) { queue_flush_for(FR_WAIT); return 1; }
     queue_flush_for(FR_WAIT);
     // (hookshot) a fence of one queue whose work up to it is recorded whole (none of it stopped): that work, not the other
     // queues' stopped work the timeline above waits for (which a wait for it forced past its waits after RX_VK_WAIT_HOLD_US)
@@ -2559,6 +2615,145 @@ void blit_crop(VkCommandBuffer cmd, VkImage src, uint32_t sw, uint32_t sh, const
     blit_crop_to_rect(cmd, src, sw, sh, crop, dst, dst_layout, {0, 0, dw, dh});
 }
 
+// (ocarina) The picture of the problem report and of the bug key (ocarina_report.h shot_wanted): the game's picture as presented
+// (its crop, at its own output size, without the menu), blitted to an RGBA8 image and copied to a host buffer in the present's
+// recording; once the GPU is past that present, a thread of its own copies it out and hands it over, and the next present lets the
+// memory go. Nothing waits for the GPU and nothing is made until a picture is asked for
+struct OcarinaShot {
+    VkImage image = VK_NULL_HANDLE;
+    VmaAllocation image_alloc = nullptr;
+    VkBuffer buf = VK_NULL_HANDLE;
+    VmaAllocation buf_alloc = nullptr;
+    void* map = nullptr;
+    uint32_t w = 0, h = 0;
+    uint64_t value = 0;   // (the present's value it is recorded in; 0: none waiting)
+    std::atomic<bool> reading{false};
+} oshot;
+void ocarina_shot_free() {
+    if (oshot.buf) destroy_buffer(oshot.buf, oshot.buf_alloc);
+    if (oshot.image) destroy_image(oshot.image, oshot.image_alloc);
+    oshot.buf = VK_NULL_HANDLE, oshot.buf_alloc = nullptr, oshot.map = nullptr;
+    oshot.image = VK_NULL_HANDLE, oshot.image_alloc = nullptr, oshot.w = oshot.h = 0;
+}
+/// (each present, the replay thread) the picture recorded before, read once the GPU is past it; the memory let go after
+void ocarina_shot_poll() {
+    if (oshot.reading.load(std::memory_order_acquire)) return;
+    if (oshot.value && completed() >= oshot.value) {
+        oshot.value = 0;
+        oshot.reading.store(true);
+        std::thread([alloc = oshot.buf_alloc, map = (const uint8_t*)oshot.map, w = oshot.w, h = oshot.h] {
+            const uint64_t n = (uint64_t)w * h * 4;
+            invalidate_mapped(alloc, n);
+            std::vector<uint8_t> px(map, map + n);
+            for (size_t i = 3; i < px.size(); i += 4) px[i] = 255;   // (the picture's alpha is not the screen's)
+            oshot.reading.store(false, std::memory_order_release);
+            ocarina_report::shot_taken(std::move(px), w, h);
+        }).detach();
+        return;
+    }
+    if (!oshot.value && oshot.image) ocarina_shot_free();
+}
+/// (the present's recording, after its full barrier) the picture, when one is asked for and none is on its way
+void ocarina_shot_record(VkCommandBuffer cmd, VkImage src, uint32_t sw, uint32_t sh, const int crop[4], uint64_t value) {
+    if (!src || oshot.value || oshot.reading.load(std::memory_order_acquire) || !ocarina_report::shot_wanted()) return;
+    const PresentSourceRect source = present_source_rect(sw, sh, crop);
+    const uint32_t limit = std::min<uint32_t>(dev.props.limits.maxImageDimension2D, 8192);
+    const uint32_t w = std::min(source.w, limit), h = std::min(source.h, limit);
+    if (!w || !h) return ocarina_report::shot_taken({}, 0, 0);
+    if (oshot.image && (oshot.w != w || oshot.h != h)) ocarina_shot_free();
+    if (!oshot.image) {
+        VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ci.imageType = VK_IMAGE_TYPE_2D;
+        ci.format = VK_FORMAT_R8G8B8A8_UNORM;
+        ci.extent = {w, h, 1};
+        ci.mipLevels = ci.arrayLayers = 1;
+        ci.samples = VK_SAMPLE_COUNT_1_BIT;
+        ci.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        if (!create_image(ci, oshot.image, oshot.image_alloc) ||
+            !create_buffer((uint64_t)w * h * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, oshot.buf, oshot.buf_alloc, &oshot.map) ||
+            !oshot.map) {
+            logf("ocarina: a foto do quadro (%ux%u) não teve memória", w, h);
+            ocarina_shot_free();
+            return ocarina_report::shot_taken({}, 0, 0);
+        }
+        oshot.w = w, oshot.h = h;
+    }
+    image_barrier(cmd, oshot.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    blit_crop(cmd, src, sw, sh, crop, oshot.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, w, h);
+    image_barrier(cmd, oshot.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    const VkBufferImageCopy c{0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {w, h, 1}};
+    vkCmdCopyImageToBuffer(cmd, oshot.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, oshot.buf, 1, &c);
+    capture_host_read_barrier(cmd, oshot.buf, (VkDeviceSize)w * h * 4);
+    oshot.value = value;
+}
+
+// (ocarina) The scene flicker detector's measure (ocarina_report.h scene_brightness): at each present, the middle of the game's
+// picture (60% of its width, the middle half of its height: the scene, away from the HUD in its corners and along its edges; the
+// Insert menu and the counter are drawn later, on the window's image, and are never in it) blitted down to 64x36 and copied to one
+// of four small host buffers; read once the GPU is past that present (2-3 presents later), never waited for: a slot still busy
+// skips its present. Its mean brightness goes to the detector in present order. About 10 KB of memory; RX_VK_FLICKER=0: none
+constexpr uint32_t kFlickW = 64, kFlickH = 36;
+constexpr int kFlickSlots = 4;
+struct FlickerProbe {
+    VkImage image = VK_NULL_HANDLE;
+    VmaAllocation image_alloc = nullptr;
+    VkBuffer buf[kFlickSlots]{};
+    VmaAllocation alloc[kFlickSlots]{};
+    void* map[kFlickSlots]{};
+    uint64_t value[kFlickSlots]{};   // (the present's value it waits for; 0 free)
+    int64_t present[kFlickSlots]{};
+    bool failed = false;
+} flick;
+void flicker_probe(VkCommandBuffer cmd, VkImage src, uint32_t sw, uint32_t sh, const int crop[4], uint64_t value, int64_t present) {
+    static const bool on = ocarina_report::flicker_on();
+    if (!on || flick.failed) return;
+    const int64_t t0 = prof_now();
+    const uint64_t done = completed();
+    for (;;) {   // (the slots the GPU is past, oldest present first)
+        int k = -1;
+        for (int i = 0; i < kFlickSlots; i++)
+            if (flick.value[i] && done >= flick.value[i] && (k < 0 || flick.present[i] < flick.present[k])) k = i;
+        if (k < 0) break;
+        invalidate_mapped(flick.alloc[k], (uint64_t)kFlickW * kFlickH * 4);
+        const uint8_t* px = (const uint8_t*)flick.map[k];
+        uint64_t sum = 0;
+        for (uint32_t i = 0; i < kFlickW * kFlickH; i++, px += 4) sum += (uint64_t)px[0] * 54 + (uint64_t)px[1] * 183 + (uint64_t)px[2] * 19;
+        ocarina_report::scene_brightness(flick.present[k], (float)(sum / 256.0 / (kFlickW * kFlickH)));
+        flick.value[k] = 0;
+    }
+    const PresentSourceRect s = present_source_rect(sw, sh, crop);
+    const int slot = (int)(present % kFlickSlots);
+    if (src && s.w >= 16 && s.h >= 16 && !flick.value[slot]) {
+        if (!flick.image) {
+            VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+            ci.imageType = VK_IMAGE_TYPE_2D;
+            ci.format = VK_FORMAT_R8G8B8A8_UNORM;
+            ci.extent = {kFlickW, kFlickH, 1};
+            ci.mipLevels = ci.arrayLayers = 1;
+            ci.samples = VK_SAMPLE_COUNT_1_BIT;
+            ci.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+            bool ok = create_image(ci, flick.image, flick.image_alloc);
+            for (int i = 0; i < kFlickSlots && ok; i++)
+                ok = create_buffer((uint64_t)kFlickW * kFlickH * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, flick.buf[i], flick.alloc[i],
+                                   &flick.map[i]) && flick.map[i];
+            if (!ok) {
+                logf("vk: scene flicker: no memory for its measure: off");
+                flick.failed = true;
+                return;
+            }
+        }
+        const int inner[4] = {(int)(s.x + s.w / 5), (int)(s.y + s.h / 4), (int)(s.w * 3 / 5), (int)(s.h / 2)};
+        image_barrier(cmd, flick.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        blit_crop(cmd, src, sw, sh, inner, flick.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, kFlickW, kFlickH);
+        image_barrier(cmd, flick.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        const VkBufferImageCopy c{0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {kFlickW, kFlickH, 1}};
+        vkCmdCopyImageToBuffer(cmd, flick.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, flick.buf[slot], 1, &c);
+        capture_host_read_barrier(cmd, flick.buf[slot], (VkDeviceSize)kFlickW * kFlickH * 4);
+        flick.value[slot] = value, flick.present[slot] = present;
+    }
+    ocarina_report::flicker_cost(prof_now() - t0);
+}
+
 // ---- PNG (stored deflate blocks: no compression library needed) ----
 uint32_t crc32(const uint8_t* p, size_t n, uint32_t c = 0xFFFFFFFFu) {
     static const std::array<uint32_t, 256> table = [] {
@@ -2856,6 +3051,19 @@ void status_tick() {
     static int64_t last_ns = 0, slowest_ns = 0;
     const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     if (last_ns) slowest_ns = std::max(slowest_ns, now_ns - last_ns);
+    if (last_ns) {   // (ocarina: every game frame into the problem report's ring, ocarina_report.h: present to present, the GPU, the
+                     // replay's phases as the log's line has them; whatever RX_VK_FRAME_TRACE says)
+        static_assert(PROF_COUNT == ocarina_report::kPhases, "the report's replay columns");
+        static int64_t r_prof[PROF_COUNT], r_gpu, r_wait;
+        static bool primed = false;
+        if (!primed) std::memcpy(r_prof, prof_ns, sizeof r_prof), r_gpu = st_gpu_ns, r_wait = st_wait_ns, primed = true;
+        ocarina_report::Frame f;
+        f.at_ns = now_ns, f.ms = (float)((now_ns - last_ns) / 1e6);
+        f.gpu_ms = (float)((st_gpu_ns - r_gpu) / 1e6), f.behind_ms = (float)((st_wait_ns - r_wait) / 1e6);
+        for (int i = 0; i < PROF_COUNT; i++) f.phase_ms[i] = (float)((prof_ns[i] - r_prof[i]) / 1e6), r_prof[i] = prof_ns[i];
+        r_gpu = st_gpu_ns, r_wait = st_wait_ns;
+        ocarina_report::frame(f);
+    }
     // (RX_VK_FRAME_TRACE=1: every frame a line of hookshot_frames.csv beside the game, present to present and what the frame did,
     // so that each stutter can be matched to its cause: waits for shaders or pipelines, translation, uploads, the memory sync,
     // pipeline compiles, the GPU behind. RX_VK_FRAME_LOG has the frame times alone)
@@ -2939,6 +3147,7 @@ void do_present(const nvn_tex* t, const int crop[4]) {
     // next frame's input stage
     temporal_idle();   // (DLSS, FSR: their video memory let go once not used for a while)
     status_tick();   // (the status line, and the video-memory warning)
+    ::mkwvk::rec::present_tick();   // (Ocarina Engine, RX_VK_RECORDER=thread: its stats line every 600 presents)
     reflex_present_begins();
     struct ReflexSleep { ~ReflexSleep() { reflex_sleep(); antilag_input(); } } reflex_sleep_after;
     {   // (hookshot, RX_VK_PASS_TRACE_AT=<frames>: the passes of the frames around these frame numbers, for finding what a frame is made of)
@@ -3067,6 +3276,9 @@ void do_present(const nvn_tex* t, const int crop[4]) {
                 capture_host_read_barrier(r.cmd, shot_bufs[presents & 1], (VkDeviceSize)kShotW * kShotH * 4);
             }
         }
+        ocarina_shot_poll();   // (ocarina: the report's and the bug key's picture, ocarina_report.h)
+        ocarina_shot_record(r.cmd, src, sw, sh, crop, value);
+        flicker_probe(r.cmd, src, sw, sh, crop, value, presents);   // (ocarina: the scene flicker detector's measure)
         memory_end_submission(r.cmd);
         full_barrier(r.cmd);
         submit_recording(r);   // (nothing is stopped at a present: drain)

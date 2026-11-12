@@ -24,12 +24,16 @@ python -I -B tests/test_recorder_sync.py --headers <Vulkan-Headers/include> [--c
    work queued (stop, join, lazy restart, vkDestroyDevice); par_active; >= 1e6 packets through a 16 KB ring, twice, hashed against
    the direct stream. --throw: a driver call that throws on the recorder thread ends the process (exit code 3, FATAL). Run with
    RX_VK_RECORDER=thread (mode 3, logged once) and with RX_VK_PARALLEL=4 (refused).
+   (Ocarina Engine) Unset, thread on a machine with 6 CPU threads or more (else off, logged); off, 0: off; on, 1: thread; another
+   value: off, logged. --badpacket: a packet published out of order stops the recorder before it runs (exit code 3, FATAL). The
+   oversize packet again as the first one in an empty ring: made directly all the same.
 3. The test has teeth: vk_recorder.h with a copy left shallow (all of them, or only the descriptor writes' image infos), with the
    fallback's drain left out, with no drain before vkEndCommandBuffer, with the replay lock let go without a drain, with a throwing
    allocation (exception safety broken), with the failure's drain left out, or with the parallel refusal left out, must fail it.
    Thread (each run with --only thread, so the recorder thread's checks alone catch it): no wait before vkEndCommandBuffer, before
    vkQueueSubmit2, at the replay lock's release, before vkResetCommandPool; no backpressure (the ring overwritten); no join at
-   teardown; the recorder's exception swallowed (--throw).
+   teardown; the recorder's exception swallowed (--throw); (Ocarina Engine) a packet given the free ring ahead instead of its room;
+   the recorder's packet check left out (--badpacket).
 4. (Windows) the process ends cleanly with the recorder parked in idle() holding its lock: tests/recorder_exit_test.cpp, a DLL with
    the real headers and an exe that calls ExitProcess (as the window's close does); exit code 0 within 20 s (a watchdog ends only
    that child) and the DLL's last global destructor run. Broken: the old global recorder with its destructor (wake, join).
@@ -280,10 +284,21 @@ def run(exe, env_mode, *args, parallel=None, timeout=600):
         return subprocess.CompletedProcess(e.cmd, None, out + "\nTIMEOUT after %d s" % timeout)
 
 
+# (Ocarina Engine) RX_VK_RECORDER unset: thread where the process may use 6 CPU threads or more (vk_recorder.h's
+# kDefaultMinThreads), off below; off and 0 turn it off, on and 1 mean thread, any other value is off (logged)
+DEFAULT_THREAD = (os.cpu_count() or 1) >= 6
 # (the environment runs: RX_VK_RECORDER, RX_VK_PARALLEL; the mode the renderer reads; the log lines it must write, once)
 ENV_RUNS = (
     ("sync", None, "env mode 1", ()),
-    (None, None, "env mode 0", ()),
+    (None, None, "env mode 3", ("LOG: vk: RX_VK_RECORDER=thread: vkCmd* packed",)) if DEFAULT_THREAD else
+    (None, None, "env mode 0", ("LOG: vk: RX_VK_RECORDER: off by default",)),
+    (None, "4", "env mode 0", ("LOG: vk: RX_VK_RECORDER=thread (the default) refused: RX_VK_PARALLEL=4",) if DEFAULT_THREAD else
+     ("LOG: vk: RX_VK_RECORDER: off by default",)),
+    ("off", None, "env mode 0", ()),
+    ("0", None, "env mode 0", ()),
+    ("on", None, "env mode 3", ("LOG: vk: RX_VK_RECORDER=thread: vkCmd* packed",)),
+    ("1", None, "env mode 3", ("LOG: vk: RX_VK_RECORDER=thread: vkCmd* packed",)),
+    ("banana", None, "env mode 0", ("LOG: vk: RX_VK_RECORDER=banana is not a mode",)),
     ("defer", None, "env mode 2", ("LOG: vk: RX_VK_RECORDER=defer:",)),
     ("defer", "1", "env mode 2", ("LOG: vk: RX_VK_RECORDER=defer:",)),
     ("defer", "4", "env mode 0", ("LOG: vk: RX_VK_RECORDER=defer refused: RX_VK_PARALLEL=4",)),
@@ -402,6 +417,10 @@ def main():
     print("---- --throw: exit code %s\n%s" % (r.returncode, r.stdout.rstrip()))
     if r.returncode != 3 or "FATAL: RX_VK_RECORDER=thread" not in r.stdout:
         raise SystemExit("FAIL: an exception on the recorder thread did not end the process loudly")
+    r = run(exe, None, "--badpacket", timeout=60)   # (Ocarina Engine: a packet out of order: stopped before it runs, loud, exit code 3)
+    print("---- --badpacket: exit code %s\n%s" % (r.returncode, r.stdout.rstrip()))
+    if r.returncode != 3 or "fails its check" not in r.stdout or "the packet out of order was run" in r.stdout:
+        raise SystemExit("FAIL: a packet out of order on the recorder thread did not end the process loudly")
 
     work_h = (VK / "vk_work.h").read_text(encoding="utf-8")
     # (each: what is broken, vk_recorder.h, vk_work.h, the environment it runs in)
@@ -425,7 +444,7 @@ def main():
          broken(rec, "            if (md == DEFER) drain();   // (what is held first", "            if (0) drain();   // (what is held first",
                 "failure drain"), work_h, (None, None)),
         ("defer: the parallel refusal left out (RX_VK_PARALLEL=4)",
-         broken(rec, "        if (!parallel_configured()) return e[0] == 'd' ? DEFER : THREAD;", "        return e[0] == 'd' ? DEFER : THREAD;",
+         broken(rec, "    if (parallel_configured()) {   // (serial replay only)", "    if (false) {   // (serial replay only)",
                 "parallel"), work_h, ("defer", "4")),
         # (the recorder thread's: run with --only thread)
         ("thread: no wait before vkEndCommandBuffer", rec, no_wait(work_h, "vkEndCommandBuffer"), ("--only", None)),
@@ -435,12 +454,20 @@ def main():
         ("thread: a command pool reset without waiting for the recorder", rec, no_wait(work_h, "vkResetCommandPool"), ("--only", None)),
         ("thread: no backpressure (the ring overwritten)",
          broken(broken(rec, "    void wait_room(uint64_t need) {\n", "    void wait_room(uint64_t need) {\n        if (need) return;\n", "room"),
-                "        lim = base + off + std::min<uint64_t>(tail, cap - (w - r_seen));", "        lim = base + off + tail;", "lim"), work_h,
+                "        lim = base + off + room;", "        lim = base + off + tail;", "lim"), work_h,
          ("--only", None)),
         ("thread: no join at teardown", broken(rec, "    th.join();\n    ready.store(false);", "    ready.store(false);", "join"), work_h,
          ("--only", None)),
         ("thread: the recorder thread's exception swallowed",
          broken(rec, "        recorder_fatal(e.what());", "        (void)e;", "fatal"), work_h, ("--throw", None)),
+        # (Ocarina Engine) a packet's end past its room (the free ring ahead, as before): the oversize call packed in an empty ring
+        ("thread: a packet given the free ring ahead, not its room",
+         broken(rec, "        lim = base + off + room;", "        lim = base + off + std::min<uint64_t>(tail, cap - (w - r_seen));", "lim"),
+         work_h, ("--only", None)),
+        # (Ocarina Engine) the recorder's packet check left out: a packet out of order runs (--badpacket)
+        ("thread: the recorder's packet check left out",
+         broken(rec, "        if (!check_packet(p, seq, len, room, tail)) [[unlikely]]", "        if (false && check_packet(p, seq, len, room, tail))",
+                "check"), work_h, ("--badpacket", None)),
         # (rec::unordered(): a call that does depend on the ring added to it must fail a check)
         ("thread: vkQueueSubmit2 made without waiting (added to unordered())", unordered_too(rec, "vkQueueSubmit2"), work_h, ("--only", None)),
         ("thread: direct recording (Dear ImGui) without waiting (B_DIRECT added to unordered())", unordered_too(rec, "DIRECT"), work_h,
@@ -455,7 +482,7 @@ def main():
          broken(rec, "        else if (unordered(k)) return;\n", "", "skip"), work_h, ("--only", None))
     ][:1 if unordered_calls(rec) else 0] + [
         ("thread: the parallel refusal left out (RX_VK_PARALLEL=4)",
-         broken(rec, "        if (!parallel_configured()) return e[0] == 'd' ? DEFER : THREAD;", "        return e[0] == 'd' ? DEFER : THREAD;",
+         broken(rec, "    if (parallel_configured()) {   // (serial replay only)", "    if (false) {   // (serial replay only)",
                 "parallel"), work_h, ("thread", "4")),
     ]
     for i, (what, text, wtext, (env_mode, parallel)) in enumerate(variants):
@@ -467,6 +494,9 @@ def main():
         elif env_mode == "--only":
             r = run(exe_b, None, "--only", "thread", timeout=120)
             caught = r.returncode != 0
+        elif env_mode == "--badpacket":
+            r = run(exe_b, None, "--badpacket", timeout=30)
+            caught = not (r.returncode == 3 and "fails its check" in r.stdout)
         elif env_mode == "--throw":
             r = run(exe_b, None, "--throw", timeout=30)
             caught = not (r.returncode == 3 and "FATAL: RX_VK_RECORDER=thread" in r.stdout)
